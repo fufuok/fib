@@ -141,6 +141,9 @@ type interopResult struct {
 	Count    int                 `json:"count"`
 	Error    string              `json:"error"`
 	Resumed  bool                `json:"resumed"`
+	// Sent0RTT is the peer's word, in client mode with -early, that the
+	// connection's first request went out in a 0-RTT packet.
+	Sent0RTT bool `json:"sent0rtt"`
 }
 
 func (r interopResult) header(name string) string {

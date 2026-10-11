@@ -37,6 +37,8 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 )
 
 func main() {
@@ -93,6 +95,135 @@ type result struct {
 	Error    string              `json:"error"`
 	// Resumed says the connection resumed a session.
 	Resumed bool `json:"resumed"`
+	// Sent0RTT says, in client mode with -early, whether the first request
+	// on the connection went out in a 0-RTT packet: its stream's first data
+	// was sent under the early keys. A request quic-go writes once its
+	// handshake has finished goes under the 1-RTT keys even when the server
+	// would have taken it early. The 0-RTT tests make one request per
+	// connection, which this is.
+	Sent0RTT bool `json:"sent0rtt"`
+}
+
+// sentStreams records, for each request stream of a client connection, the
+// type of the packet its first data went out in, from quic-go's qlog events.
+type sentStreams struct {
+	mu    sync.Mutex
+	first map[int64]qlog.PacketType
+}
+
+func (s *sentStreams) AddProducer() qlogwriter.Recorder   { return s }
+func (s *sentStreams) SupportsSchemas(schema string) bool { return schema == qlog.EventSchema }
+func (s *sentStreams) Close() error                       { return nil }
+
+func (s *sentStreams) RecordEvent(e qlogwriter.Event) {
+	sent, ok := e.(qlog.PacketSent)
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range sent.Frames {
+		frame, ok := f.Frame.(*qlog.StreamFrame)
+		// Client-initiated bidirectional streams are the requests.
+		if !ok || frame.StreamID%4 != 0 {
+			continue
+		}
+		if _, seen := s.first[int64(frame.StreamID)]; !seen {
+			s.first[int64(frame.StreamID)] = sent.Header.PacketType
+		}
+	}
+}
+
+// startedEarly reports whether the connection's first request stream sent
+// its first data in a 0-RTT packet.
+func (s *sentStreams) startedEarly() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.first[0] == qlog.PacketType0RTT
+}
+
+// ticketCache is the client's session cache, counting the tickets stored in
+// it, so that "waitticket" can wait for the one the current connection gets
+// rather than a guess at how long it takes: a connection dialed before it
+// arrives resumes with the ticket it already used, whose early data a
+// server turns away, since a ticket carries early data once.
+type ticketCache struct {
+	tls.ClientSessionCache
+	mu     sync.Mutex
+	cond   *sync.Cond
+	stored int
+	// mark is the count when the current connection was dialed.
+	mark int
+}
+
+func newTicketCache() *ticketCache {
+	c := &ticketCache{ClientSessionCache: tls.NewLRUClientSessionCache(8)}
+	c.cond = sync.NewCond(&c.mu)
+	return c
+}
+
+func (c *ticketCache) Put(key string, cs *tls.ClientSessionState) {
+	c.ClientSessionCache.Put(key, cs)
+	if cs == nil {
+		return
+	}
+	c.mu.Lock()
+	c.stored++
+	c.cond.Broadcast()
+	c.mu.Unlock()
+}
+
+// newConn marks the start of a connection: the tickets waited for from here
+// are the ones it gets.
+func (c *ticketCache) newConn() {
+	c.mu.Lock()
+	c.mark = c.stored
+	c.mu.Unlock()
+}
+
+// wait waits until a ticket has arrived since the current connection began.
+func (c *ticketCache) wait(timeout time.Duration) error {
+	timer := time.AfterFunc(timeout, func() {
+		c.mu.Lock()
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	})
+	defer timer.Stop()
+	deadline := time.Now().Add(timeout)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.stored == c.mark {
+		if !time.Now().Before(deadline) {
+			return errors.New("no session ticket arrived")
+		}
+		c.cond.Wait()
+	}
+	return nil
+}
+
+// connTraces keeps the trace of the connection the client dialed last: the
+// 0-RTT tests dial one at a time, each after a "newconn".
+type connTraces struct {
+	mu   sync.Mutex
+	last *sentStreams
+}
+
+func (c *connTraces) tracer(_ context.Context, isClient bool, _ quic.ConnectionID) qlogwriter.Trace {
+	if !isClient {
+		return nil
+	}
+	s := &sentStreams{first: make(map[int64]qlog.PacketType)}
+	c.mu.Lock()
+	c.last = s
+	c.mu.Unlock()
+	return s
+}
+
+func (c *connTraces) startedEarly() bool {
+	c.mu.Lock()
+	s := c.last
+	c.mu.Unlock()
+	return s != nil && s.startedEarly()
 }
 
 // hashBody is the FNV-1a of a body, so that large ones are checked without
@@ -127,9 +258,13 @@ func runClient(base, caFile string, early bool) error {
 		}
 	}
 	tr := &http3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "localhost"}}
+	var traces *connTraces
+	var tickets *ticketCache
 	if early {
-		tr.TLSClientConfig.ClientSessionCache = tls.NewLRUClientSessionCache(8)
-		tr.QUICConfig = &quic.Config{Allow0RTT: true}
+		traces = &connTraces{}
+		tickets = newTicketCache()
+		tr.TLSClientConfig.ClientSessionCache = tickets
+		tr.QUICConfig = &quic.Config{Allow0RTT: true, Tracer: traces.tracer}
 	}
 	defer tr.Close()
 	client := &http.Client{Transport: tr, Timeout: 60 * time.Second}
@@ -149,15 +284,35 @@ func runClient(base, caFile string, early bool) error {
 		if spec.Command == "quit" {
 			return nil
 		}
+		if spec.Command == "waitticket" {
+			// The current connection's ticket has arrived, so the next one
+			// resumes with a ticket it has not used.
+			var res result
+			if tickets == nil {
+				res.Error = "waitticket needs -early"
+			} else if err := tickets.wait(10 * time.Second); err != nil {
+				res.Error = err.Error()
+			}
+			if err := out.Encode(res); err != nil {
+				return err
+			}
+			continue
+		}
 		if spec.Command == "newconn" {
 			// The next request dials again, resuming the session if it can.
 			tr.CloseIdleConnections()
+			if tickets != nil {
+				tickets.newConn()
+			}
 			if err := out.Encode(result{}); err != nil {
 				return err
 			}
 			continue
 		}
 		res := doRequests(client, base, spec)
+		if traces != nil {
+			res.Sent0RTT = traces.startedEarly()
+		}
 		if err := out.Encode(res); err != nil {
 			return err
 		}

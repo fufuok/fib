@@ -27,9 +27,13 @@ func earlyHandler(c *fibhttp.Context) {
 // settle starts a new connection for the peer's next request, once the
 // ticket the server sends when the handshake is over has arrived: a response
 // to early data can come before that, and a client that goes before it has
-// only the ticket it has used.
+// only the ticket it has used, whose early data the server turns away, since
+// a ticket carries early data once.
 func settle(p *peer) {
-	time.Sleep(200 * time.Millisecond)
+	p.t.Helper()
+	if r := p.do(interopSpec{Command: "waitticket"}); r.Error != "" {
+		p.t.Fatalf("waiting for the session ticket: %s", r.Error)
+	}
 	p.do(interopSpec{Command: "newconn"})
 }
 
@@ -57,8 +61,9 @@ func TestEarlyDataQUICGo(t *testing.T) {
 			// Whether quic-go puts the GET in its first flight depends on its
 			// own timing: one that has finished its handshake by the time it
 			// writes the request, as a loaded machine may, sends it under the
-			// 1-RTT keys. Early data that is expected is given three
-			// connections to arrive on; it is never expected where it is off.
+			// 1-RTT keys, which the peer reports. That is tried again, up to
+			// three connections; a request that did go out early and was not
+			// taken as early is the server's failing, and fails at once.
 			want := fmt.Sprintf("GET early=%q", tc.wantEarly)
 			for attempt := 1; ; attempt++ {
 				settle(p)
@@ -66,13 +71,16 @@ func TestEarlyDataQUICGo(t *testing.T) {
 				if !got.Resumed {
 					t.Fatal("the second connection did not resume the session")
 				}
+				if early := got.Body == `GET early="1"`; early && !got.Sent0RTT {
+					t.Fatalf("the server took the request as early data, but quic-go sent it under the 1-RTT keys")
+				}
 				if got.Body == want {
 					break
 				}
-				if tc.wantEarly == "" || attempt == 3 {
-					t.Fatalf("the server saw %q, want %q", got.Body, want)
+				if tc.wantEarly == "" || got.Sent0RTT || attempt == 3 {
+					t.Fatalf("the server saw %q, want %q (quic-go sent the request in 0-RTT: %v)", got.Body, want, got.Sent0RTT)
 				}
-				t.Logf("attempt %d: the request did not arrive as early data", attempt)
+				t.Logf("attempt %d: quic-go sent the request under the 1-RTT keys", attempt)
 			}
 
 			// And again: every connection gets a ticket of its own.
