@@ -36,7 +36,8 @@ func TestMain(m *testing.M) {
 // HTTP/3 share one number.
 func freePort(t *testing.T) int {
 	t.Helper()
-	for i := 0; i < 20; i++ {
+	var last error
+	for i := 0; i < 100; i++ {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -48,8 +49,13 @@ func freePort(t *testing.T) int {
 			_ = pc.Close()
 			return port
 		}
+		last = err
+		if i%10 == 9 {
+			// A machine that has run out of ports for a moment gets one.
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
-	t.Fatal("no port free for both TCP and UDP")
+	t.Fatalf("no port free for both TCP and UDP: %v", last)
 	return 0
 }
 

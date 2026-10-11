@@ -832,9 +832,13 @@ type clientConn struct {
 	client *Client
 	host   *hostPool
 	conn   *fib.Connection
-	// parser is used only by the worker reading the connection.
-	parser responseParser
-	mu     sync.Mutex
+	// parser is used only by the worker reading the connection, and so are
+	// feeding, which says OnData is in the parser, and deferred, the stream
+	// whose end was held back until it is out.
+	parser   responseParser
+	feeding  bool
+	deferred *ResponseStream
+	mu       sync.Mutex
 	// current is the request in flight, if any. sent records that the
 	// connection has carried a request before this one, and received that the
 	// server has answered this one with at least a byte.
@@ -939,14 +943,20 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 		cc.discard()
 		return
 	}
+	// The end of a streamed body reaches its callback after the connection is
+	// released or discarded (see bodyEnd).
+	cc.feeding = true
 	resp, err := cc.parser.feed(data, r.req)
+	cc.feeding = false
 	if err != nil {
 		r.detach()
 		cc.discard()
+		cc.endDeferred()
 		r.finish(nil, err)
 		return
 	}
 	if resp == nil {
+		cc.endDeferred()
 		return
 	}
 	// Bytes past the response, a protocol switch, or either side asking to
@@ -970,8 +980,17 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	} else {
 		cc.discard()
 	}
+	cc.endDeferred()
 	if !streamed {
 		r.finish(resp, nil)
+	}
+}
+
+// endDeferred ends the streamed body whose end bodyEnd held back.
+func (cc *clientConn) endDeferred() {
+	if s := cc.deferred; s != nil {
+		cc.deferred = nil
+		s.End()
 	}
 }
 
@@ -1015,12 +1034,21 @@ func (cc *clientConn) bodyData(data []byte) {
 	}
 }
 
+// bodyEnd ends the stream. While OnData is feeding the parser it is held until
+// OnData has released the connection, since the callback that learns of the
+// end may send the next request at once, and that one should find the
+// connection idle rather than dial another.
 func (cc *clientConn) bodyEnd() {
 	s := cc.stream
 	cc.stream = nil
-	if s != nil {
-		s.End()
+	if s == nil {
+		return
 	}
+	if cc.feeding {
+		cc.deferred = s
+		return
+	}
+	s.End()
 }
 
 func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
