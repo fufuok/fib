@@ -3,11 +3,13 @@ package tls
 import (
 	"bytes"
 	"context"
+	"crypto/hkdf"
 	"crypto/sha256"
 	"crypto/sha512"
 	stdtls "crypto/tls"
 	"errors"
 	"slices"
+	"time"
 )
 
 // The TLS 1.3 handshake of a QUIC connection (RFC 9001), run by the state
@@ -26,9 +28,12 @@ import (
 // It is TLS 1.3 as the TCP handshakes are (client13.go and server13.go, whose
 // code it shares), without what QUIC does not use: records, the compatibility
 // change_cipher_spec and session ID, the suites' record protection, which is
-// QUIC's own and so also lets ChaCha20-Poly1305 be used. 0-RTT is not supported,
-// as it is not in package quic. A server hands to crypto/tls the clients it
-// cannot serve, before it has sent anything.
+// QUIC's own and so also lets ChaCha20-Poly1305 be used. Resumption and 0-RTT
+// are as crypto/tls's QUICConn has them, through the same events: a server that
+// has a client's ticket asks the QUIC layer, with QUICResumeSession, whether to
+// accept the early data, and so does a client before it offers any; a client
+// that is turned away is told by QUICRejectedEarlyData. A server hands to
+// crypto/tls the clients it cannot serve, before it has sent anything.
 
 // extQUICParams is the quic_transport_parameters extension.
 const extQUICParams = 0x39
@@ -69,6 +74,12 @@ func (q *quicCtx) setWrite(level stdtls.QUICEncryptionLevel, suite uint16, secre
 	q.events = append(q.events, stdtls.QUICEvent{Kind: stdtls.QUICSetWriteSecret, Level: level, Suite: suite, Data: bytes.Clone(secret)})
 }
 
+// resume asks the QUIC layer about the session a client resumes, whose
+// EarlyData it may clear to decline the client's 0-RTT data.
+func (q *quicCtx) resume(state *stdtls.SessionState) {
+	q.events = append(q.events, stdtls.QUICEvent{Kind: stdtls.QUICResumeSession, SessionState: state})
+}
+
 func (q *quicCtx) peer(params []byte) {
 	q.events = append(q.events, stdtls.QUICEvent{Kind: stdtls.QUICTransportParameters, Data: bytes.Clone(params)})
 }
@@ -98,6 +109,13 @@ func (h *clientHS) finishQUIC(exporter []byte) *hsError {
 	fin := append([]byte{hsFinished, 0, 0, byte(len(verify))}, verify...)
 	h.transcript = append(h.transcript, fin...)
 	h.quic.write(stdtls.QUICEncryptionLevelHandshake, fin)
+	if h.sessions != nil {
+		// The tickets that follow resume from the secret that covers the
+		// handshake through the client's Finished.
+		if h.resumption, err = deriveSecret(h.suite.hash, h.master, "res master", h.transcriptHash()); err != nil {
+			return fail(alertInternalError, "%v", err)
+		}
+	}
 	h.keyLog("CLIENT_TRAFFIC_SECRET_0", h.appClient)
 	h.keyLog("SERVER_TRAFFIC_SECRET_0", h.appServer)
 	h.keyLog("EXPORTER_SECRET", exporter)
@@ -111,6 +129,56 @@ func (h *clientHS) finishQUIC(exporter []byte) *hsError {
 	h.state = hsDone
 	h.flightEnd = true
 	h.quic.done()
+	return nil
+}
+
+// newSessionTicket takes a ticket the server sends after the handshake into the
+// cache, to resume from (RFC 8446 section 4.6.1).
+func (h *clientHS) newSessionTicket(msg []byte) *hsError {
+	if h.sessions == nil || h.resumption == nil {
+		return nil
+	}
+	r := newReader(msg[4:])
+	lifetime := r.u32()
+	ageAdd := r.u32()
+	nonce := r.vec8()
+	ticket := r.vec16()
+	extensions := r.vec16()
+	if !r.empty() || len(ticket) == 0 {
+		return fail(alertDecodeError, "malformed NewSessionTicket")
+	}
+	exts, herr := parseExtensions(extensions)
+	if herr != nil {
+		return herr
+	}
+	early := false
+	if data, ok := exts[extEarlyData]; ok {
+		d := newReader(data)
+		// QUIC allows all of the early data or none (RFC 9001 section 4.6.1).
+		if size := d.u32(); !d.empty() || size != 0xffffffff {
+			return fail(alertIllegalParameter, "invalid max_early_data_size in a session ticket")
+		}
+		early = true
+	}
+	if lifetime == 0 {
+		return nil
+	}
+	f := h.suite.hash
+	psk, err := expandLabelContext(f, h.resumption, "resumption", nonce, f().Size())
+	if err != nil {
+		return fail(alertInternalError, "%v", err)
+	}
+	life := min(time.Duration(lifetime)*time.Second, ticketLifetime)
+	session := &QUICSession{
+		ticket: bytes.Clone(ticket), psk: psk, suite: h.suiteID, received: h.now(), lifetime: life,
+		ageAdd: ageAdd, alpn: h.protocol, earlyData: early,
+		certs: h.rawCerts,
+	}
+	if early {
+		// What the layer works to when it sends early data on this session.
+		session.extra = [][]byte{append([]byte{1}, h.peerParams...)}
+	}
+	h.sessions.Put(h.config.ServerName, session)
 	return nil
 }
 
@@ -152,6 +220,8 @@ type QUICConn struct {
 	started bool
 	// suites narrows what a client offers, for tests.
 	suites []uint16
+	// sessions is where a client's tickets go and come from.
+	sessions QUICSessionCache
 }
 
 // NewQUICClient returns the handshake of a QUIC client, or nil if config asks
@@ -162,6 +232,18 @@ func NewQUICClient(config *stdtls.Config) *QUICConn {
 		return nil
 	}
 	return &QUICConn{q: &quicCtx{}, config: config}
+}
+
+// NewQUICClientWithSessions is NewQUICClient for a client that resumes sessions
+// from sessions, and puts those the server sends into it. With a session that
+// allows it, early data is offered if the QUIC layer says so, by clearing
+// EarlyData of the QUICResumeSession event it is asked about.
+func NewQUICClientWithSessions(config *stdtls.Config, sessions QUICSessionCache) *QUICConn {
+	c := NewQUICClient(config)
+	if c != nil {
+		c.sessions = sessions
+	}
+	return c
 }
 
 // QUICServer makes the handshakes of the QUIC connections of one server,
@@ -222,10 +304,65 @@ func (c *QUICConn) Start(ctx context.Context) error {
 	if c.suites != nil {
 		h.suites = c.suites
 	}
+	h.sessions = c.sessions
+	if h.pickSession() && h.session.earlyData {
+		// The QUIC layer is asked whether to offer early data with it, and the
+		// hello is made once it has answered (see NextEvent).
+		h.resumeState = &stdtls.SessionState{EarlyData: true, Extra: h.session.extra}
+		c.q.resume(h.resumeState)
+		h.pending = func() *hsError {
+			h.offerEarly = h.resumeState.EarlyData
+			h.sendHello()
+			return nil
+		}
+		return nil
+	}
+	h.sendHello()
+	return nil
+}
+
+// pickSession takes the session to offer, if the cache has one that is still
+// good for this connection, out of the cache.
+func (h *clientHS) pickSession() bool {
+	if h.sessions == nil || h.quic == nil {
+		return false
+	}
+	key := h.config.ServerName
+	s := h.sessions.Get(key)
+	if s == nil {
+		return false
+	}
+	// A session is used once, whether or not the server takes it.
+	h.sessions.Put(key, nil)
+	if _, ok := quicSuite(s.suite); !ok || !s.usable(h.now()) || !slices.Contains(h.suites, s.suite) ||
+		len(h.config.NextProtos) > 0 && !slices.Contains(h.config.NextProtos, s.alpn) {
+		return false
+	}
+	h.session = s
+	return true
+}
+
+// sendHello writes the ClientHello, and the keys early data goes under if it is
+// offered.
+func (h *clientHS) sendHello() {
+	h.earlyActive = h.offerEarly && h.session != nil
 	hello := h.clientHello()
 	h.transcript = append(h.transcript, hello...)
-	c.q.write(stdtls.QUICEncryptionLevelInitial, hello)
-	return nil
+	h.quic.write(stdtls.QUICEncryptionLevelInitial, hello)
+	if !h.earlyActive {
+		return
+	}
+	f := h.sessionHash()
+	early, err := hkdf.Extract(f, h.session.psk, nil)
+	if err == nil {
+		var secret []byte
+		if secret, err = deriveSecret(f, early, "c e traffic", hashBytes(f, h.transcript)); err == nil {
+			h.keyLog("CLIENT_EARLY_TRAFFIC_SECRET", secret)
+			h.quic.setWrite(stdtls.QUICEncryptionLevelEarly, h.session.suite, secret)
+			return
+		}
+	}
+	h.earlyActive = false
 }
 
 // NextEvent returns the next event of the handshake, or an event of kind
@@ -235,12 +372,35 @@ func (c *QUICConn) NextEvent() stdtls.QUICEvent {
 		return c.fallback.NextEvent()
 	}
 	if len(c.q.events) == 0 {
+		c.resumePending()
+	}
+	if len(c.q.events) == 0 {
 		return stdtls.QUICEvent{Kind: stdtls.QUICNoEvent}
 	}
 	e := c.q.events[0]
 	c.q.events[0] = stdtls.QUICEvent{}
 	c.q.events = c.q.events[1:]
 	return e
+}
+
+// resumePending goes on with the handshake of a server that stopped to ask
+// the QUIC layer whether to accept the early data of a resuming client: the
+// layer has had the QUICResumeSession event, and answers by what it did to
+// the session before asking for the next event.
+func (c *QUICConn) resumePending() {
+	var pending func() *hsError
+	switch {
+	case c.server != nil && c.server.pending != nil:
+		pending, c.server.pending = c.server.pending, nil
+	case c.client != nil && c.client.pending != nil:
+		pending, c.client.pending = c.client.pending, nil
+	default:
+		return
+	}
+	if herr := pending(); herr != nil {
+		c.err = quicError(herr)
+		c.q.events = append(c.q.events, stdtls.QUICEvent{Kind: stdtls.QUICErrorEvent, Err: c.err})
+	}
 }
 
 // HandleData takes handshake data received at level, in order. The data may
@@ -255,6 +415,10 @@ func (c *QUICConn) HandleData(level stdtls.QUICEncryptionLevel, data []byte) err
 	}
 	if !c.started {
 		return errors.New("tls: HandleData called before Start")
+	}
+	c.resumePending()
+	if c.err != nil {
+		return c.err
 	}
 	var at int
 	switch level {
@@ -307,10 +471,24 @@ func (c *QUICConn) HandleData(level stdtls.QUICEncryptionLevel, data []byte) err
 // quicError is the error QUIC turns into a connection error carrying alert.
 func quicError(herr *hsError) error {
 	if herr.alert != 0 {
-		return stdtls.AlertError(herr.alert)
+		if herr.err == nil {
+			return stdtls.AlertError(herr.alert)
+		}
+		return &alertCause{alert: stdtls.AlertError(herr.alert), err: herr.err}
 	}
 	return herr.err
 }
+
+// alertCause is an alert together with what went wrong, as crypto/tls
+// reports a failed QUIC handshake: it reads as the cause ("tls: failed to
+// verify certificate: ..."), and errors.As finds the AlertError in it.
+type alertCause struct {
+	alert stdtls.AlertError
+	err   error
+}
+
+func (e *alertCause) Error() string   { return e.err.Error() }
+func (e *alertCause) Unwrap() []error { return []error{e.alert, e.err} }
 
 // message handles one handshake message received at level (0 initial, 1
 // handshake, 2 application).
@@ -336,7 +514,7 @@ func (c *QUICConn) message(level int, msg []byte) *hsError {
 			if msg[0] != hsNewSessionTicket {
 				return fail(alertUnexpectedMessage, "unexpected handshake message %d", msg[0])
 			}
-			return nil
+			return h.newSessionTicket(msg)
 		}
 		if herr := h.message(msg, nil); herr != nil {
 			return herr
@@ -409,7 +587,8 @@ func (c *QUICConn) fallBack() error {
 }
 
 // SendSessionTicket sends the client a ticket to resume from, once the
-// handshake of a server is over. Early data is not supported.
+// handshake of a server is over; with opts.EarlyData the ticket may be used
+// for 0-RTT, and opts.Extra is kept with it for the QUIC layer to see again.
 func (c *QUICConn) SendSessionTicket(opts stdtls.QUICSessionTicketOptions) error {
 	if c.fallback != nil {
 		return c.fallback.SendSessionTicket(opts)
@@ -417,7 +596,7 @@ func (c *QUICConn) SendSessionTicket(opts stdtls.QUICSessionTicketOptions) error
 	if c.server == nil || c.server.state != srvDone {
 		return errors.New("tls: SendSessionTicket called before the handshake of a server is over")
 	}
-	msg, herr := c.server.ticketMessage()
+	msg, herr := c.server.ticketMessage(opts.EarlyData, opts.Extra)
 	if herr != nil {
 		return quicError(herr)
 	}

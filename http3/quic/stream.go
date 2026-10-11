@@ -1,6 +1,10 @@
 package quic
 
-import "github.com/lesismal/fib/bufferpool"
+import (
+	"sync/atomic"
+
+	"github.com/lesismal/fib/bufferpool"
+)
 
 // Stream is one QUIC stream. Its sending side is written with Write and
 // ended with Close or Reset; what arrives on its receiving side goes to the
@@ -52,6 +56,9 @@ type Stream struct {
 	holdCredit bool
 	creditAt   uint64
 
+	// early says data of the stream arrived in a 0-RTT packet.
+	early atomic.Bool
+
 	queued bool
 	done   bool
 	// released is set once the application is done with the stream, and
@@ -62,6 +69,13 @@ type Stream struct {
 
 // ID is the stream's ID.
 func (s *Stream) ID() uint64 { return s.id }
+
+// EarlyData reports whether any of the stream's data arrived in a 0-RTT
+// packet, and so may have been replayed by an attacker (RFC 9001 section
+// 9.2): what the application does with such a stream should be safe to
+// repeat. A stream's early data is also all that came before the handshake
+// ended, so a stream that is not early is one that was completed after.
+func (s *Stream) EarlyData() bool { return s.early.Load() }
 
 // Conn is the connection the stream belongs to.
 func (s *Stream) Conn() *Conn { return s.conn }

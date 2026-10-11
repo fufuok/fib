@@ -20,8 +20,9 @@ from scratch. The TLS 1.3 handshake is the standard library's
 | QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, and answered when the peer starts one) and a limit on decryption failures; Retry on the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and NewReno congestion control; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
 | Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper, extended CONNECT (RFC 9220) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/3 |
 | Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; request and response trailers; a peer that breaks the protocol ends the connection with its error code |
+| Resumption and 0-RTT | Session tickets, resumption, and 0-RTT early data, for the server (`Config.EarlyData`) and the client (`ClientConfig.EarlyData`); see [0-RTT](#0-rtt) |
 | Conformance | Both directions against quic-go, and protocol errors written frame by frame, all run in CI |
-| Interop | quic-go client and server, both directions, including 5% packet loss; the client against the live services of Cloudflare, Google, nginx, Facebook (mvfst), Varnish and quiche |
+| Interop | quic-go client and server, both directions, including 5% packet loss; quiche client and server, both directions, in a container (`http3/quicheinterop`); the client against the live services of Cloudflare, Google, nginx, Facebook (mvfst), Varnish and quiche |
 
 All of it is covered by tests that run in CI; see [Conformance tests](#conformance-tests).
 
@@ -202,14 +203,53 @@ exposed through `http3.Config` or `http3.ClientConfig`:
   unprocessed (GOAWAY or H3_REQUEST_REJECTED) and for requests still queued.
 - Requests with `Expect: 100-continue` do not wait for the 100; the body is sent
   together with the header.
-- With `TLSConfig.ClientSessionCache` set, session resumption (1-RTT) should
-  work, but it has not been tested.
+- Sessions are resumed from `ClientConfig.SessionCache` by this module's
+  handshake, or from `TLSConfig.ClientSessionCache` when the handshake is
+  crypto/tls's (`BlockingTLSHandshake`, or a TLSConfig only crypto/tls serves).
+  Only the requests that are safe to repeat go as 0-RTT data; see
+  [0-RTT](#0-rtt).
+
+### 0-RTT
+
+A client that resumes a session may send its first requests with its first
+flight (RFC 9001 section 4.6), a round trip ahead of the handshake. The data is
+encrypted under keys that come from the session alone, so it is not forward
+secret, and an attacker who recorded it can send it again. What this module does
+about that:
+
+- **Off by default** on both sides: `Config.EarlyData` on the server (its
+  session tickets then allow early data), `ClientConfig.EarlyData` on the
+  client.
+- **A ticket carries early data once.** The server keeps the tickets that have,
+  until they expire, and refuses early data on a second use (the connection
+  still resumes). It also refuses it when the age the client reports for the
+  ticket is more than 10 seconds off the server's own, when the handshake is
+  retried with a HelloRetryRequest, and when the transport limits it gave with
+  the ticket are higher than it gives now. The register is per `Handler`; a
+  server that is not the one that issued the ticket cannot know, so servers
+  behind a load balancer have to see to replays themselves.
+- **Safe methods only.** The server marks requests that arrived as early data
+  with `Early-Data: 1` (RFC 8470) and serves GET, HEAD, OPTIONS and TRACE; any
+  other method is answered 425 Too Early (`Config.EarlyDataUnsafe` serves them
+  all, and the handler must look at the header). `Stream.EarlyData` tells the
+  same of a QUIC stream. The client sends only those methods, and without a
+  body, as early data (`ClientConfig.EarlyData`), and sends a request answered
+  425 again once the handshake is over. `Client.Stats` counts what was sent early,
+  accepted, rejected (the server turned the early data away, which the QUIC
+  layer then sends again under the 1-RTT keys) and answered 425.
+- **Responses before the handshake ends.** A server that accepts early data
+  answers it as soon as it has sent its Finished, before the client's has
+  arrived (0.5-RTT). `quic.EarlyDataHandler` is how a handler takes early data
+  as it arrives; one that is not told of it after the handshake.
+
+The client's sessions are kept by this module's TLS (`tls.NewQUICSessionCache`,
+or `ClientConfig.SessionCache`); crypto/tls's QUICConn, which the other handshake
+uses, resumes and sends early data through the same QUIC code.
 
 ## Intentionally not implemented
 
 | Feature | Reason |
 | --- | --- |
-| 0-RTT | 0-RTT requests can be replayed, which needs handlers that recognize and refuse non-idempotent requests; the gain is not worth the complexity. The client sends no early data; the server drops 0-RTT packets, which the client then resends as 1-RTT. |
 | Active connection migration | A client moving on purpose has to use a fresh Connection ID on its new path, so the server would have to issue and route several per connection, and retire them. A NAT rebinding, which keeps the Connection ID, is followed (see above). |
 | QPACK dynamic table | Both sides advertise a capacity of 0: no head-of-line blocking from blocked streams, silent encoder and decoder streams, and no extra state or memory. The cost is that repeated headers are sent in full every time. |
 | Server push | No major browser enables HTTP/3 push. The client sends no MAX_PUSH_ID, and `Context.Push` returns `http.ErrNotSupported`. Use 103 Early Hints (`WriteInterim`) for preloading. |
@@ -289,7 +329,8 @@ What is still not covered end to end:
 - ChaCha20-Poly1305 negotiated in a real handshake: the development machine
   and the CI runners have AES hardware, so handshakes always pick AES-GCM, and
   only RFC 9001's test vectors cover that path.
-- Session resumption (`TLSConfig.ClientSessionCache`).
+- 0-RTT against more servers than quiche and quic-go, and replays across
+  servers that share ticket keys (the register of tickets is per process).
 - The concurrency problems only load testing shows. Frame parsing, building
   requests, QPACK decoding, QUIC packet headers, transport parameters and
   frame handling all have fuzz targets, which the `Fuzz the parsers` CI job
@@ -319,5 +360,7 @@ skip; CI sets `FIB_REQUIRE_H3_INTEROP=1`, which turns a skip into a failure.
 | The suite's own hand-written HTTP/3 client (no dependency), against the fib server | What a sound implementation never sends: DATA before HEADERS, a control stream that does not start with SETTINGS, a second control stream, a request missing a pseudo-header, a reference to the QPACK dynamic table, CANCEL_PUSH, a lowered MAX_PUSH_ID, a raised GOAWAY, a QPACK insertion, an `:authority` and `Host` that disagree, and neither of them |
 | The suite's own hand-written HTTP/3 server (no dependency), against the fib client | How the client polices its peer: MAX_PUSH_ID from a server, CANCEL_PUSH, GOAWAY naming another kind of stream, a raised GOAWAY, a QPACK insertion, and a response that refers to the dynamic table |
 | The body matrix's raw QUIC client (`http3/body_matrix_test.go`), against the fib server | Request bodies every way they can come: no body, a content-length, DATA with no length, a trailer and `Expect: 100-continue`, small and large, the stream written whole or in pieces with pauses, taken by the handler by reading, through OnBody, as `BodyComplete` decides or from another goroutine, with the server reading bodies whole, streaming them all and streaming past a threshold; also a stream reset mid-body, the body limits, the stream window pacing a slow handler, and OnBody holding the body back until the handler returns |
+| quiche, in a container (`http3/quicheinterop/run.sh`) | Both directions with both handshakes: 300 connections and 30 000 echoes, multiplexed streams, session resumption, 0-RTT in both directions (a GET goes in the first flight, a POST in early data is answered 425 and sent again, a server without early data is not sent any), certificate verification through `RootCAs` |
+| quic-go and fib, for early data (`http3/early_data_test.go`) | quic-go's client resuming and sending GET_0RTT to the fib server, the fib client sending early requests to quic-go's server, a server that does not accept it, a ticket used twice, and a 425 |
 | Two QUIC connections over an in-memory path | Handshake, transfers under 5% and 20% loss, stream limits, resets, application close, idle timeout, keep-alive, stateless reset, key updates (with the AEAD limits lowered) and the decryption failure limit |
 | Fuzzing (`go test -fuzz`) | The parsers that take untrusted bytes: the HTTP/3 frame parser, building requests from fields, QPACK decoding and its round trip, QUIC packet headers, transport parameters and 1-RTT frame handling |

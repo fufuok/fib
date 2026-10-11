@@ -177,6 +177,15 @@ type serverHS struct {
 	// secrets as events instead of records (RFC 9001).
 	quic       *quicCtx
 	peerParams []byte
+
+	// 0-RTT, for QUIC: whether the client's early data is accepted, the hash
+	// of the ClientHello its keys derive from, and, while the QUIC layer
+	// decides whether to accept it, what remains of the handshake and the
+	// session the layer is asked about.
+	earlyData   bool
+	earlyHash   []byte
+	pending     func() *hsError
+	resumeState *stdtls.SessionState
 }
 
 func (h *serverHS) now() time.Time {
@@ -726,11 +735,36 @@ func (h *serverHS) clientHello(msg []byte, out *[]byte) *hsError {
 	if herr := h.selectProtocol(); herr != nil {
 		return herr
 	}
+	if h.quic != nil && ch.earlyData && len(ch.psks) == 0 {
+		return fail(alertIllegalParameter, "early_data without pre_shared_key")
+	}
 	h.psk, h.resumed = nil, false
 	var pskIndex int
-	if psk, index, ok := h.resume(ch, h.transcript[:prior]); ok {
-		h.psk, h.resumed, pskIndex = psk, true, index
+	var ticket ticketState
+	if psk, index, state, ok := h.resume(ch, h.transcript[:prior]); ok {
+		h.psk, h.resumed, pskIndex, ticket = psk, true, index, state
 	}
+	rest := func() *hsError { return h.serve(ch, share, pskIndex, out) }
+	if h.quic != nil && ch.earlyData && h.resumed && h.earlyAcceptable(ch, ticket, pskIndex) {
+		// The QUIC layer has the last word, since it holds what the early
+		// data is bound by: it is asked, and the handshake goes on once it
+		// has answered (see QUICConn.NextEvent).
+		h.resumeState = &stdtls.SessionState{EarlyData: true, Extra: ticket.extra}
+		h.quic.resume(h.resumeState)
+		h.pending = func() *hsError {
+			if h.earlyData = h.resumeState.EarlyData; h.earlyData {
+				h.earlyHash = h.transcriptHash()
+			}
+			return rest()
+		}
+		return nil
+	}
+	return rest()
+}
+
+// serve is the rest of the answer to a ClientHello, once it is known whether
+// it resumes a session: the certificate, the key exchange, the flight.
+func (h *serverHS) serve(ch *clientHelloMsg, share *keyShare, pskIndex int, out *[]byte) *hsError {
 	if !h.resumed {
 		cert, herr := h.selectCertificate(ch)
 		if herr != nil {
@@ -758,15 +792,36 @@ func (h *serverHS) clientHello(msg []byte, out *[]byte) *hsError {
 	return h.flight(key, shared, pskIndex, out)
 }
 
+// earlyWindow is how far the age a client reports for its ticket may be from
+// the ticket's age here for the client's early data to be taken as fresh (RFC
+// 8446 section 8.3).
+const earlyWindow = 10 * time.Second
+
+// earlyAcceptable says whether the client's early data can be accepted with
+// the ticket it resumed: a ticket made for early data, the same suite and
+// protocol, the first ClientHello, a ticket age that fits, and a ticket that
+// has not carried early data before.
+func (h *serverHS) earlyAcceptable(ch *clientHelloMsg, ticket ticketState, index int) bool {
+	if !ticket.earlyData || index != 0 || h.retried || ticket.suite != h.suiteID || ticket.alpn != h.protocol {
+		return false
+	}
+	now := h.now()
+	reported := time.Duration(ch.psks[0].age-ticket.ageAdd) * time.Millisecond
+	if d := now.Sub(ticket.created) - reported; d > earlyWindow || d < -earlyWindow {
+		return false
+	}
+	return h.tickets.firstUse(ch.psks[0].identity, now)
+}
+
 // resume looks for a ticket among the ones the client offered that this
 // handshake can resume from, and returns its secret. A ticket is used only if
 // it is ours and unaltered, no older than it may be, for the same server name
 // and a suite with the hash of the one chosen now, and its binder, which
 // proves the client holds the secret, is right over the transcript and the
 // ClientHello as far as the binders (RFC 8446 section 4.2.11.2).
-func (h *serverHS) resume(ch *clientHelloMsg, prior []byte) (psk []byte, index int, ok bool) {
+func (h *serverHS) resume(ch *clientHelloMsg, prior []byte) (psk []byte, index int, state ticketState, ok bool) {
 	if h.tickets == nil || len(ch.psks) == 0 || !slices.Contains(ch.pskModes, 1) {
-		return nil, 0, false
+		return nil, 0, ticketState{}, false
 	}
 	f := h.suite.hash
 	truncated := ch.raw[:len(ch.raw)-ch.bindersLen]
@@ -794,10 +849,10 @@ func (h *serverHS) resume(ch *clientHelloMsg, prior []byte) (psk []byte, index i
 		mac := hmac.New(f, key)
 		mac.Write(hashed)
 		if hmac.Equal(mac.Sum(nil), ch.binders[i]) {
-			return state.psk, i, true
+			return state.psk, i, state, true
 		}
 	}
-	return nil, 0, false
+	return nil, 0, ticketState{}, false
 }
 
 // selectProtocol picks the ALPN protocol as crypto/tls does: the first of the
@@ -1006,6 +1061,16 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 	if err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
+	if h.earlyData {
+		// The client's 0-RTT packets are protected under a secret that
+		// covers its ClientHello alone (RFC 8446 section 7.1).
+		secret, err := deriveSecret(f, early, "c e traffic", h.earlyHash)
+		if err != nil {
+			return fail(alertInternalError, "%v", err)
+		}
+		h.keyLog("CLIENT_EARLY_TRAFFIC_SECRET", secret)
+		h.quic.setRead(stdtls.QUICEncryptionLevelEarly, h.suiteID, secret)
+	}
 	derived, err := deriveSecret(f, early, "derived", hashBytes(f, nil))
 	if err != nil {
 		return fail(alertInternalError, "%v", err)
@@ -1075,6 +1140,10 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 		if h.quic != nil {
 			b.u16(extQUICParams)
 			b.vec16(func(b *builder) { b.raw(h.quic.localParams) })
+		}
+		if h.earlyData {
+			b.u16(extEarlyData)
+			b.vec16(func(b *builder) {})
 		}
 	})
 	eem := ee.b
@@ -1260,7 +1329,7 @@ func (h *serverHS) finished(msg []byte, out *[]byte) *hsError {
 // 4.6.1), under the keys the connection goes on with, if the Config allows
 // tickets and the client said it can use them.
 func (h *serverHS) sendTicket(out *[]byte) *hsError {
-	msg, herr := h.ticketMessage()
+	msg, herr := h.ticketMessage(false, nil)
 	if herr != nil || msg == nil {
 		return herr
 	}
@@ -1274,7 +1343,7 @@ func (h *serverHS) sendTicket(out *[]byte) *hsError {
 
 // ticketMessage builds the NewSessionTicket for the session, or returns nil if
 // the Config disables tickets or the client cannot use them.
-func (h *serverHS) ticketMessage() ([]byte, *hsError) {
+func (h *serverHS) ticketMessage(earlyData bool, extra [][]byte) ([]byte, *hsError) {
 	if h.tickets == nil || !slices.Contains(h.ch.pskModes, 1) {
 		return nil, nil
 	}
@@ -1295,6 +1364,7 @@ func (h *serverHS) ticketMessage() ([]byte, *hsError) {
 	now := h.now()
 	ticket, ok := h.tickets.seal(ticketState{
 		suite: h.suiteID, created: now, ageAdd: binary.BigEndian.Uint32(ageAdd[:]), psk: psk, server: h.ch.serverName,
+		earlyData: earlyData, alpn: h.protocol, extra: extra,
 	}, now)
 	if !ok {
 		return nil, nil
@@ -1306,7 +1376,14 @@ func (h *serverHS) ticketMessage() ([]byte, *hsError) {
 	b.u32(binary.BigEndian.Uint32(ageAdd[:]))
 	b.vec8(func(b *builder) { b.raw(nonce) })
 	b.vec16(func(b *builder) { b.raw(ticket) })
-	b.vec16(func(b *builder) {})
+	b.vec16(func(b *builder) {
+		if earlyData {
+			// The ticket may be used for 0-RTT; QUIC always says "all of it"
+			// (RFC 9001 section 4.6.1).
+			b.u16(extEarlyData)
+			b.vec16(func(b *builder) { b.u32(0xffffffff) })
+		}
+	})
 	msg := b.b
 	msg[1], msg[2], msg[3] = byte((len(msg)-4)>>16), byte((len(msg)-4)>>8), byte(len(msg)-4)
 	return msg, nil

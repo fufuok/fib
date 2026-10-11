@@ -9,7 +9,9 @@ import (
 	"crypto/x509"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 // quicEnd is what crypto/tls's QUICConn and this package's both are.
@@ -38,6 +40,13 @@ type quicSide struct {
 	peer   []byte
 	done   bool
 	suite  uint16
+	// Sessions: what crypto/tls's client has to store, what a server was
+	// asked to resume, whether the server turned a client's early data away,
+	// and whether this side declines early data when asked.
+	stored   *stdtls.SessionState
+	resumed  *stdtls.SessionState
+	rejected bool
+	decline  bool
 }
 
 func newQuicSide(conn quicEnd) *quicSide {
@@ -77,6 +86,22 @@ func (s *quicSide) events(t *testing.T) {
 			t.Fatal("the transport parameters were asked for after they were set")
 		case stdtls.QUICHandshakeDone:
 			s.done = true
+		case stdtls.QUICStoreSession:
+			s.stored = e.SessionState
+			if std, ok := s.conn.(*stdtls.QUICConn); ok {
+				if err := std.StoreSession(e.SessionState); err != nil {
+					t.Fatal(err)
+				}
+			}
+		case stdtls.QUICResumeSession:
+			s.resumed = e.SessionState
+			if s.decline {
+				e.SessionState.EarlyData = false
+			}
+		case stdtls.QUICRejectedEarlyData:
+			s.rejected = true
+		case stdtls.QUICErrorEvent:
+			t.Fatalf("error event: %v", e.Err)
 		}
 	}
 }
@@ -86,7 +111,22 @@ func (s *quicSide) events(t *testing.T) {
 // error either gave. The server sends a ticket when it is done.
 func quicRun(t *testing.T, client, server quicEnd, chunk int) (*quicSide, *quicSide, error) {
 	t.Helper()
+	return quicRunWith(t, client, server, chunk, quicRunOptions{})
+}
+
+// quicRunOptions are what a run of quicRun sets differently: the ticket the
+// server sends, and whether the server declines early data when it is asked.
+type quicRunOptions struct {
+	ticket         stdtls.QUICSessionTicketOptions
+	serverDeclines bool
+	clientDeclines bool
+}
+
+func quicRunWith(t *testing.T, client, server quicEnd, chunk int, opts quicRunOptions) (*quicSide, *quicSide, error) {
+	t.Helper()
 	cli, srv := newQuicSide(client), newQuicSide(server)
+	srv.decline = opts.serverDeclines
+	cli.decline = opts.clientDeclines
 	client.SetTransportParameters([]byte("client parameters"))
 	server.SetTransportParameters([]byte("server parameters"))
 	if err := client.Start(context.Background()); err != nil {
@@ -122,7 +162,7 @@ func quicRun(t *testing.T, client, server quicEnd, chunk int) (*quicSide, *quicS
 		}
 		if srv.done && !ticketSent {
 			ticketSent = true
-			if err := server.SendSessionTicket(stdtls.QUICSessionTicketOptions{}); err != nil {
+			if err := server.SendSessionTicket(opts.ticket); err != nil {
 				return cli, srv, err
 			}
 			moved = true
@@ -301,8 +341,20 @@ func TestQUICHandshakeOptions(t *testing.T) {
 	})
 	t.Run("untrusted certificate", func(t *testing.T) {
 		_, _, err := quicRun(t, ourClient(t, quicClientConfig(x509.NewCertPool(), nil)), stdServer(quicServerConfig(cert, nil)), 4096)
+		// As crypto/tls's QUICConn reports it: the cause, and the alert.
 		var verify *stdtls.CertificateVerificationError
-		if !errors.As(err, &verify) && err == nil {
+		var alert stdtls.AlertError
+		if err == nil || !errors.As(err, &verify) || !errors.As(err, &alert) || alert != 42 {
+			t.Fatalf("got %v", err)
+		}
+		if !strings.Contains(err.Error(), "unknown authority") {
+			t.Fatalf("the error does not say why: %v", err)
+		}
+	})
+	t.Run("a name the certificate lacks", func(t *testing.T) {
+		_, _, err := quicRun(t, ourClient(t, quicClientConfig(pool, func(c *stdtls.Config) { c.ServerName = "other.invalid" })),
+			stdServer(quicServerConfig(cert, nil)), 4096)
+		if err == nil || !strings.Contains(err.Error(), "not other.invalid") {
 			t.Fatalf("got %v", err)
 		}
 	})
@@ -404,5 +456,286 @@ func TestQUICQualification(t *testing.T) {
 	}
 	if NewQUICServer(&stdtls.Config{Certificates: []stdtls.Certificate{cert}}) == nil {
 		t.Error("an ordinary server does not qualify")
+	}
+}
+
+// quicEarlyClient is crypto/tls's client, with the events that let it resume
+// and send early data.
+func quicEarlyClient(pool *x509.CertPool, cache stdtls.ClientSessionCache) *stdtls.QUICConn {
+	config := quicClientConfig(pool, func(c *stdtls.Config) { c.ClientSessionCache = cache })
+	return stdtls.QUICClient(&stdtls.QUICConfig{TLSConfig: config, EnableSessionEvents: true})
+}
+
+func TestQUICServerEarlyData(t *testing.T) {
+	cert, pool := issueCert(t, keyOf(t, "ecdsa-p256"))
+	key := [32]byte{1, 2, 3}
+	config := quicServerConfig(cert, func(c *stdtls.Config) { c.SessionTicketKey = key })
+	server := NewQUICServer(config)
+	ticket := stdtls.QUICSessionTicketOptions{EarlyData: true, Extra: [][]byte{[]byte("params one"), []byte("two")}}
+
+	// connect runs a connection of crypto/tls's client against ours.
+	connect := func(t *testing.T, server *QUICServer, cache stdtls.ClientSessionCache, opts quicRunOptions) (cli, srv *quicSide, conn *QUICConn) {
+		t.Helper()
+		conn = server.NewConn()
+		var err error
+		cli, srv, err = quicRunWith(t, quicEarlyClient(pool, cache), conn, 4096, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		quicCheck(t, cli, srv)
+		return cli, srv, conn
+	}
+	// withSession is a cache holding state, which a client tries to resume.
+	withSession := func(state *stdtls.SessionState) stdtls.ClientSessionCache {
+		cache := stdtls.NewLRUClientSessionCache(2)
+		if err := quicEarlyClient(pool, cache).StoreSession(state); err != nil {
+			t.Fatal(err)
+		}
+		return cache
+	}
+	issue := func(t *testing.T, opts stdtls.QUICSessionTicketOptions) *stdtls.SessionState {
+		t.Helper()
+		cli, _, _ := connect(t, server, stdtls.NewLRUClientSessionCache(2), quicRunOptions{ticket: opts})
+		if cli.stored == nil {
+			t.Fatal("no session to store")
+		}
+		return cli.stored
+	}
+
+	saved := issue(t, ticket)
+	if !saved.EarlyData {
+		t.Fatal("the ticket does not allow early data")
+	}
+
+	t.Run("accepted", func(t *testing.T) {
+		cli, srv, conn := connect(t, server, withSession(saved), quicRunOptions{})
+		if len(cli.writes[stdtls.QUICEncryptionLevelEarly]) == 0 {
+			t.Fatal("the client did not offer early data")
+		}
+		if !bytes.Equal(cli.writes[stdtls.QUICEncryptionLevelEarly], srv.reads[stdtls.QUICEncryptionLevelEarly]) {
+			t.Fatalf("early secrets: client %x, server %x", cli.writes[stdtls.QUICEncryptionLevelEarly], srv.reads[stdtls.QUICEncryptionLevelEarly])
+		}
+		if cli.rejected {
+			t.Fatal("the client was told its early data was rejected")
+		}
+		if srv.resumed == nil || len(srv.resumed.Extra) != 2 || string(srv.resumed.Extra[0]) != "params one" || string(srv.resumed.Extra[1]) != "two" {
+			t.Fatalf("the layer was asked about %+v", srv.resumed)
+		}
+		if !conn.ConnectionState().DidResume {
+			t.Fatal("not resumed")
+		}
+	})
+
+	t.Run("a ticket carries early data once", func(t *testing.T) {
+		// "accepted" used it.
+		cli, srv, conn := connect(t, server, withSession(saved), quicRunOptions{})
+		if len(cli.writes[stdtls.QUICEncryptionLevelEarly]) == 0 || !cli.rejected {
+			t.Fatalf("the client offered %d bytes of secret and was told rejected = %v", len(cli.writes[stdtls.QUICEncryptionLevelEarly]), cli.rejected)
+		}
+		if len(srv.reads[stdtls.QUICEncryptionLevelEarly]) != 0 || srv.resumed != nil {
+			t.Fatal("the server took the replay")
+		}
+		if !conn.ConnectionState().DidResume {
+			t.Fatal("the session should still resume")
+		}
+	})
+
+	t.Run("declined by the layer", func(t *testing.T) {
+		fresh := issue(t, ticket)
+		cli, srv, conn := connect(t, server, withSession(fresh), quicRunOptions{serverDeclines: true})
+		if srv.resumed == nil || !cli.rejected || len(srv.reads[stdtls.QUICEncryptionLevelEarly]) != 0 || !conn.ConnectionState().DidResume {
+			t.Fatalf("asked %v, rejected %v, early read %d, resumed %v", srv.resumed != nil, cli.rejected,
+				len(srv.reads[stdtls.QUICEncryptionLevelEarly]), conn.ConnectionState().DidResume)
+		}
+	})
+
+	t.Run("a ticket that does not allow it", func(t *testing.T) {
+		plain := issue(t, stdtls.QUICSessionTicketOptions{})
+		if plain.EarlyData {
+			t.Fatal("early data allowed")
+		}
+		cli, srv, conn := connect(t, server, withSession(plain), quicRunOptions{})
+		if len(cli.writes[stdtls.QUICEncryptionLevelEarly]) != 0 || srv.resumed != nil || !conn.ConnectionState().DidResume {
+			t.Fatal("expected a plain resumption")
+		}
+	})
+
+	t.Run("a ticket too far from its age", func(t *testing.T) {
+		fresh := issue(t, ticket)
+		later := quicServerConfig(cert, func(c *stdtls.Config) {
+			c.SessionTicketKey = key
+			c.Time = func() time.Time { return time.Now().Add(time.Minute) }
+		})
+		cli, srv, _ := connect(t, NewQUICServer(later), withSession(fresh), quicRunOptions{})
+		if !cli.rejected || len(srv.reads[stdtls.QUICEncryptionLevelEarly]) != 0 {
+			t.Fatal("early data was accepted for a ticket whose age does not fit")
+		}
+	})
+}
+
+// stdEarlyServer is crypto/tls's server, with the events that let it take
+// early data.
+func stdEarlyServer(config *stdtls.Config) *stdtls.QUICConn {
+	return stdtls.QUICServer(&stdtls.QUICConfig{TLSConfig: config, EnableSessionEvents: true})
+}
+
+func TestQUICClientResumes(t *testing.T) {
+	cert, pool := issueCert(t, keyOf(t, "ecdsa-p256"))
+	key := [32]byte{9, 9, 9}
+	serverConfig := func(configure func(*stdtls.Config)) *stdtls.Config {
+		return quicServerConfig(cert, func(c *stdtls.Config) {
+			c.SessionTicketKey = key
+			if configure != nil {
+				configure(c)
+			}
+		})
+	}
+	ticket := stdtls.QUICSessionTicketOptions{EarlyData: true, Extra: [][]byte{[]byte("limits")}}
+
+	// servers: a way to make the server of a connection, ours or crypto/tls's.
+	servers := map[string]func(*stdtls.Config) func() quicEnd{
+		"ours": func(c *stdtls.Config) func() quicEnd {
+			s := NewQUICServer(c)
+			return func() quicEnd { return s.NewConn() }
+		},
+		"crypto/tls": func(c *stdtls.Config) func() quicEnd {
+			return func() quicEnd { return stdEarlyServer(c) }
+		},
+	}
+	for name, makeServer := range servers {
+		t.Run(name, func(t *testing.T) {
+			// connect runs a client with the cache against a new server connection.
+			connect := func(t *testing.T, cache QUICSessionCache, newServer func() quicEnd, clientConfig func(*stdtls.Config), opts quicRunOptions) (*quicSide, *quicSide, *QUICConn, quicEnd) {
+				t.Helper()
+				client := NewQUICClientWithSessions(quicClientConfig(pool, clientConfig), cache)
+				if client == nil {
+					t.Fatal("the client Config does not qualify")
+				}
+				server := newServer()
+				opts.ticket = ticket
+				cli, srv, err := quicRunWith(t, client, server, 4096, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				quicCheck(t, cli, srv)
+				return cli, srv, client, server
+			}
+			newServer := makeServer(serverConfig(nil))
+			cache := NewQUICSessionCache(4)
+
+			cli, _, client, _ := connect(t, cache, newServer, nil, quicRunOptions{})
+			if cli.resumed != nil || client.ConnectionState().DidResume {
+				t.Fatal("the first connection resumed")
+			}
+			if cache.Get("localhost") == nil {
+				t.Fatal("no session was kept")
+			}
+
+			t.Run("accepted", func(t *testing.T) {
+				cli, srv, client, server := connect(t, cache, newServer, nil, quicRunOptions{})
+				if !client.ConnectionState().DidResume || !server.ConnectionState().DidResume {
+					t.Fatal("not resumed")
+				}
+				if cli.resumed == nil || len(cli.resumed.Extra) != 1 || cli.resumed.Extra[0][0] != 1 || string(cli.resumed.Extra[0][1:]) != "server parameters" {
+					t.Fatalf("the layer was asked about %+v", cli.resumed)
+				}
+				early := cli.writes[stdtls.QUICEncryptionLevelEarly]
+				if len(early) == 0 || !bytes.Equal(early, srv.reads[stdtls.QUICEncryptionLevelEarly]) {
+					t.Fatalf("early secrets: client %x, server %x", early, srv.reads[stdtls.QUICEncryptionLevelEarly])
+				}
+				if cli.rejected {
+					t.Fatal("rejected")
+				}
+				if len(client.ConnectionState().PeerCertificates) != 1 {
+					t.Fatal("no peer certificate on the resumed connection")
+				}
+				if cache.Get("localhost") == nil {
+					t.Fatal("the resumed connection kept no session")
+				}
+			})
+
+			// fresh fills the cache with a session of a full handshake.
+			fresh := func(t *testing.T, newServer func() quicEnd) {
+				t.Helper()
+				cache.Put("localhost", nil)
+				connect(t, cache, newServer, nil, quicRunOptions{})
+				if cache.Get("localhost") == nil {
+					t.Fatal("no session was kept")
+				}
+			}
+			earlyOf := func(side *quicSide) int { return len(side.writes[stdtls.QUICEncryptionLevelEarly]) }
+
+			t.Run("the client declines early data", func(t *testing.T) {
+				fresh(t, newServer)
+				cli, srv, client, server := connect(t, cache, newServer, nil, quicRunOptions{clientDeclines: true})
+				if !client.ConnectionState().DidResume || !server.ConnectionState().DidResume {
+					t.Fatal("not resumed")
+				}
+				if cli.resumed == nil || earlyOf(cli) != 0 || len(srv.reads[stdtls.QUICEncryptionLevelEarly]) != 0 || cli.rejected {
+					t.Fatalf("asked %v, early secret %d, rejected %v", cli.resumed != nil, earlyOf(cli), cli.rejected)
+				}
+			})
+
+			t.Run("the server declines early data", func(t *testing.T) {
+				fresh(t, newServer)
+				cli, srv, client, server := connect(t, cache, newServer, nil, quicRunOptions{serverDeclines: true})
+				if !client.ConnectionState().DidResume || !server.ConnectionState().DidResume {
+					t.Fatal("not resumed")
+				}
+				if earlyOf(cli) == 0 || !cli.rejected || len(srv.reads[stdtls.QUICEncryptionLevelEarly]) != 0 {
+					t.Fatalf("early secret %d, rejected %v", earlyOf(cli), cli.rejected)
+				}
+			})
+
+			t.Run("a server that does not know the ticket", func(t *testing.T) {
+				fresh(t, newServer)
+				other := makeServer(quicServerConfig(cert, func(c *stdtls.Config) { c.SessionTicketKey = [32]byte{7} }))
+				cli, _, client, _ := connect(t, cache, other, nil, quicRunOptions{})
+				if client.ConnectionState().DidResume {
+					t.Fatal("resumed")
+				}
+				if earlyOf(cli) == 0 || !cli.rejected {
+					t.Fatalf("early secret %d, rejected %v", earlyOf(cli), cli.rejected)
+				}
+				if len(client.ConnectionState().PeerCertificates) != 1 {
+					t.Fatal("the certificate was not checked")
+				}
+				if cache.Get("localhost") == nil {
+					t.Fatal("the new session was not kept")
+				}
+			})
+
+			t.Run("a HelloRetryRequest", func(t *testing.T) {
+				fresh(t, newServer)
+				retry := makeServer(serverConfig(func(c *stdtls.Config) { c.CurvePreferences = []stdtls.CurveID{stdtls.CurveP256} }))
+				cli, _, client, server := connect(t, cache, retry, nil, quicRunOptions{})
+				if !client.ConnectionState().DidResume || !server.ConnectionState().DidResume {
+					t.Fatal("the session was not resumed after the retry")
+				}
+				if !cli.rejected {
+					t.Fatal("early data survived a HelloRetryRequest")
+				}
+			})
+
+			t.Run("a session that has expired", func(t *testing.T) {
+				fresh(t, newServer)
+				s := cache.Get("localhost")
+				s.received = s.received.Add(-2 * s.lifetime)
+				cli, _, client, _ := connect(t, cache, newServer, nil, quicRunOptions{})
+				if cli.resumed != nil || client.ConnectionState().DidResume {
+					t.Fatal("an expired session was offered")
+				}
+			})
+
+			t.Run("a ticket is used once", func(t *testing.T) {
+				fresh(t, newServer)
+				connect(t, cache, newServer, nil, quicRunOptions{})
+				s := cache.Get("localhost")
+				connect(t, cache, newServer, nil, quicRunOptions{})
+				if cache.Get("localhost") == s {
+					t.Fatal("the session that was used is still in the cache")
+				}
+			})
+		})
 	}
 }

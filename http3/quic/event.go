@@ -11,6 +11,8 @@ const (
 	evStopSending
 	evStreamsAvailable
 	evHandshake
+	// evEarlyData is EarlyDataHandler's OnEarlyData.
+	evEarlyData
 	// evPath is PathHandler's OnPathChange.
 	evPath
 	evClose
@@ -50,6 +52,8 @@ func (c *Conn) run(e *event) {
 		c.handler.OnStreamsAvailable(c)
 	case evHandshake:
 		c.handler.OnHandshake(c)
+	case evEarlyData:
+		c.handler.(EarlyDataHandler).OnEarlyData(c)
 	case evPath:
 		if h, ok := c.handler.(PathHandler); ok {
 			h.OnPathChange(c)

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fib "github.com/lesismal/fib"
@@ -90,6 +91,21 @@ type ClientConfig struct {
 	// waits for the server. By default the handshake is a state machine that
 	// takes none, where the TLSConfig allows it (see package tls).
 	BlockingTLSHandshake bool
+	// EarlyData sends the requests that are safe to repeat, those with a
+	// GET, HEAD, OPTIONS or TRACE method and no body, as 0-RTT data when the
+	// client has a session to resume from the server it connects to: they
+	// leave with the first flight, a round trip before the handshake is over
+	// (RFC 9001 section 4.6). 0-RTT data is not protected against replay, and
+	// a server may answer it 425 Too Early (RFC 8470), in which case the
+	// request is sent again once the handshake is over. The session comes from
+	// SessionCache.
+	EarlyData bool
+	// SessionCache holds the sessions connections resume from, and the
+	// tickets of those that end up in it. With EarlyData and none given, the
+	// client keeps a cache of its own. It is used by this module's TLS
+	// handshake; with BlockingTLSHandshake, or a TLSConfig that sets
+	// ClientSessionCache, the sessions are the TLSConfig's.
+	SessionCache fibtls.QUICSessionCache
 	// TLSConfig is used for every connection. Nil means the defaults;
 	// either way a config naming no server gets the request's host, and
 	// ALPN offers "h3".
@@ -127,9 +143,35 @@ type Client struct {
 	engine    *fib.Engine
 	config    ClientConfig
 	tlsConfig *tls.Config
+	sessions  fibtls.QUICSessionCache
 	mu        sync.Mutex
 	conns     map[string]*clientConn
 	closed    bool
+
+	resumed, earlySent, earlyAccepted, earlyRejected, tooEarly atomic.Uint64
+}
+
+// ClientStats counts what resumption and 0-RTT have done for a Client.
+type ClientStats struct {
+	// Resumed is the connections whose handshake resumed a session.
+	Resumed uint64
+	// EarlySent is the requests sent as 0-RTT data. By the end of the handshake
+	// each is accepted, the server having taken the early data, or rejected,
+	// the server having turned it away so that it was sent again once the
+	// handshake was over. TooEarly is those the server answered 425, which
+	// were sent again.
+	EarlySent, EarlyAccepted, EarlyRejected, TooEarly uint64
+}
+
+// Stats reports what resumption and 0-RTT have done so far.
+func (c *Client) Stats() ClientStats {
+	return ClientStats{
+		Resumed:       c.resumed.Load(),
+		EarlySent:     c.earlySent.Load(),
+		EarlyAccepted: c.earlyAccepted.Load(),
+		EarlyRejected: c.earlyRejected.Load(),
+		TooEarly:      c.tooEarly.Load(),
+	}
 }
 
 // NewClient returns a client that dials through engine. Zero values in
@@ -155,7 +197,11 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 	tlsConfig = tlsConfig.Clone()
 	tlsConfig.NextProtos = []string{NextProto}
 	tlsConfig.MinVersion = max(tlsConfig.MinVersion, tls.VersionTLS13)
-	return &Client{engine: engine, config: config, tlsConfig: tlsConfig, conns: make(map[string]*clientConn)}
+	sessions := config.SessionCache
+	if sessions == nil && config.EarlyData {
+		sessions = fibtls.NewQUICSessionCache(64)
+	}
+	return &Client{engine: engine, config: config, tlsConfig: tlsConfig, sessions: sessions, conns: make(map[string]*clientConn)}
 }
 
 // Do sends req and calls callback exactly once with its response or the
@@ -344,6 +390,24 @@ type clientRequest struct {
 	// retried is set once the request has been sent again, which happens
 	// at most once.
 	retried bool
+	// noEarly is set once the request has been answered 425 Too Early: it
+	// goes out again only after the handshake.
+	noEarly bool
+}
+
+// canGoEarly says whether the request may be sent as 0-RTT data, which can be
+// replayed: one that changes nothing, and has nothing to send after its header.
+func (r *clientRequest) canGoEarly() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.noEarly || len(r.body) > 0 || len(r.trailer) > 0 {
+		return false
+	}
+	switch r.req.Method {
+	case "", stdhttp.MethodGet, stdhttp.MethodHead, stdhttp.MethodOptions, stdhttp.MethodTrace:
+		return true
+	}
+	return false
 }
 
 // finish calls the callback, unless it has been called already.
@@ -539,7 +603,12 @@ type clientConn struct {
 	qc       *quic.Conn
 	tlsState *tls.ConnectionState
 	ready    bool
-	closed   bool
+	// early says the connection can carry requests as 0-RTT data before it
+	// is ready; controlOpen that the control stream has been opened.
+	early       bool
+	earlySent   uint64
+	controlOpen bool
+	closed      bool
 	// goingAway is set once the server has said it takes no more
 	// requests, or the client is done with the connection.
 	goingAway bool
@@ -555,7 +624,7 @@ func (c *Client) newTLS() func(bool, *tls.Config) quic.TLSConn {
 		return nil
 	}
 	return func(_ bool, config *tls.Config) quic.TLSConn {
-		if conn := fibtls.NewQUICClient(config); conn != nil {
+		if conn := fibtls.NewQUICClientWithSessions(config, c.sessions); conn != nil {
 			return conn
 		}
 		return nil
@@ -587,6 +656,7 @@ func (cc *clientConn) dial() {
 			// fib hands each datagram over as a buffer of its own from the
 			// pool, which QUIC gives back once it has done with it.
 			RecycleDatagrams: true,
+			EarlyData:        c.config.EarlyData,
 		}
 		cc.mu.Lock()
 		cc.fc = fc
@@ -596,6 +666,12 @@ func (cc *clientConn) dial() {
 		if err != nil {
 			fc.Close()
 			cc.failed(err)
+			return
+		}
+		if qc.CanSendEarly() {
+			// The handshake resumes a session that allows 0-RTT: requests that
+			// are safe to repeat go now, with its first flight.
+			cc.startEarly(qc)
 		}
 	})
 	if err != nil {
@@ -655,43 +731,101 @@ func (p clientPath) OnClose(_ *fib.Connection, err error) {
 
 func (cc *clientConn) OnHandshake(qc *quic.Conn) {
 	state := qc.ConnectionState()
-	if _, err := openControl(qc, cc.client.config.MaxResponseHeaderBytes); err != nil {
-		closeWith(qc, connErr(ErrCodeStreamCreationError, "cannot open the control stream"))
+	if !cc.openControlOnce(qc) {
 		return
 	}
 	cc.mu.Lock()
 	cc.tlsState = &state
 	cc.ready = true
+	early := cc.earlySent
+	cc.mu.Unlock()
+	c := cc.client
+	if state.DidResume {
+		c.resumed.Add(1)
+	}
+	if early > 0 {
+		if qc.EarlyDataAccepted() {
+			c.earlyAccepted.Add(early)
+		} else {
+			c.earlyRejected.Add(early)
+		}
+	}
+	cc.startWaiting()
+}
+
+// openControlOnce opens the connection's control stream, with its SETTINGS,
+// if that has not been done. It reports false if the connection had to be
+// closed for it.
+func (cc *clientConn) openControlOnce(qc *quic.Conn) bool {
+	cc.mu.Lock()
+	opened := cc.controlOpen
+	cc.controlOpen = true
+	cc.mu.Unlock()
+	if opened {
+		return true
+	}
+	if _, err := openControl(qc, cc.client.config.MaxResponseHeaderBytes); err != nil {
+		closeWith(qc, connErr(ErrCodeStreamCreationError, "cannot open the control stream"))
+		return false
+	}
+	return true
+}
+
+// startEarly lets the requests waiting go as 0-RTT data, ahead of the
+// handshake.
+func (cc *clientConn) startEarly(qc *quic.Conn) {
+	if !cc.openControlOnce(qc) {
+		return
+	}
+	cc.mu.Lock()
+	cc.early = true
 	cc.mu.Unlock()
 	cc.startWaiting()
 }
 
 // startWaiting puts waiting requests on streams, as many as the server
-// allows.
+// allows. Before the handshake is over, those that may go as 0-RTT data are
+// the only ones that go.
 func (cc *clientConn) startWaiting() {
 	for {
 		cc.mu.Lock()
-		if !cc.ready || cc.closed || cc.goingAway || len(cc.waiting) == 0 {
+		if cc.closed || cc.goingAway || len(cc.waiting) == 0 || !cc.ready && !cc.early {
 			cc.mu.Unlock()
 			return
 		}
-		r := cc.waiting[0]
+		at := 0
+		if !cc.ready {
+			at = -1
+			for i, r := range cc.waiting {
+				if r.canGoEarly() {
+					at = i
+					break
+				}
+			}
+			if at < 0 {
+				cc.mu.Unlock()
+				return
+			}
+		}
+		r := cc.waiting[at]
 		if r.isDone() {
-			cc.waiting = cc.waiting[1:]
+			cc.waiting = slices.Delete(cc.waiting, at, at+1)
 			cc.mu.Unlock()
 			continue
 		}
 		s, err := cc.qc.OpenStream()
-		if errors.Is(err, quic.ErrStreamLimit) {
-			cc.mu.Unlock()
-			return
-		}
 		if err != nil {
+			// The stream limit, or no early data after all: it waits.
 			cc.mu.Unlock()
 			return
 		}
-		cc.waiting = cc.waiting[1:]
-		st := &clientStream{cc: cc, s: s, r: r, parser: frameParser{maxFrame: uint64(cc.client.config.MaxResponseHeaderBytes)}}
+		early := !cc.ready
+		if early {
+			cc.earlySent++
+			cc.client.earlySent.Add(1)
+		}
+		cc.waiting = slices.Delete(cc.waiting, at, at+1)
+		st := &clientStream{cc: cc, s: s, r: r, early: early, parser: frameParser{maxFrame: uint64(cc.client.config.MaxResponseHeaderBytes)}}
 		if cc.client.config.StreamResponseBody && !r.whole {
 			// The stream's flow control is given back from here, so that a
 			// body that streams paces the server; see clientStream.feed.
@@ -859,9 +993,11 @@ func (cc *clientConn) closeIfIdle() {
 
 // clientStream is one request's stream.
 type clientStream struct {
-	cc     *clientConn
-	s      *quic.Stream
-	r      *clientRequest
+	cc *clientConn
+	s  *quic.Stream
+	r  *clientRequest
+	// early says the request was sent as 0-RTT data.
+	early  bool
 	parser frameParser
 	resp   *stdhttp.Response
 	body   []byte
@@ -1011,6 +1147,13 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 		st.fail(fmt.Errorf("http3: malformed response: %w", err))
 		return nil
 	}
+	if resp != nil && st.early && resp.StatusCode == stdhttp.StatusTooEarly {
+		// The server will not answer what it took as early data, which may be
+		// a replay: the request goes again once the handshake is over
+		// (RFC 8470 section 5.2).
+		st.tooEarly()
+		return nil
+	}
 	// A nil response is an interim one, which only precedes the answer.
 	st.resp = resp
 	config := &st.cc.client.config
@@ -1035,6 +1178,28 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 		st.stream.Start()
 	}
 	return nil
+}
+
+// tooEarly gives up on the stream of a request the server answered 425, and
+// queues the request to go again, at the head of the line, and not as early
+// data.
+func (st *clientStream) tooEarly() {
+	st.done = true
+	st.body = nil
+	abortStream(st.s, ErrCodeRequestCancelled)
+	r, cc := st.r, st.cc
+	cc.client.tooEarly.Add(1)
+	r.mu.Lock()
+	r.noEarly = true
+	r.stream = nil
+	r.mu.Unlock()
+	cc.mu.Lock()
+	if cc.streams[st.s.ID()] == st {
+		delete(cc.streams, st.s.ID())
+	}
+	cc.waiting = append([]*clientRequest{r}, cc.waiting...)
+	cc.mu.Unlock()
+	cc.startWaiting()
 }
 
 // complete hands a finished response to its request.

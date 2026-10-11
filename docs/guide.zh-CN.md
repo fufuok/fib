@@ -449,7 +449,12 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
     change_cipher_spec；TLS 保护不了任何记录，所以三个套件（含 ChaCha20-Poly1305）都能用。客户端的 `Config` 不满足条件
     （客户端证书、`ClientSessionCache`、ECH）时用 `crypto/tls`；服务端像 TCP 一样先读完 ClientHello 再决定，不能服务的（没有
     QUIC 传输参数、ALPN 对不上、带 session ID、没有共同套件或曲线、解析不了）在发出任何东西之前交给 `crypto/tls`。会话票据同
-    TCP（PSK 恢复，不支持 0-RTT）。
+    TCP（PSK 恢复），QUIC 上还支持 0-RTT：服务端的票据带 early_data 扩展、记住签发时的传输限制，收到 early data 时先用
+    `QUICResumeSession` 事件问 QUIC 层要不要接受（限制被调低就不接受），再导出早期密钥；每张票据只接受一次 early data（登记表
+    在 `Handler` 里）、票据年龄偏差超过 10 秒或经过 HelloRetryRequest 也拒绝。客户端用自己的会话缓存（`tls.NewQUICSessionCache`，
+    `crypto/tls` 的 `ClientSessionState` 里的密钥只有它自己读得到）：ClientHello 带 psk_key_exchange_modes 和 pre_shared_key
+    （HelloRetryRequest 之后重算 binder），票据被服务端拒绝时回退成完整握手，服务端不接受 early data 时发出 `QUICRejectedEarlyData`
+    事件；恢复的连接没有证书可验，`PeerCertificates` 用会话里保存的。详见 [`docs/http3.zh-CN.md`](http3.zh-CN.md) 的 0-RTT 一节。
   - **开关**：`http.ClientConfig.BlockingTLSHandshake`、`websocket.DialerConfig.BlockingTLSHandshake`、`http3.ClientConfig.BlockingTLSHandshake`、
     `http3.Config.BlockingTLSHandshake`（以及 `tls.Handler.Blocking`、`tls.DialOptions.Blocking`）设为 true 时，握手改走 `crypto/tls`
     （TCP 上占握手池里的一个协程，QUIC 上占 `QUICConn` 内部的一个协程），默认（false）走状态机。对比压测见 `http` 包的
@@ -1120,7 +1125,7 @@ QUIC 层的实现要点：
   ChaCha20-Poly1305（标准库没有导出 ChaCha20-Poly1305，本库按 RFC 8439 自行实现，
   并用 RFC 9001 附录的测试向量校验）；密钥更新（key update）双向支持：一把密钥保护的
   包数达到 RFC 9001 §6.6 的上限时主动发起，也响应对端发起的更新，解密失败次数超过
-  完整性上限时关闭连接；客户端支持 Retry。不支持 0-RTT。
+  完整性上限时关闭连接；客户端支持 Retry。支持 0-RTT（默认关闭，`quic.Config.EarlyData`）。
 - 丢包检测与拥塞控制按 RFC 9002 实现：ACK 阈值和时间阈值判定丢包、PTO 探测、
   NewReno 拥塞控制；服务端在验证客户端地址前遵守 3 倍放大限制。发出的数据报固定为
   1200 字节（所有 IPv6 路径都能承载的大小），因此不需要 PMTU 探测。
@@ -1136,7 +1141,7 @@ QUIC 层的实现要点：
 HTTP/3 的一致性测试（与 quic-go 客户端、服务端的双向互通，以及用手写帧构造的协议错误
 用例，CI 中在三个平台运行；quic-go 放在 `http3/interop` 这个独立 module 里，fib 本身
 不增加依赖）、当前的限制（只跟随 NAT 重绑定、不支持主动迁移、固定 1200 字节数据报、关闭时
-没有 closing/draining 期等）、有意未实现的功能及原因（0-RTT、QPACK 动态表、server push
+没有 closing/draining 期等）、0-RTT 的做法与防重放、有意未实现的功能及原因（QPACK 动态表、server push
 等），以及待优化项（安全加固、pacing、PMTU 探测、拥塞控制、批量收发等）见
 [`docs/http3.zh-CN.md`](http3.zh-CN.md)。
 

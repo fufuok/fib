@@ -49,7 +49,9 @@ type sentPacket struct {
 	size         int
 	ackEliciting bool
 	inFlight     bool
-	frames       []sentFrame
+	// early says the packet was sent as 0-RTT data.
+	early  bool
+	frames []sentFrame
 }
 
 // maxFreeSent bounds the sent packets a connection keeps for reuse, and
@@ -233,9 +235,10 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 		c.ackedScratch = acked[:0]
 	}()
 	newest := acked[len(acked)-1]
-	eliciting := false
+	eliciting, oneRTT := false, false
 	for _, p := range acked {
 		eliciting = eliciting || p.ackEliciting
+		oneRTT = oneRTT || !p.early
 	}
 	if newest.pn == largest && eliciting {
 		if space == spaceInitial {
@@ -268,7 +271,7 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 		// A key update may follow an acknowledged packet of this phase.
 		c.txPhaseAcked = true
 	}
-	if space == spaceApp && c.isClient && !c.handshakeConfirmed {
+	if space == spaceApp && c.isClient && !c.handshakeConfirmed && oneRTT {
 		// An acknowledged 1-RTT packet confirms the handshake as well as
 		// HANDSHAKE_DONE would (RFC 9001 section 4.1.2).
 		c.confirmHandshake()
@@ -532,4 +535,34 @@ func (c *Conn) discardSpace(space int) {
 	}
 	*s = pnSpace{discarded: true, largestAcked: s.largestAcked}
 	c.ptoCount = 0
+}
+
+// rejectEarlyLocked is what a client does when the server turns its 0-RTT data
+// away, or a Retry makes it start over: the early packets are given up on,
+// without the congestion response a loss gets, and what they carried is
+// sent again. Callers hold c.mu.
+func (c *Conn) resendEarlyLocked() {
+	s := &c.spaces[spaceApp]
+	kept := s.sent[:0]
+	for _, p := range s.sent {
+		if !p.early {
+			kept = append(kept, p)
+			continue
+		}
+		if p.ackEliciting {
+			s.ackElicitingInFlight--
+		}
+		if p.inFlight {
+			c.cc.bytesInFlight -= uint64(p.size)
+		}
+		for i := range p.frames {
+			c.frameLost(spaceApp, &p.frames[i])
+		}
+		c.releaseSent(p)
+	}
+	for i := len(kept); i < len(s.sent); i++ {
+		s.sent[i] = nil
+	}
+	s.sent = kept
+	c.wantFlush = true
 }

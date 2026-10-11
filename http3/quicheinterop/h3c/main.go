@@ -15,6 +15,7 @@ import (
 	"crypto/x509/pkix"
 	"flag"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	fib "github.com/lesismal/fib"
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3"
+	fibtls "github.com/lesismal/fib/tls"
 )
 
 func main() {
@@ -33,6 +35,8 @@ func main() {
 	blocking := flag.Bool("blocking", false, "use crypto/tls's QUICConn for the handshake")
 	conns := flag.Int("n", 200, "connections, each with its own handshake")
 	verify := flag.Bool("verify", false, "check certificate verification (RootCAs, ServerName) instead of the load")
+	resume := flag.Int("resume", 0, "connect this many times in turn, each resuming the session of the one before, instead of the load")
+	wantEarly := flag.Bool("want-early", false, "with -resume, require the requests after the first to go as 0-RTT data the server accepts")
 	flag.Parse()
 
 	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
@@ -101,6 +105,9 @@ func main() {
 
 	if *verify {
 		os.Exit(verifyCertificates(engine, config, echo))
+	}
+	if *resume > 0 {
+		os.Exit(resumeSessions(engine, config, *addr, *resume, *wantEarly, *blocking))
 	}
 
 	start := time.Now()
@@ -202,4 +209,59 @@ func selfSigned() *x509.Certificate {
 	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
 	cert, _ := x509.ParseCertificate(der)
 	return cert
+}
+
+// resumeSessions connects n times, each connection a new client that resumes
+// the session of the one before and, if the session allows, sends its GET as
+// 0-RTT data. It returns the exit code.
+func resumeSessions(engine *fib.Engine, base http3.ClientConfig, addr string, n int, wantEarly, blocking bool) int {
+	cache := fibtls.NewQUICSessionCache(4)
+	// crypto/tls's handshake keeps its sessions in the TLS config's cache.
+	stdCache := tls.NewLRUClientSessionCache(4)
+	code := 0
+	for i := 0; i < n; i++ {
+		cfg := base
+		cfg.EarlyData = true
+		cfg.SessionCache = cache
+		if blocking {
+			cfg.TLSConfig = cfg.TLSConfig.Clone()
+			cfg.TLSConfig.ClientSessionCache = stdCache
+		}
+		client := http3.NewClient(engine, cfg)
+		req, _ := stdhttp.NewRequest(stdhttp.MethodGet, "https://"+addr+"/echo", nil)
+		resp, err := client.Go(req).Wait()
+		if err != nil {
+			fmt.Printf("FAIL round %d: %v\n", i, err)
+			client.Close()
+			return 1
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		st := client.Stats()
+		resumed := resp.TLS != nil && resp.TLS.DidResume
+		fmt.Printf("round %d: status=%d resumed=%v early-sent=%d accepted=%d rejected=%d too-early=%d\n",
+			i, resp.StatusCode, resumed, st.EarlySent, st.EarlyAccepted, st.EarlyRejected, st.TooEarly)
+		want := i > 0
+		if resp.StatusCode != 200 || resumed != want {
+			fmt.Println("FAIL: round", i, "should resume:", want)
+			code = 1
+		}
+		if wantEarly && i > 0 && (st.EarlySent != 1 || st.EarlyAccepted != 1) {
+			fmt.Println("FAIL: round", i, "did not send its request as accepted 0-RTT data")
+			code = 1
+		}
+		if !wantEarly && st.EarlySent != 0 {
+			fmt.Println("FAIL: round", i, "sent early data to a server that does not offer it")
+			code = 1
+		}
+		client.Close()
+		// The ticket comes after the handshake.
+		if blocking {
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		for deadline := time.Now().Add(3 * time.Second); cache.Get("localhost") == nil && time.Now().Before(deadline); {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	return code
 }

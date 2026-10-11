@@ -144,6 +144,14 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 				return false, &TransportError{Code: errProtocolViolation, Reason: "frame not allowed in handshake packets"}
 			}
 		}
+		if c.curEarly {
+			// 0-RTT packets carry no acknowledgements, handshake data, or
+			// frames that answer the server (RFC 9000 section 12.4).
+			switch typ {
+			case frameAck, frameAckECN, frameCrypto, frameNewToken, framePathResponse, frameRetireConnectionID, frameHandshakeDone:
+				return false, &TransportError{Code: errProtocolViolation, Reason: "frame not allowed in 0-RTT packets"}
+			}
+		}
 		var err error
 		switch {
 		case typ == framePadding:
@@ -209,6 +217,9 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			if e != nil || s == nil {
 				err = e
 				break
+			}
+			if c.curEarly {
+				s.early.Store(true)
 			}
 			err = s.onStreamFrame(off, data, typ&0x01 != 0)
 		case typ == frameMaxData:

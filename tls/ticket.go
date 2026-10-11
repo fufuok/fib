@@ -1,6 +1,7 @@
 package tls
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -57,6 +58,40 @@ type ticketKeys struct {
 	mu     sync.Mutex
 	static *ticketKey
 	keys   []*ticketKey
+	// used are the tickets that have carried early data, until they expire:
+	// early data can be replayed, so a ticket gets it once (RFC 8446 section
+	// 8, RFC 9001 section 9.2).
+	used map[[32]byte]time.Time
+}
+
+// maxUsedTickets bounds the register; when it is full of live tickets no
+// more early data is accepted, which costs a round trip and nothing else.
+const maxUsedTickets = 1 << 20
+
+// firstUse reports whether ticket has not carried early data before, and
+// records that it does now.
+func (t *ticketKeys) firstUse(ticket []byte, now time.Time) bool {
+	key := sha256.Sum256(ticket)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, seen := t.used[key]; seen {
+		return false
+	}
+	if t.used == nil {
+		t.used = make(map[[32]byte]time.Time)
+	}
+	if len(t.used) >= maxUsedTickets {
+		for k, expires := range t.used {
+			if now.After(expires) {
+				delete(t.used, k)
+			}
+		}
+		if len(t.used) >= maxUsedTickets {
+			return false
+		}
+	}
+	t.used[key] = now.Add(ticketLifetime + time.Minute)
+	return true
 }
 
 func newTicketKeys(config *stdtls.Config) *ticketKeys {
@@ -121,6 +156,12 @@ type ticketState struct {
 	ageAdd  uint32
 	psk     []byte
 	server  string
+	// For a QUIC session that may be resumed with 0-RTT data: whether it
+	// may, the protocol it was agreed for, and what the QUIC layer asked to
+	// have kept with it (the transport parameters the server then had).
+	earlyData bool
+	alpn      string
+	extra     [][]byte
 }
 
 // sealRaw seals plain under the current key.
@@ -162,6 +203,21 @@ func (t *ticketKeys) seal(s ticketState, now time.Time) ([]byte, bool) {
 	plain = append(plain, s.psk...)
 	plain = binary.BigEndian.AppendUint16(plain, uint16(len(s.server)))
 	plain = append(plain, s.server...)
+	if s.earlyData || len(s.extra) != 0 {
+		// After the server name: whether early data is allowed, the protocol,
+		// and the extra data of the QUIC layer.
+		early := byte(0)
+		if s.earlyData {
+			early = 1
+		}
+		plain = append(plain, early, byte(len(s.alpn)))
+		plain = append(plain, s.alpn...)
+		plain = append(plain, byte(len(s.extra)))
+		for _, e := range s.extra {
+			plain = binary.BigEndian.AppendUint16(plain, uint16(len(e)))
+			plain = append(plain, e...)
+		}
+	}
 	return t.sealRaw(plain, now)
 }
 
@@ -233,11 +289,41 @@ func (t *ticketKeys) open(ticket []byte, now time.Time) (ticketState, bool) {
 		return ticketState{}, false
 	}
 	s.psk, plain = plain[:n], plain[n:]
-	m := int(binary.BigEndian.Uint16(plain))
-	if len(plain) != 2+m {
+	if len(plain) < 2 {
 		return ticketState{}, false
 	}
-	s.server = string(plain[2:])
+	m := int(binary.BigEndian.Uint16(plain))
+	if len(plain) < 2+m {
+		return ticketState{}, false
+	}
+	s.server, plain = string(plain[2:2+m]), plain[2+m:]
+	if len(plain) != 0 {
+		if len(plain) < 3 {
+			return ticketState{}, false
+		}
+		s.earlyData = plain[0] == 1
+		a := int(plain[1])
+		if len(plain) < 2+a+1 {
+			return ticketState{}, false
+		}
+		s.alpn, plain = string(plain[2:2+a]), plain[2+a:]
+		count := int(plain[0])
+		plain = plain[1:]
+		for i := 0; i < count; i++ {
+			if len(plain) < 2 {
+				return ticketState{}, false
+			}
+			l := int(binary.BigEndian.Uint16(plain))
+			if len(plain) < 2+l {
+				return ticketState{}, false
+			}
+			s.extra = append(s.extra, bytes.Clone(plain[2:2+l]))
+			plain = plain[2+l:]
+		}
+		if len(plain) != 0 {
+			return ticketState{}, false
+		}
+	}
 	if age := now.Sub(s.created); age < -time.Minute || age > ticketLifetime {
 		return ticketState{}, false
 	}

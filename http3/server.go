@@ -51,6 +51,17 @@ type Config struct {
 	// waits for the client. By default the handshake is a state machine that
 	// takes none, where the TLSConfig allows it (see package tls).
 	BlockingTLSHandshake bool
+	// EarlyData lets clients that resume a session send requests in their
+	// first flight, 0-RTT data (RFC 9001 section 4.6), which saves them a
+	// round trip. Such data is not protected against replay: an attacker who
+	// recorded it can send it again. A request that arrives in it carries
+	// "Early-Data: 1" (RFC 8470), and only a safe method (GET, HEAD, OPTIONS,
+	// TRACE) is served; anything else is answered 425 Too Early, which tells
+	// the client to send it again once the handshake is over.
+	EarlyData bool
+	// EarlyDataUnsafe serves every method in early data, which then is up to
+	// the handler to guard against replays, by the Early-Data header.
+	EarlyDataUnsafe bool
 	// TLSConfig is required, with the server's certificates. HTTP/3 needs
 	// TLS 1.3 and the "h3" ALPN protocol, which the handler sees to.
 	TLSConfig *tls.Config
@@ -211,6 +222,7 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		// fib hands each datagram over as a buffer of its own from the
 		// pool, which QUIC gives back once it has done with it.
 		RecycleDatagrams: true,
+		EarlyData:        config.EarlyData,
 	}
 	return h
 }
@@ -380,9 +392,26 @@ type serverConn struct {
 }
 
 func (sc *serverConn) OnHandshake(qc *quic.Conn) {
-	sc.qc = qc
 	state := qc.ConnectionState()
 	sc.tlsState = &state
+	sc.start(qc)
+}
+
+// OnEarlyData starts the connection ahead of its handshake, for the requests
+// in the client's first flight. Their responses go out as soon as the
+// server's side of the handshake has its keys.
+func (sc *serverConn) OnEarlyData(qc *quic.Conn) {
+	state := qc.ConnectionState()
+	sc.tlsState = &state
+	sc.start(qc)
+}
+
+// start opens the connection's control stream, once.
+func (sc *serverConn) start(qc *quic.Conn) {
+	if sc.qc != nil {
+		return
+	}
+	sc.qc = qc
 	control, err := openControl(qc, sc.h.config.MaxHeaderBytes, [2]uint64{settingEnableConnectProtocol, 1})
 	if err != nil {
 		closeWith(qc, connErr(ErrCodeStreamCreationError, "cannot open the control stream"))
@@ -887,6 +916,15 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 	req.TLS = rs.sc.tlsState
 	rs.req = req
 	rs.sc.track(rs)
+	if rs.s.EarlyData() {
+		// Sent before the handshake was over, so it may be a replay
+		// (RFC 8470).
+		req.Header.Set("Early-Data", "1")
+		if !rs.sc.h.config.EarlyDataUnsafe && !safeMethod(req.Method) {
+			rs.reject(stdhttp.StatusTooEarly)
+			return nil
+		}
+	}
 	if _, ok := req.Header[":protocol"]; ok {
 		// An extended CONNECT: its handler runs now, and may switch the
 		// stream to a tunnel.
@@ -1230,4 +1268,14 @@ func (h *ServerHandler) newTLS(blocking bool) func(bool, *tls.Config) quic.TLSCo
 		}
 		return server.NewConn()
 	}
+}
+
+// safeMethod says whether a request with method can be served from early
+// data, which may be replayed: the methods that change nothing.
+func safeMethod(method string) bool {
+	switch method {
+	case stdhttp.MethodGet, stdhttp.MethodHead, stdhttp.MethodOptions, stdhttp.MethodTrace:
+		return true
+	}
+	return false
 }

@@ -160,6 +160,31 @@ var errTestOver = errors.New("test over")
 // on the first datagram that reaches it, as a fib server does.
 func newTestPair(t *testing.T, loss float64, configure func(client, server *Config)) *testPair {
 	t.Helper()
+	return newTestPairWith(t, loss, configure, nil)
+}
+
+// newTestPairWith is newTestPair for a test that has something to do with the
+// client as soon as it is dialed, before the handshake can have got anywhere:
+// afterDial runs then.
+func newTestPairWith(t *testing.T, loss float64, configure func(client, server *Config), afterDial func(*Conn)) *testPair {
+	t.Helper()
+	return newTestPairOpts(t, loss, configure, pairOpts{afterDial: afterDial})
+}
+
+// pairOpts are the less usual things a test pair can be asked for.
+type pairOpts struct {
+	// afterDial runs with the client as soon as it is dialed.
+	afterDial func(*Conn)
+	// wrapServer, if set, gives the server a handler built around the pair's
+	// own.
+	wrapServer func(*testHandler) Handler
+	// pipes, if set, is told the ends of the path before anything is sent.
+	pipes func(client, server *pipeEnd)
+}
+
+func newTestPairOpts(t *testing.T, loss float64, configure func(client, server *Config), opts pairOpts) *testPair {
+	t.Helper()
+	afterDial := opts.afterDial
 	serverTLS, clientTLS, err := tlstest.Configs()
 	if err != nil {
 		t.Fatal(err)
@@ -189,6 +214,13 @@ func newTestPair(t *testing.T, loss float64, configure func(client, server *Conf
 	p := &testPair{clientH: newTestHandler(), serverH: newTestHandler(), done: make(chan struct{})}
 	p.clientEnd, p.serverEnd = newPipe()
 	p.clientEnd.loss, p.serverEnd.loss = loss, loss
+	var serverHandler Handler = p.serverH
+	if opts.wrapServer != nil {
+		serverHandler = opts.wrapServer(p.serverH)
+	}
+	if opts.pipes != nil {
+		opts.pipes(p.clientEnd, p.serverEnd)
+	}
 	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
 	p.wg.Add(2)
 	go func() {
@@ -201,7 +233,7 @@ func newTestPair(t *testing.T, loss float64, configure func(client, server *Conf
 					if p.stray != nil {
 						p.stray(d)
 					} else if IsInitial(d) {
-						p.server = Accept(p.serverEnd, addr, sc, p.serverH, d)
+						p.server = Accept(p.serverEnd, addr, sc, serverHandler, d)
 					}
 					p.serverMu.Unlock()
 					continue
@@ -245,6 +277,9 @@ func newTestPair(t *testing.T, loss float64, configure func(client, server *Conf
 	p.client, err = Dial(p.clientEnd, addr, cc, p.clientH)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if afterDial != nil {
+		afterDial(p.client)
 	}
 	go func() {
 		defer p.wg.Done()

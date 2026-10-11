@@ -31,23 +31,59 @@ for size in 0 1024 200000; do
   check $QC 127.0.0.1:11001 4 0 $size
 done
 
-# fib's tickets do not advertise early data, so quiche, which sends 0-RTT
-# only against a ticket that does, never tries it: sent-as-0rtt stays false
-# and the requests go out after the handshake. What this checks is that
-# enabling early data on the client changes nothing for such a server.
-step "quiche client -> fib server: early data enabled on the client (fib does not offer 0-RTT)"
-for size in 1024 200000; do
-  check $QC 127.0.0.1:11001 4 1 $size
-done
-kill $FIB; wait $FIB 2>/dev/null
-tail -3 /tmp/fib.log
+# rounds runs quicheclient and checks that at least n of its rounds say what.
+rounds() {
+  local n=$1 what=$2; shift 2
+  local out
+  out=$("$@") || { echo "$out"; echo "FAILED: $*"; fail=1; return; }
+  echo "$out"
+  if [ "$(echo "$out" | grep -c -- "$what")" -lt "$n" ]; then
+    echo "FAILED: fewer than $n rounds with $what: $*"; fail=1
+  fi
+}
 
-step "quiche client -> fib server, handshaking on crypto/tls's QUICConn (-blocking)"
-/tmp/h3s -blocking > /tmp/fib2.log 2>&1 &
+step "quiche client -> fib server, early data not enabled on the server: no 0-RTT is offered"
+rounds 4 "sent-as-0rtt=false" $QC 127.0.0.1:11001 4 1 get
+kill $FIB; wait $FIB 2>/dev/null
+
+step "quiche client -> fib server with 0-RTT: a GET goes in the first flight, and the server knows"
+/tmp/h3s -early > /tmp/fib3.log 2>&1 &
 FIB=$!
 sleep 2
-check $QC 127.0.0.1:11001 4 1 1024
+rounds 3 "sent-as-0rtt=true.*server-saw-early=true" $QC 127.0.0.1:11001 4 1 get
+rounds 4 "server-saw-early=false" $QC 127.0.0.1:11001 4 0 get
+
+step "quiche client -> fib server with 0-RTT: a POST in early data is answered 425 and sent again after the handshake"
+rounds 3 "sent-as-0rtt=true sent-again-after-425=true" $QC 127.0.0.1:11001 4 1 1024
+rounds 3 "sent-as-0rtt=true sent-again-after-425=true" $QC 127.0.0.1:11001 4 1 200000
 kill $FIB; wait $FIB 2>/dev/null
+
+step "quiche client -> fib server with 0-RTT for every method: the POST is served from early data"
+/tmp/h3s -early-unsafe > /tmp/fib4.log 2>&1 &
+FIB=$!
+sleep 2
+for size in 1024 200000; do
+  rounds 3 "sent-as-0rtt=true sent-again-after-425=false" $QC 127.0.0.1:11001 4 1 $size
+done
+kill $FIB; wait $FIB 2>/dev/null
+
+step "quiche client -> fib server, 0-RTT on crypto/tls's QUICConn (-blocking)"
+/tmp/h3s -early -blocking > /tmp/fib5.log 2>&1 &
+FIB=$!
+sleep 2
+rounds 3 "sent-as-0rtt=true.*server-saw-early=true" $QC 127.0.0.1:11001 4 1 get
+kill $FIB; wait $FIB 2>/dev/null
+tail -3 /tmp/fib3.log
+
+# quiche-server does not offer early data. One that does is the same source
+# with a line added.
+cp /workspace/target/release/quiche-server /tmp/quiche-server-plain
+rm -rf /tmp/ws && mkdir /tmp/ws
+(cd /workspace && tar --exclude=./target -cf - .) | tar -xf - -C /tmp/ws
+sed -i 's|c.grease(false);|c.grease(false);\n    c.enable_early_data();|' /tmp/ws/frameworks/quiche/src/server.rs
+(cd /tmp/ws && CARGO_TARGET_DIR=/workspace/target cargo build --release --offline -q -p quiche-server) || exit 1
+cp /workspace/target/release/quiche-server /tmp/quiche-server-early
+cp /tmp/quiche-server-plain /workspace/target/release/quiche-server
 
 step "fib client -> quiche server: load, then certificate verification"
 /workspace/target/release/quiche-server -b=1024 -streams=100 -idle=120s -t 2 > /tmp/quiche.log 2>&1 &
@@ -56,6 +92,17 @@ sleep 2
 check /tmp/h3c -addr=127.0.0.1:13001 -n=300
 check /tmp/h3c -addr=127.0.0.1:13001 -n=300 -blocking
 check /tmp/h3c -addr=127.0.0.1:13001 -verify
+
+step "fib client -> quiche server: session resumption (quiche offers no early data)"
+check /tmp/h3c -addr=127.0.0.1:13001 -resume 4
+check /tmp/h3c -addr=127.0.0.1:13001 -resume 4 -blocking
+kill $Q; wait $Q 2>/dev/null
+
+step "fib client -> quiche server that accepts early data: 0-RTT"
+/tmp/quiche-server-early -b=1024 -streams=100 -idle=120s -t 2 > /tmp/quiche2.log 2>&1 &
+Q=$!
+sleep 2
+check /tmp/h3c -addr=127.0.0.1:13001 -resume 4 -want-early
 kill $Q; wait $Q 2>/dev/null
 tail -3 /tmp/quiche.log
 

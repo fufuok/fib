@@ -47,14 +47,16 @@ func main() {
 	caFile := flag.String("ca", "", "PEM certificate to trust, client mode")
 	url := flag.String("url", "", "base URL, client mode")
 	retry := flag.Bool("retry", false, "server mode: validate every source address with a Retry")
+	early0 := flag.Bool("early-server", false, "server mode: accept 0-RTT data, and say in X-Used-0RTT whether a request used it")
+	early := flag.Bool("early", false, "client mode: keep session tickets, and send GET_0RTT and HEAD_0RTT requests as 0-RTT data")
 	flag.Parse()
 
 	var err error
 	switch *mode {
 	case "server":
-		err = runServer(*addr, *certFile, *keyFile, *retry)
+		err = runServer(*addr, *certFile, *keyFile, *retry, *early0)
 	case "client":
-		err = runClient(*url, *caFile)
+		err = runClient(*url, *caFile, *early)
 	default:
 		err = errors.New("-mode must be server or client")
 	}
@@ -89,6 +91,8 @@ type result struct {
 	BodyHash string              `json:"bodyHash"`
 	Count    int                 `json:"count"`
 	Error    string              `json:"error"`
+	// Resumed says the connection resumed a session.
+	Resumed bool `json:"resumed"`
 }
 
 // hashBody is the FNV-1a of a body, so that large ones are checked without
@@ -108,7 +112,7 @@ func filler(n int) []byte {
 	return b
 }
 
-func runClient(base, caFile string) error {
+func runClient(base, caFile string, early bool) error {
 	if base == "" {
 		return errors.New("-url is required")
 	}
@@ -123,6 +127,10 @@ func runClient(base, caFile string) error {
 		}
 	}
 	tr := &http3.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "localhost"}}
+	if early {
+		tr.TLSClientConfig.ClientSessionCache = tls.NewLRUClientSessionCache(8)
+		tr.QUICConfig = &quic.Config{Allow0RTT: true}
+	}
 	defer tr.Close()
 	client := &http.Client{Transport: tr, Timeout: 60 * time.Second}
 
@@ -140,6 +148,14 @@ func runClient(base, caFile string) error {
 		}
 		if spec.Command == "quit" {
 			return nil
+		}
+		if spec.Command == "newconn" {
+			// The next request dials again, resuming the session if it can.
+			tr.CloseIdleConnections()
+			if err := out.Encode(result{}); err != nil {
+				return err
+			}
+			continue
 		}
 		res := doRequests(client, base, spec)
 		if err := out.Encode(res); err != nil {
@@ -215,6 +231,7 @@ func doRequest(client *http.Client, base string, spec request) result {
 		Trailer:  resp.Trailer,
 		BodyLen:  len(data),
 		BodyHash: hashBody(data),
+		Resumed:  resp.TLS != nil && resp.TLS.DidResume,
 	}
 	if len(data) <= 4096 {
 		res.Body = string(data)
@@ -222,7 +239,7 @@ func doRequest(client *http.Client, base string, spec request) result {
 	return res
 }
 
-func runServer(addr, certFile, keyFile string, retry bool) error {
+func runServer(addr, certFile, keyFile string, retry, early bool) error {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return err
@@ -238,6 +255,13 @@ func runServer(addr, certFile, keyFile string, retry bool) error {
 	server := &http3.Server{
 		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}}),
 		Handler:   http.HandlerFunc(serveHTTP),
+		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+			return context.WithValue(ctx, connKey{}, c)
+		},
+	}
+	var quicConfig *quic.Config
+	if early {
+		quicConfig = &quic.Config{Allow0RTT: true}
 	}
 	transport := &quic.Transport{Conn: pconn}
 	if retry {
@@ -245,7 +269,7 @@ func runServer(addr, certFile, keyFile string, retry bool) error {
 		// client prove its address before the handshake goes on.
 		transport.VerifySourceAddress = func(net.Addr) bool { return true }
 	}
-	listener, err := transport.ListenEarly(server.TLSConfig, nil)
+	listener, err := transport.ListenEarly(server.TLSConfig, quicConfig)
 	if err != nil {
 		return err
 	}
@@ -297,8 +321,14 @@ func runServer(addr, certFile, keyFile string, retry bool) error {
 
 // serveHTTP answers the conformance tests' requests. The query decides what
 // comes back, so that one endpoint covers every case.
+// connKey is where ConnContext keeps a request's QUIC connection.
+type connKey struct{}
+
 func serveHTTP(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
+	if c, ok := r.Context().Value(connKey{}).(*quic.Conn); ok {
+		w.Header().Set("X-Used-0RTT", strconv.FormatBool(c.ConnectionState().Used0RTT))
+	}
 	if ms, _ := strconv.Atoi(query.Get("delay")); ms > 0 {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}

@@ -9,7 +9,9 @@
 // NAT rebinding does (see HandlePathDatagrams); a client never moves, and
 // servers ask clients not to with disable_active_migration.
 //
-// The TLS 1.3 handshake is crypto/tls's QUICConn. 0-RTT is not supported.
+// The TLS 1.3 handshake is crypto/tls's QUICConn, or the stand-in for it
+// that Config.NewTLS makes. A server accepts 0-RTT data when Config.EarlyData
+// is set (RFC 9001 section 4.6).
 package quic
 
 import (
@@ -68,6 +70,16 @@ type Handler interface {
 	OnStreamsAvailable(c *Conn)
 	// OnClose runs once when the connection is over, with why.
 	OnClose(c *Conn, err error)
+}
+
+// EarlyDataHandler is a Handler that takes the 0-RTT data of a server
+// connection as it arrives. OnEarlyData runs once, before the first call about
+// data that came in 0-RTT packets, which is before OnHandshake: the handshake
+// is still going on, the client is not authenticated, and the data can be
+// replayed (see Stream.EarlyData). A Handler without it is told of 0-RTT
+// data only after OnHandshake, when the handshake is over.
+type EarlyDataHandler interface {
+	OnEarlyData(c *Conn)
 }
 
 // CallsDoneHandler is a Handler that is also told when a run of its calls
@@ -133,6 +145,16 @@ type Config struct {
 	// size every path carries; more saves packets, and the syscalls that
 	// send them, on a path known to carry them. At most 1452.
 	MaxDatagramSize int
+	// EarlyData lets a client send 0-RTT data on a session it resumes, if
+	// its TLS keeps sessions that allow it (see CanSendEarly), and lets a
+	// server accept 0-RTT data from clients resuming a session: its tickets
+	// then allow it, and what a client sends in its first flight is
+	// delivered without waiting for the handshake to end (see
+	// EarlyDataHandler). Early data is not forward secret, and an
+	// attacker can replay it: a ticket carries it once, but a server that
+	// is not the one that issued the ticket cannot know. Applications must
+	// serve only what is safe to repeat in it.
+	EarlyData bool
 	// RecycleDatagrams says that the datagrams HandleDatagram and
 	// HandleDatagrams are given are buffers from package bufferpool that the
 	// connection takes over, and gives back once it has done with them. What
@@ -364,6 +386,29 @@ type Conn struct {
 	roomWaiters int
 	// buffered are packets that arrived before their keys.
 	buffered [][]byte
+
+	// 0-RTT, for a server: the keys of the client's early packets, once TLS
+	// has accepted its early data (they go with the first 1-RTT packet);
+	// whether the packet being handled is an early one; the early data
+	// calls held back until the handshake is over, for a handler that is
+	// not an EarlyDataHandler; and whether OnEarlyData has been queued.
+	earlyRx      *keys
+	curEarly     bool
+	heldEarly    []event
+	holdEarly    bool
+	earlyStarted bool
+
+	// 0-RTT, for a client: the keys its early packets are sent under, until
+	// the 1-RTT ones replace them; the limits the server gave on the session
+	// it resumes, which the early data works to until the server's own
+	// parameters arrive; and whether the server turned the early data away.
+	earlyTx       *keys
+	earlyOffered  bool
+	remembered    *transportParams
+	earlyRejected bool
+	// peerParamsRaw is the server's transport parameters as it sent them,
+	// which are kept with the session for the next connection.
+	peerParamsRaw []byte
 	// roundLens are the lengths of the datagrams a round of sending sends,
 	// one after another in its buffer, which only the sending goroutine uses
 	// (see flush).
@@ -436,6 +481,8 @@ func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isC
 		// with the amplification limit that addressValidated keeps.
 		pathValidated: true,
 	}
+	_, isEarly := handler.(EarlyDataHandler)
+	c.holdEarly = !isEarly
 	c.sendRoom.L = &c.mu
 	for i := range c.spaces {
 		c.spaces[i].largestAcked = -1
@@ -460,9 +507,9 @@ func (c *Conn) newTLS() TLSConn {
 		}
 	}
 	if c.isClient {
-		return tls.QUICClient(&tls.QUICConfig{TLSConfig: c.config.TLSConfig})
+		return tls.QUICClient(&tls.QUICConfig{TLSConfig: c.config.TLSConfig, EnableSessionEvents: c.config.EarlyData})
 	}
-	return tls.QUICServer(&tls.QUICConfig{TLSConfig: c.config.TLSConfig})
+	return tls.QUICServer(&tls.QUICConfig{TLSConfig: c.config.TLSConfig, EnableSessionEvents: c.config.EarlyData})
 }
 
 // Dial starts the client side of a connection, sending its first packets
@@ -713,7 +760,9 @@ func (c *Conn) openStream(bidi bool) (*Stream, error) {
 	if c.closed {
 		return nil, ErrClosed
 	}
-	if !c.handshakeComplete {
+	if !c.handshakeComplete && c.earlyRx == nil && c.earlyTx == nil {
+		// Early data is sent, and answered, before the handshake ends, on
+		// streams opened then too.
 		return nil, errors.New("quic: handshake not complete")
 	}
 	var id uint64
@@ -742,21 +791,28 @@ func (c *Conn) newStream(id uint64) *Stream {
 	local := isClientStream(id) == c.isClient
 	s.hasSend = isBidi(id) || local
 	s.hasRecv = isBidi(id) || !local
-	p := c.peerParams
-	switch {
-	case p == nil:
-	case !isBidi(id):
-		s.sendMax = p.maxStreamDataUni
-	case local:
-		s.sendMax = p.maxStreamDataBidiR
-	default:
-		s.sendMax = p.maxStreamDataBidiL
-	}
+	s.sendMax = c.streamSendMax(id)
 	if s.hasRecv {
 		s.recvMax = c.config.StreamReceiveWindow
 	}
 	c.streams[id] = s
 	return s
+}
+
+// streamSendMax is how much the peer lets this side send on a stream, to
+// begin with.
+func (c *Conn) streamSendMax(id uint64) uint64 {
+	p := c.peerParams
+	local := isClientStream(id) == c.isClient
+	switch {
+	case p == nil:
+		return 0
+	case !isBidi(id):
+		return p.maxStreamDataUni
+	case local:
+		return p.maxStreamDataBidiR
+	}
+	return p.maxStreamDataBidiL
 }
 
 // peerStream finds the stream a frame refers to, opening the peer's streams
@@ -1027,6 +1083,11 @@ func (c *Conn) retryBuffered(now time.Time) {
 				continue
 			}
 			if c.keysFor(h.typ) == nil {
+				if h.typ == packet0RTT && (c.peerParams != nil || c.isClient) {
+					// TLS has answered the ClientHello without accepting
+					// early data, so there will be no keys for these.
+					continue
+				}
 				c.buffered = append(c.buffered, pkt)
 				continue
 			}
@@ -1050,6 +1111,9 @@ func packetSpace(typ int) int {
 }
 
 func (c *Conn) keysFor(typ int) *keys {
+	if typ == packet0RTT {
+		return c.earlyRx
+	}
 	s := &c.spaces[packetSpace(typ)]
 	if s.discarded {
 		return nil
@@ -1067,15 +1131,25 @@ func (c *Conn) isStatelessReset(d []byte) bool {
 // handlePacket decrypts and processes one packet, reporting whether it was
 // authentic.
 func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
-	if h.typ == packet0RTT {
-		return false
-	}
 	space := packetSpace(h.typ)
 	s := &c.spaces[space]
 	if s.discarded {
 		return false
 	}
-	if s.rx == nil {
+	rx := s.rx
+	early := h.typ == packet0RTT
+	if early {
+		if c.isClient {
+			return false
+		}
+		rx = c.earlyRx
+	}
+	if rx == nil {
+		if early && c.peerParams != nil {
+			// The ClientHello is answered, without early keys: TLS declined
+			// the early data, or its keys are gone.
+			return false
+		}
 		if space != spaceInitial && len(c.buffered) < maxBufferedPackets {
 			// A copy, since it outlives the datagram it arrived in.
 			c.buffered = append(c.buffered, bytes.Clone(pkt))
@@ -1086,15 +1160,15 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 	if len(s.recv) > 0 {
 		largest = int64(s.recv.largest())
 	}
-	pn, n, ok := unprotect(pkt, h.pnOffset, s.rx.hp, largest)
+	pn, n, ok := unprotect(pkt, h.pnOffset, rx.hp, largest)
 	if !ok {
 		return false
 	}
 	hdrEnd := h.pnOffset + n
-	k := s.rx
+	k := rx
 	updating := false
 	var phase bool
-	if space == spaceApp {
+	if h.typ == packet1RTT {
 		phase = pkt[0]&0x04 != 0
 		if phase != (c.rxGen&1 == 1) {
 			if c.prevRx != nil && pn < c.phaseStart {
@@ -1121,7 +1195,7 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 			// Too many forgeries against one key would weaken it, so the
 			// connection ends well before the AEAD's integrity limit
 			// (RFC 9001 section 6.6).
-			if c.decryptFailures++; c.decryptFailures >= integrityLimit(s.rx.suite) {
+			if c.decryptFailures++; c.decryptFailures >= integrityLimit(rx.suite) {
 				c.closeLocked(transportErr(errAEADLimitReached, "too many packets failed authentication"))
 				return true
 			}
@@ -1168,20 +1242,30 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 		c.addressValidated = true
 		c.discardSpace(spaceInitial)
 	}
+	if h.typ == packet1RTT && c.earlyRx != nil {
+		// A 1-RTT packet is the end of the client's early data
+		// (RFC 9001 section 4.9.3).
+		c.earlyRx = nil
+	}
 	c.lastActivity = now
 	c.sentSinceRecv = false
 	// The calls the packet's frames queue start here, which is where a
 	// move to the path it came on goes (see migrateLocked).
 	firstEvent := len(c.events)
+	c.curEarly = early
 	ackEliciting, err := c.handleFrames(space, payload, now)
+	c.curEarly = false
 	if err != nil {
 		c.closeLocked(err)
 		return true
 	}
+	if early {
+		c.queueEarly(firstEvent)
+	}
 	if c.closed || s.discarded {
 		return true
 	}
-	if c.rxPC != c.pc && !c.isClient && c.handshakeConfirmed && space == spaceApp &&
+	if c.rxPC != c.pc && !c.isClient && c.handshakeConfirmed && h.typ == packet1RTT &&
 		c.nonProbing && int64(pn) > largest {
 		c.migrateLocked(now, firstEvent)
 	}
@@ -1199,6 +1283,31 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 		}
 	}
 	return true
+}
+
+// queueEarly sees to the calls an early packet queued, from firstEvent on:
+// they are held until the handshake is over if the handler is not one for
+// early data, and otherwise preceded, the first time, by OnEarlyData.
+func (c *Conn) queueEarly(firstEvent int) {
+	if len(c.events) == firstEvent {
+		return
+	}
+	if c.holdEarly {
+		for _, e := range c.events[firstEvent:] {
+			// The datagram may be given back before these run.
+			e.data = bytes.Clone(e.data)
+			c.heldEarly = append(c.heldEarly, e)
+		}
+		clear(c.events[firstEvent:])
+		c.events = c.events[:firstEvent]
+		return
+	}
+	if !c.earlyStarted {
+		c.earlyStarted = true
+		c.events = append(c.events, event{})
+		copy(c.events[firstEvent+1:], c.events[firstEvent:])
+		c.events[firstEvent] = event{kind: evEarlyData}
+	}
 }
 
 // handleCrypto takes in handshake data and hands what is in order to TLS.
@@ -1282,18 +1391,62 @@ func (c *Conn) processTLSEvents() error {
 		case tls.QUICNoEvent:
 			return nil
 		case tls.QUICSetReadSecret, tls.QUICSetWriteSecret:
-			if space < 0 {
-				continue
-			}
 			k, err := newKeys(e.Suite, bytes.Clone(e.Data))
 			if err != nil {
 				return transportErr(errInternal, err.Error())
 			}
-			if e.Kind == tls.QUICSetReadSecret {
+			switch {
+			case space < 0 && e.Kind == tls.QUICSetReadSecret && !c.isClient:
+				c.earlyRx = k
+			case space < 0 && e.Kind == tls.QUICSetWriteSecret && c.isClient && c.remembered != nil:
+				c.earlyTx = k
+				c.earlyOffered = true
+			case space < 0:
+			case e.Kind == tls.QUICSetReadSecret:
 				c.spaces[space].rx = k
-			} else {
+			default:
 				c.spaces[space].tx = k
+				if space == spaceApp {
+					c.earlyTx = nil
+				}
 			}
+		case tls.QUICResumeSession:
+			if e.SessionState == nil || !e.SessionState.EarlyData {
+				break
+			}
+			if c.isClient {
+				// A client offers early data on a session whose limits it
+				// has, and works to them until the server's arrive.
+				p, ok := parseRemembered(e.SessionState.Extra)
+				if !ok || !c.config.EarlyData {
+					e.SessionState.EarlyData = false
+					break
+				}
+				c.remembered = &p
+				c.peerParams = &p
+				c.peerMaxData, c.peerMaxBidi, c.peerMaxUni = p.initialMaxData, p.maxStreamsBidi, p.maxStreamsUni
+			} else if !c.earlyAllowed(e.SessionState.Extra) {
+				// A server takes early data only against the limits it gave
+				// before.
+				e.SessionState.EarlyData = false
+			}
+		case tls.QUICStoreSession:
+			// The session a client can resume is kept with the server's
+			// limits, which its early data will work to.
+			if e.SessionState != nil && c.peerParamsRaw != nil {
+				e.SessionState.Extra = append(e.SessionState.Extra, append([]byte{1}, c.peerParamsRaw...))
+			}
+			if st, ok := c.tls.(interface {
+				StoreSession(*tls.SessionState) error
+			}); ok && e.SessionState != nil {
+				if err := st.StoreSession(e.SessionState); err != nil {
+					return tlsError(err)
+				}
+			}
+		case tls.QUICRejectedEarlyData:
+			c.rejectEarlyLocked()
+		case tls.QUICErrorEvent:
+			return tlsError(e.Err)
 		case tls.QUICWriteData:
 			if space >= 0 && !c.spaces[space].discarded {
 				c.spaces[space].cryptoSend.write(e.Data)
@@ -1331,9 +1484,18 @@ func (c *Conn) handlePeerParams(data []byte) error {
 		c.peerCIDs[0] = peerCID{cid: c.dcid, token: p.statelessResetToken}
 	}
 	c.peerParams = &p
+	c.peerParamsRaw = bytes.Clone(data)
 	c.peerMaxData = p.initialMaxData
 	c.peerMaxBidi = p.maxStreamsBidi
 	c.peerMaxUni = p.maxStreamsUni
+	if c.remembered != nil {
+		// Streams opened under the limits remembered take the real ones.
+		for id, s := range c.streams {
+			if s.hasSend {
+				s.sendMax = c.streamSendMax(id)
+			}
+		}
+	}
 	if p.maxIdleTimeout > 0 && p.maxIdleTimeout < c.idleTimeout {
 		c.idleTimeout = p.maxIdleTimeout
 	}
@@ -1344,19 +1506,69 @@ func (c *Conn) onHandshakeComplete() error {
 	if c.peerParams == nil {
 		return transportErr(errTransportParameter, "no transport parameters")
 	}
+	if c.remembered != nil && !c.earlyRejected {
+		// The server took early data, sent under the limits it had given, and
+		// must not have given less now (RFC 9000 section 7.4.1).
+		if !limitsNotBelow(c.peerParams, c.remembered) {
+			return transportErr(errProtocolViolation, "transport parameters below those remembered for 0-RTT")
+		}
+	}
 	c.handshakeComplete = true
 	c.maxDatagram = int(min(uint64(c.config.MaxDatagramSize), c.peerParams.maxUDPPayloadSize))
 	if !c.isClient {
 		c.handshakeDonePending = true
 		c.confirmHandshake()
 		if tc := c.config.TLSConfig; !tc.SessionTicketsDisabled {
-			if err := c.tls.SendSessionTicket(tls.QUICSessionTicketOptions{}); err != nil {
+			opts := tls.QUICSessionTicketOptions{}
+			if c.config.EarlyData {
+				opts.EarlyData = true
+				opts.Extra = [][]byte{c.rememberedLimits()}
+			}
+			if err := c.tls.SendSessionTicket(opts); err != nil {
 				return tlsError(err)
 			}
 		}
 	}
 	c.events = append(c.events, event{kind: evHandshake})
+	if len(c.heldEarly) > 0 {
+		// The early data that waited for the handshake comes after it.
+		c.events = append(c.events, c.heldEarly...)
+		clear(c.heldEarly)
+		c.heldEarly = nil
+	}
 	return nil
+}
+
+// rejectEarlyLocked is the server turning a client's 0-RTT data away: it goes
+// again under the 1-RTT keys.
+func (c *Conn) rejectEarlyLocked() {
+	if !c.isClient || c.earlyRejected {
+		return
+	}
+	c.earlyRejected = true
+	c.earlyTx = nil
+	c.resendEarlyLocked()
+}
+
+// CanSendEarly reports whether a client's connection sends what it writes as
+// 0-RTT data, before the handshake is over: its TLS resumed a session that
+// allows it, and the server has not turned it away. What is written before
+// the handshake is over is sent again if the server does turn it away, so
+// that it arrives either way, but a server that accepts it may be sent it
+// twice by an attacker (see Config.EarlyData).
+func (c *Conn) CanSendEarly() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.earlyTx != nil
+}
+
+// EarlyDataAccepted reports whether a client's server took its 0-RTT data:
+// it was offered, and not turned away. It is settled once the handshake is
+// over.
+func (c *Conn) EarlyDataAccepted() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.isClient && c.earlyOffered && !c.earlyRejected
 }
 
 // confirmHandshake is when the handshake is known to be over on both sides
@@ -1415,6 +1627,10 @@ func (c *Conn) handleRetry(pkt []byte, h header) {
 	s.sent = nil
 	s.cryptoSend.onLost(0, s.cryptoSend.next)
 	c.ptoCount = 0
+	if c.earlyTx != nil {
+		// The early data goes again, to the connection ID the Retry names.
+		c.resendEarlyLocked()
+	}
 }
 
 // closeLocked ends the connection with err, telling the peer.

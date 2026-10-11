@@ -140,6 +140,7 @@ type interopResult struct {
 	BodyHash string              `json:"bodyHash"`
 	Count    int                 `json:"count"`
 	Error    string              `json:"error"`
+	Resumed  bool                `json:"resumed"`
 }
 
 func (r interopResult) header(name string) string {

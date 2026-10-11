@@ -3,13 +3,22 @@
 // left behind, and says what quiche made of it: whether the handshake
 // resumed, and whether the request went out as 0-RTT early data.
 //
-//	quicheclient <addr> <rounds> <early: 0|1> <body bytes>
+//	quicheclient <addr> <rounds> <early: 0|1> <body bytes | get>
+//
+// With a body size it POSTs the body to /echo and checks it comes back; with
+// "get" it GETs /early, which answers what the server saw of the request's
+// Early-Data header. A request answered 425 Too Early (RFC 8470) is sent
+// again once the handshake is over.
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use quiche::h3::NameValue;
 
 struct Round {
+    /// The request had to be sent again after a 425.
+    too_early: bool,
+    /// What the server saw of Early-Data, for a GET.
+    server_saw_early: Option<bool>,
     session: Vec<u8>,
     echoed: bool,
     resumed: bool,
@@ -17,7 +26,7 @@ struct Round {
     status: u16,
 }
 
-fn round(addr: SocketAddr, session: Option<&[u8]>, early: bool, size: usize) -> Result<Round, String> {
+fn round(addr: SocketAddr, session: Option<&[u8]>, early: bool, size: Option<usize>) -> Result<Round, String> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| e.to_string())?;
     config.verify_peer(false);
     config.set_application_protos(&[b"h3"]).unwrap();
@@ -47,7 +56,10 @@ fn round(addr: SocketAddr, session: Option<&[u8]>, early: bool, size: usize) -> 
         conn.set_session(s).map_err(|e| format!("set_session: {e}"))?;
     }
 
+    let get = size.is_none();
+    let size = size.unwrap_or(0);
     let body: Vec<u8> = (0..size).map(|i| (i * 7 + 3) as u8).collect();
+    let mut too_early = false;
     let mut h3: Option<quiche::h3::Connection> = None;
     let h3cfg = quiche::h3::Config::new().unwrap();
     let mut stream: Option<u64> = None;
@@ -70,16 +82,19 @@ fn round(addr: SocketAddr, session: Option<&[u8]>, early: bool, size: usize) -> 
         }
         if let Some(h) = h3.as_mut() {
             if stream.is_none() {
-                let hdrs = [
-                    quiche::h3::Header::new(b":method", b"POST"),
+                let len = size.to_string();
+                let mut hdrs = vec![
+                    quiche::h3::Header::new(b":method", if get { b"GET" } else { b"POST" }),
                     quiche::h3::Header::new(b":scheme", b"https"),
                     quiche::h3::Header::new(b":authority", b"localhost"),
-                    quiche::h3::Header::new(b":path", b"/echo"),
-                    quiche::h3::Header::new(b"content-length", size.to_string().as_bytes()),
+                    quiche::h3::Header::new(b":path", if get { b"/early" } else { b"/echo" }),
                 ];
+                if !get {
+                    hdrs.push(quiche::h3::Header::new(b"content-length", len.as_bytes()));
+                }
                 stream = Some(h.send_request(&mut conn, &hdrs, size == 0).map_err(|e| e.to_string())?);
                 sent_fin = size == 0;
-                early_sent = conn.is_in_early_data();
+                early_sent = early_sent || conn.is_in_early_data();
             }
             if let (Some(s), false) = (stream, sent_fin) {
                 match h.send_body(&mut conn, s, &body[sent..], true) {
@@ -88,6 +103,9 @@ fn round(addr: SocketAddr, session: Option<&[u8]>, early: bool, size: usize) -> 
                         sent_fin = sent == size;
                     }
                     Err(quiche::h3::Error::Done) => {}
+                    // The server answered without waiting for the body and
+                    // asked for no more of it, as it does for a 425.
+                    Err(quiche::h3::Error::TransportError(quiche::Error::StreamStopped(_))) => sent_fin = true,
                     Err(e) => return Err(format!("send_body: {e}")),
                 }
             }
@@ -106,6 +124,17 @@ fn round(addr: SocketAddr, session: Option<&[u8]>, early: bool, size: usize) -> 
                         }
                     }
                     Ok((_, quiche::h3::Event::Finished)) => {
+                        if status == 425 && conn.is_established() && !too_early {
+                            // Sent as early data and refused as such: again,
+                            // now that the handshake is over.
+                            too_early = true;
+                            stream = None;
+                            sent = 0;
+                            sent_fin = false;
+                            got.clear();
+                            status = 0;
+                            break;
+                        }
                         done = true;
                         break;
                     }
@@ -158,7 +187,9 @@ fn round(addr: SocketAddr, session: Option<&[u8]>, early: bool, size: usize) -> 
     while let Ok((n, info)) = conn.send(&mut out) {
         let _ = socket.send_to(&out[..n], info.to);
     }
-    Ok(Round { session: sess, echoed: got == body, resumed, sent_as_0rtt: early_sent, status })
+    let server_saw_early = if get { Some(got == b"early=1") } else { None };
+    let echoed = if get { got == b"early=1" || got == b"early=" } else { got == body };
+    Ok(Round { too_early, server_saw_early, session: sess, echoed, resumed, sent_as_0rtt: early_sent, status })
 }
 
 fn main() {
@@ -170,7 +201,7 @@ fn main() {
     let addr: SocketAddr = args[1].parse().unwrap();
     let rounds: usize = args[2].parse().unwrap();
     let early = args[3] == "1";
-    let size: usize = args[4].parse().unwrap();
+    let size: Option<usize> = if args[4] == "get" { None } else { Some(args[4].parse().unwrap()) };
 
     let mut session: Option<Vec<u8>> = None;
     let mut resumed_rounds = 0;
@@ -178,9 +209,14 @@ fn main() {
         match round(addr, session.as_deref(), early, size) {
             Ok(r) => {
                 println!(
-                    "round {i}: status={} echoed={} resumed={} sent-as-0rtt={} ticket-received={}",
-                    r.status, r.echoed, r.resumed, r.sent_as_0rtt, !r.session.is_empty()
+                    "round {i}: status={} echoed={} resumed={} sent-as-0rtt={} sent-again-after-425={} server-saw-early={} ticket-received={}",
+                    r.status, r.echoed, r.resumed, r.sent_as_0rtt, r.too_early,
+                    r.server_saw_early.map_or("-".to_string(), |b| b.to_string()), !r.session.is_empty()
                 );
+                if r.server_saw_early.is_some_and(|saw| saw != (r.sent_as_0rtt && !r.too_early)) {
+                    println!("round {i}: the server's view of the request disagrees with what was sent");
+                    std::process::exit(1);
+                }
                 if r.resumed {
                     resumed_rounds += 1;
                 }

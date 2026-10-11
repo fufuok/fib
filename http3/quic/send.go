@@ -19,10 +19,15 @@ type packetPlan struct {
 	// padded says the payload has PADDING, which makes the packet count as
 	// in flight even without ack-eliciting frames.
 	padded bool
+	// early says a client sends it as 0-RTT data.
+	early bool
 }
 
 // headerLen is the length of a packet header in a space.
-func (c *Conn) headerLen(space, pnLen int) int {
+func (c *Conn) headerLen(space, pnLen int, early bool) int {
+	if space == spaceApp && early {
+		return 1 + 4 + 1 + len(c.dcid) + 1 + len(c.scid) + 2 + pnLen
+	}
 	if space == spaceApp {
 		return 1 + len(c.dcid) + pnLen
 	}
@@ -34,14 +39,18 @@ func (c *Conn) headerLen(space, pnLen int) int {
 }
 
 func (c *Conn) packetSize(p *packetPlan) int {
-	return c.headerLen(p.space, p.pnLen) + len(p.payload) + aeadOverhead
+	return c.headerLen(p.space, p.pnLen, p.early) + len(p.payload) + aeadOverhead
 }
 
 // sealPlan appends the sealed packet to out.
 func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 	start := len(out)
 	s := &c.spaces[p.space]
-	if p.space == spaceApp {
+	tx := s.tx
+	if p.early {
+		tx = c.earlyTx
+	}
+	if p.space == spaceApp && !p.early {
 		first := byte(0x40) | byte(p.pnLen-1)
 		if c.txGen&1 == 1 {
 			first |= 0x04
@@ -52,6 +61,9 @@ func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 		typ := byte(packetInitial)
 		if p.space == spaceHandshake {
 			typ = packetHandshake
+		}
+		if p.early {
+			typ = packet0RTT
 		}
 		out = append(out, 0xc0|typ<<4|byte(p.pnLen-1))
 		out = binary.BigEndian.AppendUint32(out, Version1)
@@ -75,7 +87,7 @@ func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 		copy(grown, out)
 		out = grown
 	}
-	sealed := s.tx.seal(out[start:], pnOffset, p.pnLen, p.pn)
+	sealed := tx.seal(out[start:], pnOffset, p.pnLen, p.pn)
 	return out[:start+len(sealed)]
 }
 
@@ -190,11 +202,14 @@ func (c *Conn) appendDatagram(out, scratch []byte, now time.Time) []byte {
 	n, size := 0, 0
 	for space := range c.spaces {
 		s := &c.spaces[space]
-		if s.tx == nil || s.discarded {
+		// A client with early keys and no 1-RTT ones yet sends 0-RTT packets
+		// in the application space.
+		early := space == spaceApp && s.tx == nil && c.earlyTx != nil
+		if s.tx == nil && !early || s.discarded {
 			continue
 		}
 		slot := scratch[space*maxDatagramLimit : space*maxDatagramLimit : (space+1)*maxDatagramLimit]
-		plan, ok := c.buildPacket(space, limit-size, congestionOK || s.probes > 0, now, slot)
+		plan, ok := c.buildPacket(space, limit-size, congestionOK || s.probes > 0, now, slot, early)
 		if !ok {
 			continue
 		}
@@ -236,21 +251,27 @@ func (c *Conn) appendDatagram(out, scratch []byte, now time.Time) []byte {
 // bytes, building its payload in scratch, which has room for all of it.
 // mayElicit says whether congestion control allows ack-eliciting frames;
 // without them, only an acknowledgement that is due goes out.
-func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scratch []byte) (packetPlan, bool) {
+func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scratch []byte, early bool) (packetPlan, bool) {
 	s := &c.spaces[space]
 	pn := s.nextPN
 	pl := pnLen(pn, s.largestAcked)
-	max := room - c.headerLen(space, pl) - aeadOverhead
+	max := room - c.headerLen(space, pl, early) - aeadOverhead
 	if max < 16 {
 		return packetPlan{}, false
 	}
 	ackDue := s.ackPending && (s.ackNow || !s.ackDeadline.IsZero() && !now.Before(s.ackDeadline))
+	if early {
+		// There is nothing to acknowledge before the server has been heard
+		// from, and only streams are sent.
+		ackDue = false
+	}
 	if !ackDue && s.probes == 0 && (!mayElicit || !c.framesWaiting(space)) {
 		// An acknowledgement that is not due goes out only with something
 		// else, and there is nothing else: building it would be for nothing.
 		return packetPlan{}, false
 	}
 	sp := c.newSentPacket(pn)
+	sp.early = early
 	payload := scratch[:0]
 	withAck := false
 	// A handshake packet carries the acknowledgement again even when it has
@@ -259,7 +280,7 @@ func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scrat
 	// it sends its flight again only as its probe timeout doubles from the
 	// one second it starts at. There are few such packets and most are padded
 	// anyway, so it costs nothing.
-	if (s.ackPending || space != spaceApp) && len(s.recv) > 0 {
+	if !early && (s.ackPending || space != spaceApp) && len(s.recv) > 0 {
 		if ack := c.appendAck(payload, s, now); len(ack) <= max/2 {
 			payload = ack
 			withAck = true
@@ -267,7 +288,11 @@ func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scrat
 		}
 	}
 	if mayElicit {
-		payload = c.appendFrames(payload, space, max, sp)
+		if early {
+			payload = c.appendStreams(payload, max, sp)
+		} else {
+			payload = c.appendFrames(payload, space, max, sp)
+		}
 	}
 	if s.probes > 0 && !sp.ackEliciting && len(payload) < max {
 		payload = append(payload, framePing)
@@ -293,7 +318,7 @@ func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scrat
 		padded = true
 	}
 	s.nextPN++
-	return packetPlan{space: space, pn: pn, pnLen: pl, payload: payload, sp: sp, padded: padded}, true
+	return packetPlan{space: space, pn: pn, pnLen: pl, payload: payload, sp: sp, padded: padded, early: early}, true
 }
 
 // framesWaiting reports whether a space may have ack-eliciting frames to

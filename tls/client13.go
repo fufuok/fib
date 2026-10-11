@@ -72,10 +72,12 @@ const (
 	extSessionTicket     = 35
 	extStatusRequest     = 5
 	extPreSharedKey      = 41
+	extEarlyData         = 42
 	extRenegotiationInfo = 0xff01
 	extSupportedVersions = 43
 	extCookie            = 44
 	extKeyShare          = 51
+	extPSKModesClient    = 45
 
 	alertHandshakeFailure      = 40
 	alertBadCertificate        = 42
@@ -323,6 +325,25 @@ type clientHS struct {
 	// secrets as events instead of records.
 	quic       *quicCtx
 	peerParams []byte
+
+	// Resumption, for QUIC: where sessions come from and go to, the session
+	// this handshake offers, and how far it got. offerEarly says that early
+	// data is offered, earlyActive that it still is: until the server turns
+	// it away. resumed says the server took the session, accepted that it
+	// took the early data. While the QUIC layer decides whether to offer early
+	// data, pending is the start of the handshake and resumeState the session
+	// the layer was asked about.
+	sessions    QUICSessionCache
+	session     *QUICSession
+	offerEarly  bool
+	earlyActive bool
+	resumed     bool
+	accepted    bool
+	resumeState *stdtls.SessionState
+	pending     func() *hsError
+	// resumption is the resumption master secret, from which the tickets of
+	// the server's NewSessionTicket messages give a PSK each.
+	resumption []byte
 }
 
 // newClientHS prepares a handshake with config, which nativeClient qualified.
@@ -523,10 +544,75 @@ func (h *clientHS) clientHello() []byte {
 			b.u16(extCookie)
 			b.vec16(func(b *builder) { b.vec16(func(b *builder) { b.raw(h.cookie) }) })
 		}
+		if h.quic != nil && h.sessions != nil {
+			// Tickets are for clients that say they use them.
+			b.u16(extPSKModes)
+			b.vec16(func(b *builder) { b.vec8(func(b *builder) { b.u8(1) }) }) // psk_dhe_ke
+		}
+		if h.earlyActive {
+			b.u16(extEarlyData)
+			b.vec16(func(b *builder) {})
+		}
+		if sess := h.session; sess != nil {
+			// The pre_shared_key extension is the last, and ends in the
+			// binder, whose place is filled once the message is known.
+			size := h.sessionHash()().Size()
+			age := uint32(h.now().Sub(sess.received)/time.Millisecond) + sess.ageAdd
+			b.u16(extPreSharedKey)
+			b.vec16(func(b *builder) {
+				b.vec16(func(b *builder) {
+					b.vec16(func(b *builder) { b.raw(sess.ticket) })
+					b.u32(age)
+				})
+				b.vec16(func(b *builder) { b.vec8(func(b *builder) { b.raw(make([]byte, size)) }) })
+			})
+		}
 	})
 	msg := b.b
 	msg[1], msg[2], msg[3] = byte((len(msg)-4)>>16), byte((len(msg)-4)>>8), byte(len(msg)-4)
+	if h.session != nil {
+		f := h.sessionHash()
+		size := f().Size()
+		binder, err := h.pskBinder(f, msg[:len(msg)-(2+1+size)])
+		if err == nil {
+			copy(msg[len(msg)-size:], binder)
+		}
+	}
 	return msg
+}
+
+func (h *clientHS) now() time.Time {
+	if h.config.Time != nil {
+		return h.config.Time()
+	}
+	return time.Now()
+}
+
+// sessionHash is the hash of the offered session's suite.
+func (h *clientHS) sessionHash() func() hash.Hash {
+	s, _ := quicSuite(h.session.suite)
+	return s.hash
+}
+
+// pskBinder is the binder of the offered session over a ClientHello up to
+// its binders (RFC 8446 section 4.2.11.2), after whatever of the handshake
+// came before it.
+func (h *clientHS) pskBinder(f func() hash.Hash, truncated []byte) ([]byte, error) {
+	early, err := hkdf.Extract(f, h.session.psk, nil)
+	if err != nil {
+		return nil, err
+	}
+	binderKey, err := deriveSecret(f, early, "res binder", hashBytes(f, nil))
+	if err != nil {
+		return nil, err
+	}
+	key, err := expandLabelContext(f, binderKey, "finished", nil, f().Size())
+	if err != nil {
+		return nil, err
+	}
+	mac := hmac.New(f, key)
+	mac.Write(hashBytes(f, append(bytes.Clone(h.transcript), truncated...)))
+	return mac.Sum(nil), nil
 }
 
 // hostnameInSNI is the name a ClientHello may carry, which is a host name and
@@ -855,6 +941,8 @@ func (h *clientHS) serverHello13(msg []byte, version uint16, random, sessionID [
 		haveShare    bool
 		haveSelected bool
 		haveCookie   bool
+		pskIndex     uint16
+		havePSK      bool
 	)
 	for typ, data := range exts {
 		d := newReader(data)
@@ -875,8 +963,16 @@ func (h *clientHS) serverHello13(msg []byte, version uint16, random, sessionID [
 			}
 			cookie = d.vec16()
 			haveCookie = d.empty() && len(cookie) > 0
+		case extPreSharedKey:
+			if hrr || h.session == nil {
+				return fail(alertUnsupportedExtension, "server sent an unsolicited extension %d", typ)
+			}
+			pskIndex = d.u16()
+			havePSK = d.empty()
+			if !havePSK {
+				return fail(alertDecodeError, "malformed ServerHello extension")
+			}
 		default:
-			// Including pre_shared_key, which this client never offered.
 			return fail(alertUnsupportedExtension, "server sent an unsolicited extension %d", typ)
 		}
 		if !d.ok {
@@ -899,6 +995,25 @@ func (h *clientHS) serverHello13(msg []byte, version uint16, random, sessionID [
 		return fail(alertIllegalParameter, "server changed its cipher suite after a HelloRetryRequest")
 	}
 	h.suiteID, h.suite = cipherSuite, s
+	if havePSK {
+		if pskIndex != 0 {
+			return fail(alertIllegalParameter, "server selected a pre-shared key that was not offered")
+		}
+		if h.sessionHash()().Size() != s.hash().Size() {
+			return fail(alertIllegalParameter, "server selected a cipher suite whose hash differs from the session's")
+		}
+		h.resumed = true
+		for _, der := range h.session.certs {
+			if cert, err := x509.ParseCertificate(der); err == nil {
+				h.certs = append(h.certs, cert)
+			}
+			h.rawCerts = append(h.rawCerts, der)
+		}
+	} else if h.session != nil {
+		// The server would rather start over, and takes no early data.
+		h.session = nil
+		h.rejectEarly()
+	}
 	if !haveShare || stdtls.CurveID(selected) != h.group {
 		return fail(alertIllegalParameter, "server did not select the key share offered")
 	}
@@ -953,6 +1068,12 @@ func (h *clientHS) helloRetryRequest(msg []byte, cipherSuite uint16, s suite, se
 	}
 	h.retried = true
 	h.suiteID, h.suite = cipherSuite, s
+	// A retried handshake takes no early data, and the session is offered
+	// again only if its hash is the one the server chose.
+	h.rejectEarly()
+	if h.session != nil && h.sessionHash()().Size() != s.hash().Size() {
+		h.session = nil
+	}
 	// The first ClientHello is replaced in the transcript by its hash.
 	first := hashBytes(s.hash, h.transcript)
 	h.transcript = append([]byte{hsMessageHash, 0, 0, byte(len(first))}, first...)
@@ -1001,7 +1122,11 @@ func (h *clientHS) handshakeKeys(shared []byte, out *[]byte) *hsError {
 	f := h.suite.hash
 	size := f().Size()
 	zeros := make([]byte, size)
-	early, err := hkdf.Extract(f, zeros, nil)
+	earlySecret := zeros
+	if h.resumed {
+		earlySecret = h.session.psk
+	}
+	early, err := hkdf.Extract(f, earlySecret, nil)
 	if err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
@@ -1085,6 +1210,15 @@ func (h *clientHS) encryptedExtensions(msg []byte) *hsError {
 		if typ == extQUICParams && h.quic != nil {
 			h.peerParams = bytes.Clone(data)
 		}
+		if typ == extEarlyData {
+			if !h.earlyActive || len(data) != 0 {
+				return fail(alertUnsupportedExtension, "server accepted early data that was not offered")
+			}
+			h.accepted = true
+		}
+	}
+	if h.earlyActive && !h.accepted {
+		h.rejectEarly()
 	}
 	if h.quic != nil {
 		// RFC 9001 sections 8.1 and 8.2.
@@ -1098,7 +1232,21 @@ func (h *clientHS) encryptedExtensions(msg []byte) *hsError {
 	}
 	h.transcript = append(h.transcript, msg...)
 	h.state = hsExpectCertificateOrRequest
+	if h.resumed {
+		// A resumed session has no certificate to send or verify.
+		h.state = hsExpectFinished
+	}
 	return nil
+}
+
+// rejectEarly ends an offer of early data: the server has turned it away, or
+// the handshake is one it cannot go with.
+func (h *clientHS) rejectEarly() {
+	if h.earlyActive {
+		h.earlyActive = false
+		h.quic.events = append(h.quic.events, stdtls.QUICEvent{Kind: stdtls.QUICRejectedEarlyData})
+	}
+	h.offerEarly = false
 }
 
 func (h *clientHS) certificateRequest(msg []byte) *hsError {
@@ -1340,6 +1488,7 @@ func (h *clientHS) connectionState() stdtls.ConnectionState {
 	return stdtls.ConnectionState{
 		Version:                    h.version,
 		HandshakeComplete:          true,
+		DidResume:                  h.resumed,
 		CipherSuite:                h.suiteID,
 		NegotiatedProtocol:         h.protocol,
 		NegotiatedProtocolIsMutual: h.protocol != "",

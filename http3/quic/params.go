@@ -191,3 +191,66 @@ func parseParams(b []byte, isClient bool) (transportParams, error) {
 	}
 	return p, nil
 }
+
+// rememberedLimits are the limits a server tells a client to hold on to with
+// its session ticket, which the client works to when it sends early data
+// (RFC 9000 section 7.4.1): the server must not give less on the connection
+// that resumes the session. A version byte comes first.
+func (c *Conn) rememberedLimits() []byte {
+	p := transportParams{
+		initialMaxData:     c.local.initialMaxData,
+		maxStreamDataBidiL: c.local.maxStreamDataBidiL,
+		maxStreamDataBidiR: c.local.maxStreamDataBidiR,
+		maxStreamDataUni:   c.local.maxStreamDataUni,
+		maxStreamsBidi:     c.local.maxStreamsBidi,
+		maxStreamsUni:      c.local.maxStreamsUni,
+		activeCIDLimit:     c.local.activeCIDLimit,
+	}
+	return append([]byte{1}, p.encode()...)
+}
+
+// earlyAllowed says whether the limits kept with a ticket (extra) fit what
+// this connection gives: none of them is above the limit now.
+func (c *Conn) earlyAllowed(extra [][]byte) bool {
+	if len(extra) != 1 || len(extra[0]) < 1 || extra[0][0] != 1 {
+		return false
+	}
+	old, err := parseParams(extra[0][1:], true)
+	if err != nil {
+		return false
+	}
+	l := &c.local
+	return old.initialMaxData <= l.initialMaxData &&
+		old.maxStreamDataBidiL <= l.maxStreamDataBidiL &&
+		old.maxStreamDataBidiR <= l.maxStreamDataBidiR &&
+		old.maxStreamDataUni <= l.maxStreamDataUni &&
+		old.maxStreamsBidi <= l.maxStreamsBidi &&
+		old.maxStreamsUni <= l.maxStreamsUni &&
+		old.activeCIDLimit <= l.activeCIDLimit
+}
+
+// parseRemembered reads the limits kept with a session by a client (see
+// processTLSEvents): the server's transport parameters as they were.
+func parseRemembered(extra [][]byte) (transportParams, bool) {
+	if len(extra) == 0 {
+		return transportParams{}, false
+	}
+	// The layer's own entry is the last it appended.
+	blob := extra[len(extra)-1]
+	if len(blob) < 1 || blob[0] != 1 {
+		return transportParams{}, false
+	}
+	p, err := parseParams(blob[1:], true)
+	return p, err == nil
+}
+
+// limitsNotBelow says whether the limits now are not below those remembered.
+func limitsNotBelow(now, old *transportParams) bool {
+	return now.initialMaxData >= old.initialMaxData &&
+		now.maxStreamDataBidiL >= old.maxStreamDataBidiL &&
+		now.maxStreamDataBidiR >= old.maxStreamDataBidiR &&
+		now.maxStreamDataUni >= old.maxStreamDataUni &&
+		now.maxStreamsBidi >= old.maxStreamsBidi &&
+		now.maxStreamsUni >= old.maxStreamsUni &&
+		now.activeCIDLimit >= old.activeCIDLimit
+}

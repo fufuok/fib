@@ -16,8 +16,9 @@ Go. The container has no network; the repository is mounted read-only.
 | --- | --- |
 | quiche client → fib server (`h3s`) | 300 connections, 30 000 echoes with body comparison, 87 000 multiplexed streams (`benchcli-rust -check`) |
 | quiche client → fib server | session resumption: `quicheclient` hands each connection's ticket to the next; every round after the first must resume (`is_resumed`) and still echo the body (0, 1 KiB, 200 KB) |
-| quiche client → fib server | early data enabled on the client: fib's tickets do not offer 0-RTT, so quiche does not send any, and the request is served after the handshake |
+| quiche client → fib server | 0-RTT: with early data off on the server no 0-RTT is offered; with it on, a GET goes in the first flight and the server sees `Early-Data: 1`; a POST in early data is answered 425 and sent again after the handshake (`quicheclient` does what RFC 8470 asks of a client); with `-early-unsafe` the POST is served from early data. Both handshakes |
 | fib client (`h3c`) → quiche server | 300 connections × 2 requests of 0 B … 300 KB, echoed correctly |
+| fib client → quiche server | session resumption (`h3c -resume`): every connection after the first resumes the one before; against a quiche-server built with `enable_early_data` the GET also goes as 0-RTT data the server accepts, and against the stock one no early data is offered. Both handshakes |
 | fib client → quiche server | certificate verification (`h3c -verify`): the server's own certificate as `RootCAs` connects; another root, a name the certificate lacks, and the system roots are refused |
 
 quiche's server makes a fresh self-signed certificate every start, so `-verify`

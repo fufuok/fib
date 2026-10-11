@@ -19,7 +19,7 @@
 | 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431/417、非法请求（含 `:authority` 与 `Host` 不一致）以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 / RFC 9204 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数、Extended CONNECT（RFC 9220）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/3 |
 | 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；请求与响应 trailer；对端违反协议时按错误码关闭连接 |
 | 一致性 | 与 quic-go 客户端、服务端双向互通，以及用手写帧构造的协议错误用例，都在 CI 中运行 |
-| 互通验证 | quic-go 客户端与服务端（双向，含 5% 丢包）；客户端访问 Cloudflare、Google、nginx、Facebook（mvfst）、Varnish、quiche 的线上服务 |
+| 互通验证 | quic-go 客户端与服务端（双向，含 5% 丢包）；容器里的 quiche 客户端与服务端（双向，`http3/quicheinterop`）；客户端访问 Cloudflare、Google、nginx、Facebook（mvfst）、Varnish、quiche 的线上服务 |
 
 以上内容都有测试覆盖并在 CI 中运行，见下面的[一致性测试](#一致性测试)。
 
@@ -150,13 +150,34 @@
 - 已收到部分响应后连接断开的请求直接失败，不会重发；只有被 GOAWAY 或
   H3_REQUEST_REJECTED 明确标为未处理的请求、以及还在排队没有发出的请求才会重发。
 - 带 `Expect: 100-continue` 的请求不会等待 100，body 和请求头一起发送。
-- 设置了 `TLSConfig.ClientSessionCache` 时会话恢复（1-RTT）理论上可用，但没有测试过。
+- 会话从 `ClientConfig.SessionCache` 恢复（本库的握手），握手走 `crypto/tls`（`BlockingTLSHandshake`，或 `TLSConfig` 只有
+  `crypto/tls` 能服务）时从 `TLSConfig.ClientSessionCache` 恢复。只有重发也无妨的请求会作为 0-RTT 数据发出，见
+  [0-RTT](#0-rtt)。
+
+### 0-RTT
+
+恢复会话的客户端可以把头几个请求随第一个飞行一起发出（RFC 9001 第 4.6 节），比握手早一个往返。这些数据用只来自会话的密钥加密，
+没有前向保密，抓到包的攻击者可以重放。本库的处理：
+
+- **两端都默认关闭**：服务端 `Config.EarlyData`（会话票据随之允许 early data），客户端 `ClientConfig.EarlyData`。
+- **一张票据只带一次 early data。** 服务端记住带过 early data 的票据（到票据过期为止），再次使用时拒绝 early data（连接仍然恢复）。
+  客户端报告的票据年龄和服务端自己算的相差超过 10 秒、握手经过 HelloRetryRequest、签发票据时给出的传输限制高于现在，也拒绝。
+  这个登记表是每个 `Handler` 一份；不是签发票据的那台服务端无从得知，所以放在负载均衡后面的服务端要自己防重放。
+- **只服务安全方法。** 服务端给作为 early data 到达的请求加 `Early-Data: 1`（RFC 8470），只服务 GET、HEAD、OPTIONS、TRACE，
+  其他方法回 425 Too Early（`Config.EarlyDataUnsafe` 全部服务，由 handler 检查这个头）；QUIC 的 `Stream.EarlyData` 对 stream
+  说同样的事。客户端只把这些方法且没有 body 的请求作为 early data 发出（`ClientConfig.EarlyData`），收到 425 的请求在握手结束后重发。
+  `Client.Stats` 统计作为 early data 发出的、被接受的、被拒绝的（服务端丢弃了 early data，QUIC 层随后用 1-RTT 密钥重发）和
+  回 425 的请求数。
+- **握手结束前就可以回应。** 接受 early data 的服务端在发出自己的 Finished 之后、客户端的 Finished 到达之前就回应（0.5-RTT）。
+  `quic.EarlyDataHandler` 让 handler 在 early data 到达时就收到；不是它的 handler 在握手结束后才收到。
+
+客户端的会话由本库的 TLS 保存（`tls.NewQUICSessionCache`，或 `ClientConfig.SessionCache`）；另一种握手用的 `crypto/tls` 的
+`QUICConn` 通过同一套 QUIC 代码恢复会话、发送 early data。
 
 ## 有意没有实现的功能
 
 | 功能 | 原因 |
 | --- | --- |
-| 0-RTT | 0-RTT 请求可以被重放，需要 handler 识别并拒绝不幂等的请求，收益和复杂度不成比例。客户端不发送 early data，服务端丢弃 0-RTT 包，客户端随后按 1-RTT 重发。 |
 | 主动连接迁移 | 客户端主动迁移时要在新路径上用新的 Connection ID，服务端就得为每个连接签发、路由并退役多个 CID。保留 Connection ID 的 NAT 重绑定会被跟随（见上）。 |
 | QPACK 动态表 | 两端都声明容量为 0：不会出现 blocked stream 造成的队头阻塞，编码器流和解码器流都没有内容，也没有额外的状态和内存。代价是重复出现的 header 每次都要完整发送。 |
 | Server push | 主流浏览器都不启用 HTTP/3 push。客户端不发 MAX_PUSH_ID，`Context.Push` 返回 `http.ErrNotSupported`。预加载推荐用 103 Early Hints（`WriteInterim`）。 |
@@ -222,7 +243,7 @@
 
 - ChaCha20-Poly1305 在真实握手中被协商的情况：测试机和 CI 机器都有 AES 硬件，握手总是
   选 AES-GCM，这条路径只有 RFC 9001 的测试向量覆盖。
-- 会话恢复（`TLSConfig.ClientSessionCache`）。
+- 0-RTT 与 quiche、quic-go 之外更多服务端的互通，以及共享票据密钥的多台服务端之间的重放（票据登记表是每个进程一份）。
 - 压测才能暴露的并发问题。帧解析、请求构造、QPACK 解码、QUIC 包头、传输参数和帧处理
   都有 fuzz 目标，CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。
 - 可以考虑接入 [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)，
