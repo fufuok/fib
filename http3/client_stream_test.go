@@ -1,3 +1,5 @@
+//go:build linux || darwin || windows
+
 package http3
 
 import (

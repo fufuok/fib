@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -38,6 +39,10 @@ func (earlyEcho) OnEarlyData(c *fib.Connection, b []byte) {
 // opensslClient is an OpenSSL 3 s_client, the peer for early data over TCP.
 func opensslClient(t *testing.T) string {
 	t.Helper()
+	if runtime.GOOS != "linux" {
+		// The peers are OpenSSL 3's, which only the Linux runs are known to have.
+		t.Skip("OpenSSL interop runs on Linux")
+	}
 	path, err := exec.LookPath("openssl")
 	if err != nil {
 		t.Skip("no openssl")
