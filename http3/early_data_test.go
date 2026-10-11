@@ -54,18 +54,30 @@ func TestEarlyDataQUICGo(t *testing.T) {
 			if first.Resumed || first.Body != `GET early=""` {
 				t.Fatalf("first connection: resumed %v, %q", first.Resumed, first.Body)
 			}
-			settle(p)
-			got := p.ok(interopSpec{Method: "GET_0RTT", Path: "/second"})
-			if !got.Resumed {
-				t.Fatal("the second connection did not resume the session")
-			}
-			if want := fmt.Sprintf("GET early=%q", tc.wantEarly); got.Body != want {
-				t.Fatalf("the server saw %q, want %q", got.Body, want)
+			// Whether quic-go puts the GET in its first flight depends on its
+			// own timing: one that has finished its handshake by the time it
+			// writes the request, as a loaded machine may, sends it under the
+			// 1-RTT keys. Early data that is expected is given three
+			// connections to arrive on; it is never expected where it is off.
+			want := fmt.Sprintf("GET early=%q", tc.wantEarly)
+			for attempt := 1; ; attempt++ {
+				settle(p)
+				got := p.ok(interopSpec{Method: "GET_0RTT", Path: "/second"})
+				if !got.Resumed {
+					t.Fatal("the second connection did not resume the session")
+				}
+				if got.Body == want {
+					break
+				}
+				if tc.wantEarly == "" || attempt == 3 {
+					t.Fatalf("the server saw %q, want %q", got.Body, want)
+				}
+				t.Logf("attempt %d: the request did not arrive as early data", attempt)
 			}
 
 			// And again: every connection gets a ticket of its own.
 			settle(p)
-			got = p.ok(interopSpec{Method: "HEAD_0RTT", Path: "/third"})
+			got := p.ok(interopSpec{Method: "HEAD_0RTT", Path: "/third"})
 			if !got.Resumed {
 				t.Fatal("the third connection did not resume")
 			}
