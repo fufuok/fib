@@ -230,9 +230,15 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 func (h *ServerHandler) OnOpen(*fib.Connection)                 {}
 func (h *ServerHandler) OnPriorityData(*fib.Connection, []byte) {}
 
-// OnData hands a datagram to its peer's connection, starting one if it is a
-// client's first. The engine hands each UDP datagram over as a buffer of its
+// OnData hands a datagram to the connection it is for, starting one if it is
+// a client's first. The engine hands each UDP datagram over as a buffer of its
 // own from the pool, which QUIC gives back once it has done with it.
+//
+// A client address's fib.Connection is shared by every QUIC connection that
+// comes from it (see udpPeer), and a datagram goes to the one its connection
+// ID names: a client may run several connections from one socket, as
+// quic-go's does, and the first flight of a new one can arrive while the
+// server still has the last.
 //
 // A datagram from an address with no connection that belongs to one all the
 // same, by the connection ID in it, comes from a client whose address
@@ -242,19 +248,37 @@ func (h *ServerHandler) OnPriorityData(*fib.Connection, []byte) {}
 // datagrams to whichever of its loops the address falls to, and the QUIC
 // connection, which takes datagrams from any goroutine, follows it there.
 func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
-	if qc, ok := c.Attachment().(*quic.Conn); ok {
-		qc.HandlePathDatagram(c, c.RemoteAddr(), data)
-		return
+	peer := peerOf(c)
+	if path := h.pathFor(peer, quic.DatagramDCID(data), data); path != nil {
+		path.qc.HandlePathDatagram(path, c.RemoteAddr(), data)
+	}
+}
+
+// pathFor returns the path of the connection data, a datagram to cid, is
+// for: one already on the peer's address, one that moved here, or one data
+// starts. It returns nil for a datagram no connection takes, having answered
+// or dropped it.
+func (h *ServerHandler) pathFor(peer *udpPeer, cid, data []byte) *peerPath {
+	c := peer.c
+	if path := peer.find(cid); path != nil {
+		return path
+	}
+	if peer.isClosing() {
+		// The address's connection is closing, and would take a connection
+		// started or moved onto it with it. The datagram is dropped, and the
+		// client's next one, sent again, arrives on the connection the
+		// address gets after: a ClientHello taken here and lost with it
+		// would have spent its ticket's early data.
+		return nil
 	}
 	if vn := quic.VersionNegotiation(data); vn != nil {
 		_ = c.Send(vn)
-		c.Close()
-		return
+		peer.closeIfUnused()
+		return nil
 	}
 	if qc := h.route(data); qc != nil {
-		c.SetAttachment(qc)
-		qc.HandlePathDatagram(c, c.RemoteAddr(), data)
-		return
+		// nil if the address started closing since: the datagram is dropped.
+		return peer.add(qc)
 	}
 	if !quic.IsInitial(data) {
 		if quic.ShortHeaderDCID(data) == nil {
@@ -265,16 +289,28 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 			// so the datagram is dropped and the path kept. Closed, it would
 			// still take the next of them while it closed, and the
 			// connection that moved onto it would end with it.
-			return
+			return nil
 		}
 		// A packet for a connection this server no longer has, perhaps from
 		// before a restart: tell the client, so that it need not time out.
 		if reset := h.resetKey.StatelessReset(data); reset != nil {
 			_ = c.Send(reset)
 		}
-		c.Close()
-		return
+		peer.closeIfUnused()
+		return nil
 	}
+	if tc := h.quic.TLSConfig; tc == nil || len(tc.Certificates) == 0 && tc.GetCertificate == nil && tc.GetConfigForClient == nil {
+		peer.closeIfUnused()
+		return nil
+	}
+	h.accept(peer, data)
+	return nil
+}
+
+// accept starts the connection a client's Initial in data begins, on a path
+// of its own on the peer's address.
+func (h *ServerHandler) accept(peer *udpPeer, data []byte) {
+	c := peer.c
 	sc := &serverConn{h: h, conn: c, streams: make(map[uint64]*requestStream)}
 	if addr := c.RemoteAddr(); addr != nil {
 		sc.remoteAddr = addr.String()
@@ -282,17 +318,18 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	// A client's GOAWAY names a push ID; nothing here promises pushes, so
 	// only the checks the control stream makes matter.
 	sc.peer.onGoAway = func(uint64) error { return nil }
-	if tc := h.quic.TLSConfig; tc == nil || len(tc.Certificates) == 0 && tc.GetCertificate == nil && tc.GetConfigForClient == nil {
-		c.Close()
+	path := peer.reserve()
+	if path == nil {
+		// Closing since pathFor looked; see there.
 		return
 	}
-	qc := quic.Accept(c, c.RemoteAddr(), h.quic, sc, data)
+	qc := quic.Accept(path, c.RemoteAddr(), h.quic, sc, data)
 	if qc == nil {
-		c.Close()
+		peer.release(path)
 		return
 	}
 	h.addRoute(qc)
-	c.SetAttachment(qc)
+	peer.bind(path, qc)
 }
 
 // route returns the connection a datagram's connection ID names, if it is a
@@ -322,30 +359,197 @@ func (h *ServerHandler) removeRoute(qc *quic.Conn) {
 	h.routesMu.Unlock()
 }
 
-// OnDatagrams hands a burst of datagrams to their peer's connection, which
-// answers them together. A burst that starts a connection starts it with its
-// first datagram, as OnData does.
+// OnDatagrams hands a burst of datagrams to the connections they are for,
+// each run of them that is for one connection together, which it answers
+// together. A datagram that starts a connection starts it as OnData does.
 func (h *ServerHandler) OnDatagrams(c *fib.Connection, datagrams [][]byte) {
-	for len(datagrams) > 0 {
-		if qc, ok := c.Attachment().(*quic.Conn); ok {
-			qc.HandlePathDatagrams(c, c.RemoteAddr(), datagrams)
-			return
+	peer := peerOf(c)
+	remote := c.RemoteAddr()
+	var run *peerPath
+	first := 0
+	for i, d := range datagrams {
+		cid := quic.DatagramDCID(d)
+		if run != nil && run.qc.Owns(cid) {
+			continue
 		}
-		h.OnData(c, datagrams[0])
-		datagrams = datagrams[1:]
+		if run != nil {
+			run.qc.HandlePathDatagrams(run, remote, datagrams[first:i])
+		}
+		run, first = h.pathFor(peer, cid, d), i
+		if run == nil {
+			// Answered, dropped or the start of a connection, which has
+			// taken it; the next datagram looks for its own.
+			first = i + 1
+		}
+	}
+	if run != nil {
+		run.qc.HandlePathDatagrams(run, remote, datagrams[first:])
 	}
 }
 
-// OnClose ends the peer's connection with its path, if it is the path the
-// connection sends on: one it has left, or not moved to, goes alone.
+// OnClose ends the connections that send on the address with it: one that
+// has left it, or not moved to it, goes alone.
 func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
-	if qc, ok := c.Attachment().(*quic.Conn); ok && qc.SendsOn(c) {
-		if err == nil {
-			err = net.ErrClosed
-		}
-		qc.Abort(err)
-	}
+	peer, ok := c.Attachment().(*udpPeer)
 	c.SetAttachment(nil)
+	if !ok {
+		return
+	}
+	if err == nil {
+		err = net.ErrClosed
+	}
+	for _, path := range peer.detach() {
+		if path.qc != nil && path.qc.SendsOn(path) {
+			path.qc.Abort(err)
+		}
+	}
+}
+
+// udpPeer is a client address's fib.Connection, shared by the QUIC
+// connections that come from it. A client may run several from one socket,
+// and starts the next one before the server is done with the last: quic-go
+// does both. Each connection sends on a path of its own (see peerPath), and
+// one ending lets its path go without closing the address's fib.Connection,
+// which the engine closes once the address has been quiet for
+// Config.UDPIdleTimeout: closed at once, the first flight of a connection the
+// client starts next would arrive at a fib.Connection that is closing, and
+// be lost with it, its early data included.
+type udpPeer struct {
+	c     *fib.Connection
+	mu    sync.Mutex
+	paths []*peerPath
+	// used is set once a connection has had a path here; see closeIfUnused.
+	used bool
+	// closing is set once the handler closes the address's fib.Connection;
+	// see pathFor.
+	closing bool
+}
+
+// peerOf returns c's udpPeer, making it with the first datagram from the
+// address.
+func peerOf(c *fib.Connection) *udpPeer {
+	if peer, ok := c.Attachment().(*udpPeer); ok {
+		return peer
+	}
+	peer := &udpPeer{c: c}
+	c.SetAttachment(peer)
+	return peer
+}
+
+// find returns the path of the connection that owns cid, if one is on the
+// address.
+func (p *udpPeer) find(cid []byte) *peerPath {
+	if cid == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, path := range p.paths {
+		if path.qc != nil && path.qc.Owns(cid) {
+			return path
+		}
+	}
+	return nil
+}
+
+// add returns qc's path on the address, adding one for a connection that has
+// just reached it, or nil once the address is closing.
+func (p *udpPeer) add(qc *quic.Conn) *peerPath {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closing {
+		return nil
+	}
+	for _, path := range p.paths {
+		if path.qc == qc {
+			return path
+		}
+	}
+	path := &peerPath{peer: p, qc: qc}
+	p.paths = append(p.paths, path)
+	p.used = true
+	return path
+}
+
+// reserve adds a path for a connection being accepted, which bind names once
+// it exists, or returns nil once the address is closing.
+func (p *udpPeer) reserve() *peerPath {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closing {
+		return nil
+	}
+	path := &peerPath{peer: p}
+	p.paths = append(p.paths, path)
+	p.used = true
+	return path
+}
+
+func (p *udpPeer) bind(path *peerPath, qc *quic.Conn) {
+	p.mu.Lock()
+	path.qc = qc
+	p.mu.Unlock()
+}
+
+// release lets path go.
+func (p *udpPeer) release(path *peerPath) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, held := range p.paths {
+		if held == path {
+			p.paths = append(p.paths[:i], p.paths[i+1:]...)
+			return
+		}
+	}
+}
+
+// detach takes every path off the address, which is closing.
+func (p *udpPeer) detach() []*peerPath {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	paths := p.paths
+	p.paths = nil
+	return paths
+}
+
+// closeIfUnused closes the address's fib.Connection when no connection has
+// used it: a datagram that started none, from an address that never had one,
+// leaves nothing to keep it for. An address that had one is kept for the
+// client's next (see udpPeer).
+func (p *udpPeer) closeIfUnused() {
+	p.mu.Lock()
+	unused := !p.used
+	if unused {
+		p.closing = true
+	}
+	p.mu.Unlock()
+	if unused {
+		_ = p.c.Close()
+	}
+}
+
+func (p *udpPeer) isClosing() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closing
+}
+
+// peerPath is one QUIC connection's use of an address: the quic.PacketConn
+// it sends on there.
+type peerPath struct {
+	peer *udpPeer
+	// qc is set once the connection exists; see udpPeer.reserve.
+	qc *quic.Conn
+}
+
+func (p *peerPath) Send(datagram []byte) error { return p.peer.c.Send(datagram) }
+
+// Close lets the connection's use of the address go; the address's
+// fib.Connection stays for the client's next connection, until it is idle
+// (see udpPeer).
+func (p *peerPath) Close() error {
+	p.peer.release(p)
+	return nil
 }
 
 var (

@@ -286,6 +286,28 @@ func ShortHeaderDCID(datagram []byte) []byte {
 	return datagram[1 : 1+cidLen]
 }
 
+// DatagramDCID returns the connection ID a datagram's first packet is for,
+// whatever its header: a long header names it with its length, which is the
+// same in every version (RFC 8999), and a short header carries one of the
+// length this side chooses. It returns nil for a datagram too short to hold
+// one. It is a slice of datagram.
+func DatagramDCID(datagram []byte) []byte {
+	if len(datagram) == 0 {
+		return nil
+	}
+	if datagram[0]&0x80 == 0 {
+		return ShortHeaderDCID(datagram)
+	}
+	if len(datagram) < 6 {
+		return nil
+	}
+	n := int(datagram[5])
+	if len(datagram) < 6+n {
+		return nil
+	}
+	return datagram[6 : 6+n]
+}
+
 // StatelessReset returns the stateless reset to answer datagram with, or nil
 // when datagram is not a short header packet to one of this side's
 // connection IDs, or is too small to be answered without the answer being

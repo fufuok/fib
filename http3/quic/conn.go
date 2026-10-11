@@ -585,6 +585,15 @@ func (c *Conn) RemoteAddr() net.Addr {
 // packets by it when they arrive from an address it does not know.
 func (c *Conn) LocalCID() []byte { return c.scid }
 
+// Owns reports whether packets sent to the connection ID cid are this
+// connection's: cid is its own, or, on a server, the one the client chose
+// for its first packets, which its Initial and 0-RTT packets go to until it
+// has the server's. A server whose clients run several connections from one
+// address tells their packets apart by it.
+func (c *Conn) Owns(cid []byte) bool {
+	return bytes.Equal(cid, c.scid) || !c.isClient && bytes.Equal(cid, c.odcid)
+}
+
 // SendsOn reports whether pc is the path the connection sends on.
 func (c *Conn) SendsOn(pc PacketConn) bool {
 	c.mu.Lock()
