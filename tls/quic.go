@@ -8,6 +8,7 @@ import (
 	"crypto/sha512"
 	stdtls "crypto/tls"
 	"errors"
+	"hash"
 	"slices"
 	"time"
 )
@@ -132,12 +133,43 @@ func (h *clientHS) finishQUIC(exporter []byte) *hsError {
 	return nil
 }
 
-// newSessionTicket takes a ticket the server sends after the handshake into the
-// cache, to resume from (RFC 8446 section 4.6.1).
-func (h *clientHS) newSessionTicket(msg []byte) *hsError {
+// ticketSink is what takes the tickets a server sends a client after its
+// handshake into the client's cache: the handshake's end, with only what that
+// needs of it.
+type ticketSink struct {
+	cache      QUICSessionCache
+	key        string
+	hash       func() hash.Hash
+	resumption []byte
+	suite      uint16
+	alpn       string
+	certs      [][]byte
+	// quicParams are the server's transport parameters, which a QUIC client
+	// keeps with the session; nil over TCP.
+	quicParams []byte
+	quic       bool
+	now        func() time.Time
+}
+
+// sink makes the handshake's ticket sink once its Finished is sent.
+func (h *clientHS) sink() *ticketSink {
 	if h.sessions == nil || h.resumption == nil {
 		return nil
 	}
+	return &ticketSink{cache: h.sessions, key: h.config.ServerName, hash: h.suite.hash, resumption: h.resumption,
+		suite: h.suiteID, alpn: h.protocol, certs: h.rawCerts, quicParams: h.peerParams, quic: h.quic != nil, now: h.now}
+}
+
+// newSessionTicket takes a ticket the server sends after the handshake into the
+// cache, to resume from (RFC 8446 section 4.6.1).
+func (h *clientHS) newSessionTicket(msg []byte) *hsError {
+	if k := h.sink(); k != nil {
+		return k.store(msg)
+	}
+	return nil
+}
+
+func (k *ticketSink) store(msg []byte) *hsError {
 	r := newReader(msg[4:])
 	lifetime := r.u32()
 	ageAdd := r.u32()
@@ -151,34 +183,33 @@ func (h *clientHS) newSessionTicket(msg []byte) *hsError {
 	if herr != nil {
 		return herr
 	}
-	early := false
+	var maxEarly uint32
 	if data, ok := exts[extEarlyData]; ok {
 		d := newReader(data)
+		size := d.u32()
 		// QUIC allows all of the early data or none (RFC 9001 section 4.6.1).
-		if size := d.u32(); !d.empty() || size != 0xffffffff {
+		if !d.empty() || k.quic && size != 0xffffffff {
 			return fail(alertIllegalParameter, "invalid max_early_data_size in a session ticket")
 		}
-		early = true
+		maxEarly = size
 	}
 	if lifetime == 0 {
 		return nil
 	}
-	f := h.suite.hash
-	psk, err := expandLabelContext(f, h.resumption, "resumption", nonce, f().Size())
+	psk, err := expandLabelContext(k.hash, k.resumption, "resumption", nonce, k.hash().Size())
 	if err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
-	life := min(time.Duration(lifetime)*time.Second, ticketLifetime)
 	session := &QUICSession{
-		ticket: bytes.Clone(ticket), psk: psk, suite: h.suiteID, received: h.now(), lifetime: life,
-		ageAdd: ageAdd, alpn: h.protocol, earlyData: early,
-		certs: h.rawCerts,
+		ticket: bytes.Clone(ticket), psk: psk, suite: k.suite, received: k.now(),
+		lifetime: min(time.Duration(lifetime)*time.Second, ticketLifetime),
+		ageAdd:   ageAdd, alpn: k.alpn, earlyData: maxEarly != 0, maxEarly: maxEarly, certs: k.certs,
 	}
-	if early {
+	if k.quic && maxEarly != 0 {
 		// What the layer works to when it sends early data on this session.
-		session.extra = [][]byte{append([]byte{1}, h.peerParams...)}
+		session.extra = [][]byte{append([]byte{1}, k.quicParams...)}
 	}
-	h.sessions.Put(h.config.ServerName, session)
+	k.cache.Put(k.key, session)
 	return nil
 }
 
@@ -324,7 +355,7 @@ func (c *QUICConn) Start(ctx context.Context) error {
 // pickSession takes the session to offer, if the cache has one that is still
 // good for this connection, out of the cache.
 func (h *clientHS) pickSession() bool {
-	if h.sessions == nil || h.quic == nil {
+	if h.sessions == nil || h.quic == nil && !h.offers(stdtls.VersionTLS13) {
 		return false
 	}
 	key := h.config.ServerName

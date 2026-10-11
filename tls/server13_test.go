@@ -6,6 +6,7 @@ import (
 	"bytes"
 	stdtls "crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -504,5 +505,99 @@ func TestClientAndServerHandshakesTogether(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// withEarlyData adds the extensions of a client that offers early data on a
+// ticket (one this server does not know) to the ClientHello record.
+func withEarlyData(t *testing.T, record []byte) (rec, msg []byte) {
+	t.Helper()
+	msg = record[recordHeaderLen:]
+	r := newReader(msg[4:])
+	r.u16()
+	r.take(32)
+	r.vec8()
+	r.vec16()
+	r.vec8()
+	extLen := len(r.b) - 2 // the extension block's length field is next
+	_ = extLen
+	extStart := len(msg) - len(r.b) // at the block's length field
+	var add builder
+	add.u16(extEarlyData)
+	add.vec16(func(b *builder) {})
+	add.u16(extPSKModes)
+	add.vec16(func(b *builder) { b.vec8(func(b *builder) { b.u8(1) }) })
+	add.u16(extPreSharedKey)
+	add.vec16(func(b *builder) {
+		b.vec16(func(b *builder) {
+			b.vec16(func(b *builder) { b.raw(bytes.Repeat([]byte{7}, 40)) })
+			b.u32(1234)
+		})
+		b.vec16(func(b *builder) { b.vec8(func(b *builder) { b.raw(make([]byte, 32)) }) })
+	})
+	out := append(bytes.Clone(msg), add.b...)
+	n := binary.BigEndian.Uint16(out[extStart:]) + uint16(len(add.b))
+	binary.BigEndian.PutUint16(out[extStart:], n)
+	out[1], out[2], out[3] = byte((len(out)-4)>>16), byte((len(out)-4)>>8), byte(len(out)-4)
+	return appendRecord(nil, recordTypeHandshake, 0x0301, out), out
+}
+
+func TestServerSkipsEarlyDataOverTCP(t *testing.T) {
+	cert, pool := issueCert(t, keyOf(t, "ecdsa-p256"))
+	for _, tc := range []struct {
+		name    string
+		early   int // bytes of early data records sent after the ClientHello
+		wantErr bool
+	}{
+		{"none sent", 0, false},
+		{"a little", 300, false},
+		{"more than is skipped", maxSkippedEarly + 1000, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newSrvHS(&stdtls.Config{Certificates: []stdtls.Certificate{cert}}, newTicketKeys(&stdtls.Config{}))
+			cli := newHS(t, pool, nil)
+			rec := cli.hello()
+			orig := rec[recordHeaderLen:]
+			modified, msg := withEarlyData(t, rec)
+			cli.transcript = append(cli.transcript[:len(cli.transcript)-len(orig)], msg...)
+			toServer := modified
+			for left := tc.early; left > 0; {
+				n := min(left, 2000)
+				toServer = appendRecord(toServer, recordTypeApplicationData, 0x0303, bytes.Repeat([]byte{0x5a}, n))
+				left -= n
+			}
+			var inServer, inClient, toClient []byte
+			for step := 0; step < 100 && !(srv.state == srvDone && cli.state == hsDone); step++ {
+				if len(toServer) > 0 {
+					inServer = append(inServer, toServer...)
+					toServer = nil
+					consumed, out, _, herr := srv.process(inServer)
+					if herr != nil {
+						if tc.wantErr {
+							return
+						}
+						t.Fatalf("server: %v", herr)
+					}
+					inServer = inServer[consumed:]
+					toClient = append(toClient, out...)
+				}
+				if len(toClient) > 0 {
+					inClient = append(inClient, toClient...)
+					toClient = nil
+					consumed, out, _, herr := cli.process(inClient)
+					if herr != nil {
+						t.Fatalf("client: %v", herr)
+					}
+					inClient = inClient[consumed:]
+					toServer = append(toServer, out...)
+				}
+			}
+			if tc.wantErr {
+				t.Fatal("the early data was skipped without limit")
+			}
+			if srv.state != srvDone || cli.state != hsDone {
+				t.Fatalf("server state %d, client state %d", srv.state, cli.state)
+			}
+		})
 	}
 }

@@ -23,6 +23,8 @@ type QUICSession struct {
 	ageAdd    uint32
 	alpn      string
 	earlyData bool
+	// maxEarly is how much early data the ticket allows over TCP.
+	maxEarly uint32
 	// extra is what the QUIC layer keeps with the session: the server's
 	// transport parameters, which a client sending early data works to.
 	extra [][]byte

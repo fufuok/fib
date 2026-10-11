@@ -182,10 +182,27 @@ type serverHS struct {
 	// of the ClientHello its keys derive from, and, while the QUIC layer
 	// decides whether to accept it, what remains of the handshake and the
 	// session the layer is asked about.
-	earlyData   bool
-	earlyHash   []byte
+	earlyData bool
+	earlyHash []byte
+	// skipEarly is how many bytes of a client's early data over TCP, which is
+	// not accepted, may still be skipped.
+	skipEarly   int
 	pending     func() *hsError
 	resumeState *stdtls.SessionState
+	// Early data over TCP that is accepted (RFC 8446 section 4.2.10): whether
+	// the Handler takes it and how much, the keys it is read under and the
+	// handshake keys the client's Finished is, whether the client's
+	// EndOfEarlyData is still to come, and the plaintext so far and its size.
+	// Once the flight is sent the layer sends under tx, and the ticket that
+	// follows the client's Finished is left to it.
+	tcpEarly   bool
+	maxEarly   uint32
+	earlyRx    *recordKeys
+	hsRx       *recordKeys
+	earlyOn    bool
+	earlyBuf   []byte
+	earlyTotal uint32
+	ticketMsg  []byte
 }
 
 func (h *serverHS) now() time.Time {
@@ -416,7 +433,7 @@ func parseClientHello(msg []byte) (*clientHelloMsg, bool) {
 // crypto/tls would not.
 func (h *serverHS) choose(ch *clientHelloMsg) uint16 {
 	if h.allow13 && slices.Contains(ch.versions, stdtls.VersionTLS13) {
-		if ch.earlyData || !slices.Contains(ch.compression, 0) {
+		if !slices.Contains(ch.compression, 0) {
 			return 0
 		}
 		if !slices.Contains(ch.suites, stdtls.TLS_AES_128_GCM_SHA256) && !slices.Contains(ch.suites, stdtls.TLS_AES_256_GCM_SHA384) {
@@ -568,6 +585,22 @@ func (h *serverHS) process(in []byte) (consumed int, out []byte, done bool, err 
 	return consumed, out, h.state == srvDone, nil
 }
 
+// maxSkippedEarly bounds the early data of a client that is skipped: a ticket
+// this server made allows none, so a client that sends any went by a ticket of
+// another server's, and not much of it is to be expected.
+const maxSkippedEarly = 64 << 10
+
+// skipEarlyRecord drops a record of early data, if the handshake has been told
+// to expect some and this is where it is: it is protected, and not under the
+// handshake keys. It reports whether it did.
+func (h *serverHS) skipEarlyRecord(record []byte) bool {
+	if h.skipEarly <= 0 {
+		return false
+	}
+	h.skipEarly -= len(record) - recordHeaderLen
+	return true
+}
+
 func (h *serverHS) record(record []byte, out *[]byte) *hsError {
 	typ, body := record[0], record[recordHeaderLen:]
 	if record[1] != 3 {
@@ -596,10 +629,17 @@ func (h *serverHS) record(record []byte, out *[]byte) *hsError {
 		return h.handshakeData(body, out)
 	case recordTypeApplicationData:
 		if !h.rxOn {
+			if h.skipEarlyRecord(record) {
+				// Early data after a HelloRetryRequest.
+				return nil
+			}
 			return fail(alertUnexpectedMessage, "protected record before the ServerHello")
 		}
 		inner, plain, alert, ok := h.rx.open(record)
 		if !ok {
+			if h.state == srvAwaitFinished && h.skipEarlyRecord(record) {
+				return nil
+			}
 			return fail(alert, "bad record")
 		}
 		switch inner {
@@ -607,6 +647,14 @@ func (h *serverHS) record(record []byte, out *[]byte) *hsError {
 			return h.handshakeData(plain, out)
 		case recordTypeAlert:
 			return remoteAlert(plain)
+		case recordTypeApplicationData:
+			if h.earlyOn {
+				if h.earlyTotal += uint32(len(plain)); h.earlyTotal > h.maxEarly {
+					return fail(alertUnexpectedMessage, "more early data than the ticket allows")
+				}
+				h.earlyBuf = append(h.earlyBuf, plain...)
+				return nil
+			}
 		}
 		return fail(alertUnexpectedMessage, "unexpected record type %d during the handshake", inner)
 	}
@@ -628,7 +676,9 @@ func (h *serverHS) handshakeData(data []byte, out *[]byte) *hsError {
 		switch {
 		case (h.state == srvAwaitHello || h.state == srvAwaitHello2) && msg[0] == hsClientHello:
 			herr = h.clientHello(msg, out)
-		case h.state == srvAwaitFinished && msg[0] == hsFinished:
+		case h.state == srvAwaitFinished && h.earlyOn && msg[0] == hsEndOfEarlyData:
+			herr = h.endOfEarlyData(msg)
+		case h.state == srvAwaitFinished && !h.earlyOn && msg[0] == hsFinished:
 			herr = h.finished(msg, out)
 		case h.state == srv12AwaitKeyExchange && msg[0] == hsClientKeyExchange:
 			herr = h.clientKeyExchange(msg)
@@ -735,7 +785,7 @@ func (h *serverHS) clientHello(msg []byte, out *[]byte) *hsError {
 	if herr := h.selectProtocol(); herr != nil {
 		return herr
 	}
-	if h.quic != nil && ch.earlyData && len(ch.psks) == 0 {
+	if ch.earlyData && len(ch.psks) == 0 {
 		return fail(alertIllegalParameter, "early_data without pre_shared_key")
 	}
 	h.psk, h.resumed = nil, false
@@ -743,6 +793,18 @@ func (h *serverHS) clientHello(msg []byte, out *[]byte) *hsError {
 	var ticket ticketState
 	if psk, index, state, ok := h.resume(ch, h.transcript[:prior]); ok {
 		h.psk, h.resumed, pskIndex, ticket = psk, true, index, state
+	}
+	if h.quic == nil && ch.earlyData {
+		if h.resumed && h.tcpEarly && h.earlyAcceptable(ch, ticket, pskIndex) {
+			h.earlyData = true
+			h.earlyHash = h.transcriptHash()
+		} else if h.skipEarly == 0 {
+			// Early data that is not accepted is still sent by a client
+			// that offered it, after the ClientHello and before it has the
+			// answer, in records that are read under no key this side has,
+			// and which are skipped (RFC 8446 section 4.2.10).
+			h.skipEarly = maxSkippedEarly
+		}
 	}
 	rest := func() *hsError { return h.serve(ch, share, pskIndex, out) }
 	if h.quic != nil && ch.earlyData && h.resumed && h.earlyAcceptable(ch, ticket, pskIndex) {
@@ -1069,7 +1131,11 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 			return fail(alertInternalError, "%v", err)
 		}
 		h.keyLog("CLIENT_EARLY_TRAFFIC_SECRET", secret)
-		h.quic.setRead(stdtls.QUICEncryptionLevelEarly, h.suiteID, secret)
+		if h.quic != nil {
+			h.quic.setRead(stdtls.QUICEncryptionLevelEarly, h.suiteID, secret)
+		} else if h.earlyRx, err = newKeys13(h.suite.keyLen, f, secret); err != nil {
+			return fail(alertInternalError, "%v", err)
+		}
 	}
 	derived, err := deriveSecret(f, early, "derived", hashBytes(f, nil))
 	if err != nil {
@@ -1105,6 +1171,12 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 			return fail(alertInternalError, "%v", err)
 		}
 		h.rxOn, h.txOn = true, true
+		if h.earlyRx != nil {
+			// The client's early data comes first, under its own keys, and
+			// then its EndOfEarlyData; the handshake keys follow.
+			h.hsRx, h.rx = h.rx, h.earlyRx
+			h.earlyOn = true
+		}
 	}
 
 	var sealed []byte
@@ -1295,6 +1367,43 @@ func (h *serverHS) finishedMAC(base []byte) ([]byte, error) {
 	return mac.Sum(nil), nil
 }
 
+// endOfEarlyData takes the client's EndOfEarlyData, which ends its early data:
+// what it sends next is under the handshake keys.
+func (h *serverHS) endOfEarlyData(msg []byte) *hsError {
+	if len(msg) != 4 || len(h.hsBuf) != 4 {
+		return fail(alertDecodeError, "malformed EndOfEarlyData")
+	}
+	h.transcript = append(h.transcript, msg...)
+	h.rx, h.earlyOn = h.hsRx, false
+	return nil
+}
+
+// takeEarly returns the early data that has arrived since the last call.
+func (h *serverHS) takeEarly() []byte {
+	b := h.earlyBuf
+	h.earlyBuf = nil
+	return b
+}
+
+// earlyWriteKeys are the keys the server sends under from the end of its
+// flight on, if it takes early data: it may answer before the client's
+// Finished has come, which the client does not send before it has the flight
+// (RFC 8446 section 2.3). Once the layer sends with them, the ticket that
+// follows the Finished is the layer's to seal.
+func (h *serverHS) earlyWriteKeys() *recordKeys {
+	if h.earlyData && h.quic == nil && h.state == srvAwaitFinished {
+		return h.tx
+	}
+	return nil
+}
+
+// takeTicket returns the ticket message that was left to the layer to send.
+func (h *serverHS) takeTicket() []byte {
+	m := h.ticketMsg
+	h.ticketMsg = nil
+	return m
+}
+
 // finished checks the client's Finished, which completes the handshake.
 func (h *serverHS) finished(msg []byte, out *[]byte) *hsError {
 	want, err := h.finishedMAC(h.clientHS)
@@ -1329,9 +1438,14 @@ func (h *serverHS) finished(msg []byte, out *[]byte) *hsError {
 // 4.6.1), under the keys the connection goes on with, if the Config allows
 // tickets and the client said it can use them.
 func (h *serverHS) sendTicket(out *[]byte) *hsError {
-	msg, herr := h.ticketMessage(false, nil)
+	msg, herr := h.ticketMessage(h.tcpEarly, nil)
 	if herr != nil || msg == nil {
 		return herr
+	}
+	if h.earlyData {
+		// The layer sends under tx by now.
+		h.ticketMsg = msg
+		return nil
 	}
 	sealed, err := h.tx.seal(*out, recordTypeHandshake, msg, nil)
 	if err != nil {
@@ -1381,7 +1495,13 @@ func (h *serverHS) ticketMessage(earlyData bool, extra [][]byte) ([]byte, *hsErr
 			// The ticket may be used for 0-RTT; QUIC always says "all of it"
 			// (RFC 9001 section 4.6.1).
 			b.u16(extEarlyData)
-			b.vec16(func(b *builder) { b.u32(0xffffffff) })
+			b.vec16(func(b *builder) {
+				if h.quic != nil {
+					b.u32(0xffffffff)
+				} else {
+					b.u32(h.maxEarly)
+				}
+			})
 		}
 	})
 	msg := b.b

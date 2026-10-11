@@ -73,6 +73,7 @@ const (
 	extStatusRequest     = 5
 	extPreSharedKey      = 41
 	extEarlyData         = 42
+	hsEndOfEarlyData     = 5
 	extRenegotiationInfo = 0xff01
 	extSupportedVersions = 43
 	extCookie            = 44
@@ -344,6 +345,14 @@ type clientHS struct {
 	// resumption is the resumption master secret, from which the tickets of
 	// the server's NewSessionTicket messages give a PSK each.
 	resumption []byte
+	// Early data over TCP: the keys it is sealed under, which the layer seals
+	// with as the application writes; sealEarly seals the EndOfEarlyData that
+	// ends it, with the same keys under the layer's lock; decided is told
+	// whether the server took it.
+	earlyTx      *recordKeys
+	sealEarly    func(msg []byte) ([]byte, error)
+	decided      func(accepted bool)
+	earlyRefused bool
 }
 
 // newClientHS prepares a handshake with config, which nativeClient qualified.
@@ -415,9 +424,47 @@ func (h *clientHS) newKeyShare(group stdtls.CurveID) error {
 
 // hello returns the record that opens the handshake.
 func (h *clientHS) hello() []byte {
+	h.earlyActive = h.offerEarly && h.session != nil
 	msg := h.clientHello()
 	h.transcript = append(h.transcript, msg...)
-	return appendRecord(nil, recordTypeHandshake, 0x0301, msg)
+	rec := appendRecord(nil, recordTypeHandshake, 0x0301, msg)
+	if h.earlyActive {
+		secret, err := h.earlySecret()
+		if err != nil {
+			h.earlyActive = false
+			return rec
+		}
+		if h.earlyTx, err = newKeys13(h.suite13Of(h.session.suite).keyLen, h.sessionHash(), secret); err != nil {
+			h.earlyActive = false
+			return rec
+		}
+		// The change_cipher_spec for middleboxes comes before the early data
+		// when there is some (RFC 8446 appendix D.4).
+		h.sentCCS = true
+		rec = append(rec, recordTypeChangeCipherSpec, 3, 3, 0, 1, 1)
+	}
+	return rec
+}
+
+// suite13Of looks up a TLS 1.3 suite by its ID.
+func (h *clientHS) suite13Of(id uint16) suite {
+	s, _ := h.suite13(id)
+	return s
+}
+
+// earlySecret is the secret early data is protected under: it covers the
+// ClientHello alone (RFC 8446 section 7.1).
+func (h *clientHS) earlySecret() ([]byte, error) {
+	f := h.sessionHash()
+	early, err := hkdf.Extract(f, h.session.psk, nil)
+	if err != nil {
+		return nil, err
+	}
+	secret, err := deriveSecret(f, early, "c e traffic", hashBytes(f, h.transcript))
+	if err == nil {
+		h.keyLog("CLIENT_EARLY_TRAFFIC_SECRET", secret)
+	}
+	return secret, err
 }
 
 func appendRecord(dst []byte, typ byte, version uint16, body []byte) []byte {
@@ -544,7 +591,7 @@ func (h *clientHS) clientHello() []byte {
 			b.u16(extCookie)
 			b.vec16(func(b *builder) { b.vec16(func(b *builder) { b.raw(h.cookie) }) })
 		}
-		if h.quic != nil && h.sessions != nil {
+		if h.sessions != nil && h.offers(stdtls.VersionTLS13) {
 			// Tickets are for clients that say they use them.
 			b.u16(extPSKModes)
 			b.vec16(func(b *builder) { b.vec8(func(b *builder) { b.u8(1) }) }) // psk_dhe_ke
@@ -1219,6 +1266,8 @@ func (h *clientHS) encryptedExtensions(msg []byte) *hsError {
 	}
 	if h.earlyActive && !h.accepted {
 		h.rejectEarly()
+	} else if h.accepted && h.quic == nil && h.decided != nil {
+		h.decided(true)
 	}
 	if h.quic != nil {
 		// RFC 9001 sections 8.1 and 8.2.
@@ -1244,7 +1293,14 @@ func (h *clientHS) encryptedExtensions(msg []byte) *hsError {
 func (h *clientHS) rejectEarly() {
 	if h.earlyActive {
 		h.earlyActive = false
-		h.quic.events = append(h.quic.events, stdtls.QUICEvent{Kind: stdtls.QUICRejectedEarlyData})
+		if h.quic != nil {
+			h.quic.events = append(h.quic.events, stdtls.QUICEvent{Kind: stdtls.QUICRejectedEarlyData})
+		} else {
+			h.earlyRefused = true
+			if h.decided != nil {
+				h.decided(false)
+			}
+		}
 	}
 	h.offerEarly = false
 }
@@ -1438,6 +1494,17 @@ func (h *clientHS) finished(msg []byte, out *[]byte) *hsError {
 		return h.finishQUIC(exporter)
 	}
 
+	if h.accepted && h.sealEarly != nil {
+		// The early data ends with EndOfEarlyData under its keys, and the
+		// Finished that follows covers it.
+		eoed := []byte{hsEndOfEarlyData, 0, 0, 0}
+		h.transcript = append(h.transcript, eoed...)
+		rec, serr := h.sealEarly(eoed)
+		if serr != nil {
+			return fail(alertInternalError, "%v", serr)
+		}
+		*out = append(*out, rec...)
+	}
 	var flight []byte
 	if h.certReq {
 		// No certificate to offer: an empty Certificate says so, and the
@@ -1462,6 +1529,11 @@ func (h *clientHS) finished(msg []byte, out *[]byte) *hsError {
 	}
 	h.transcript = append(h.transcript, fin...)
 	*out = append(*out, flight...)
+	if h.sessions != nil {
+		if h.resumption, err = deriveSecret(f, h.master, "res master", h.transcriptHash()); err != nil {
+			return fail(alertInternalError, "%v", err)
+		}
+	}
 
 	if h.rx, err = newKeys13(h.suite.keyLen, f, h.appServer); err != nil {
 		return fail(alertInternalError, "%v", err)

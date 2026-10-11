@@ -104,6 +104,27 @@ type Handler struct {
 	// other, for a Config that behaves differently under the state machines
 	// than under crypto/tls, or to compare the two.
 	Blocking bool
+	// EarlyData lets a server take the early data (0-RTT) of clients that
+	// resume a session (RFC 8446 section 2.3), which it can do where the
+	// handshake runs without a worker and the wrapped handler is an
+	// EarlyDataHandler. Its tickets then allow early data, and a client that
+	// uses a ticket sends its first bytes with its first flight, which the
+	// server answers before the handshake is over. Early data is not forward
+	// secret and can be replayed: a ticket carries it once, but a server that
+	// did not issue the ticket cannot know, and the handler must serve only
+	// what is safe to repeat. Off by default.
+	EarlyData bool
+	// MaxEarlyData is the most early data a client may send on a ticket. Zero
+	// means 16 KiB.
+	MaxEarlyData uint32
+	// SessionCache, on a client, is where tickets go and sessions come from,
+	// for client handshakes that run without a worker: a connection then
+	// resumes the session of one before it. With EarlyData also set, what is
+	// written before the handshake is over is sent as early data on a ticket
+	// that allows it, with the first flight, and sent again if the server turns
+	// it away. A server that takes it may be sent it twice by an attacker, so
+	// only what is safe to repeat should be written then.
+	SessionCache QUICSessionCache
 
 	// fastConfig is the clone of Config handshakes run with where the
 	// connection may leave crypto/tls afterwards; see fast.go.
@@ -146,6 +167,9 @@ type DialOptions struct {
 	Blocking bool
 	// HandshakeTimeout bounds the handshake; see Handler.HandshakeTimeout.
 	HandshakeTimeout time.Duration
+	// SessionCache and EarlyData are Handler's.
+	SessionCache QUICSessionCache
+	EarlyData    bool
 }
 
 // DialWithOptions is Dial with options.
@@ -167,6 +191,7 @@ func DialWithOptions(engine *fib.Engine, network, addr string, timeout time.Dura
 	}
 	client := NewClient(config, handler)
 	client.Blocking, client.HandshakeTimeout = options.Blocking, options.HandshakeTimeout
+	client.SessionCache, client.EarlyData = options.SessionCache, options.EarlyData
 	return engine.DialWithHandler(network, addr, timeout, client, done)
 }
 
@@ -272,11 +297,35 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 			c.CloseWithError(err)
 			return
 		}
+		if h.SessionCache != nil {
+			chs.sessions = h.SessionCache
+			if chs.pickSession() {
+				chs.offerEarly = h.EarlyData && chs.session.maxEarly > 0
+			}
+		}
 		hs, hello = chs, chs.hello()
+		if chs.earlyActive {
+			t.early = &earlyWrites{keys: chs.earlyTx, max: chs.session.maxEarly, active: true}
+			chs.sealEarly = t.sealEarly
+			chs.decided = t.earlyDecided
+		}
 	} else {
-		hs = newServerHS(h.Config, c, h.ticketKeys())
+		shs := newServerHS(h.Config, c, h.ticketKeys())
+		if _, ok := h.inner().(EarlyDataHandler); ok && h.EarlyData {
+			shs.tcpEarly, shs.maxEarly = true, cmpOr(h.MaxEarlyData, 16<<10)
+		}
+		hs = shs
 	}
 	c.SetLayer(t)
+	if t.early != nil {
+		// What the handler writes in OnOpen follows the hello as early data.
+		if err := c.SendRaw(hello); err != nil {
+			h.inner().OnOpen(c)
+			c.CloseWithError(err)
+			return
+		}
+		hello = nil
+	}
 	h.inner().OnOpen(c)
 	timeout := h.HandshakeTimeout
 	if timeout == 0 {
@@ -324,6 +373,24 @@ func (h *Handler) OnClose(c *fib.Connection, err error) {
 		}
 	}
 	h.inner().OnClose(c, err)
+}
+
+// EarlyDataHandler is implemented by a wrapped handler that takes the early
+// data of Handler.EarlyData. OnEarlyData receives it as it arrives, in order,
+// after OnHandshake and before any OnData, while the handshake is still going
+// on: the client is not yet authenticated, and what it sent can be a replay
+// by an attacker. The connection can be written to; the answers go out
+// as soon as the server's side of the handshake is.
+type EarlyDataHandler interface {
+	OnEarlyData(*fib.Connection, []byte)
+}
+
+// earlyServer is what a server handshake that takes early data gives the
+// layer.
+type earlyServer interface {
+	takeEarly() []byte
+	earlyWriteKeys() *recordKeys
+	takeTicket() []byte
 }
 
 // HandshakeHandler is implemented by a wrapped handler that wants to know
@@ -395,6 +462,13 @@ type layer struct {
 	nbuf    []byte
 	hsTimer *time.Timer
 	nfailed bool
+	// early is a client's early data, guarded by wmu; sink takes the tickets
+	// that follow the handshake, and is readMu's.
+	early *earlyWrites
+	sink  *ticketSink
+	// earlyOpened says a server that takes early data has begun to send
+	// ahead of the end of its handshake, and notified that OnHandshake has run.
+	earlyOpened bool
 
 	// readMu makes whoever decrypts, the handshake's worker for the bytes
 	// that arrived with the handshake or a worker afterwards, the only one
@@ -609,6 +683,35 @@ func (t *layer) releaseInLocked() {
 	t.in, t.inHead = nil, 0
 }
 
+// earlyWrites is what a client has sent as early data: under which keys, how
+// much the ticket allows, how much has gone, whether more may while the server
+// has not answered, and a copy of it all in case it has to be sent again.
+type earlyWrites struct {
+	keys     *recordKeys
+	max      uint32
+	sent     uint32
+	active   bool
+	accepted bool
+	copies   [][]byte
+}
+
+// sealEarly seals a handshake message under the early keys, for the handshake
+// to send; the early data's own records use the same keys, so it is done under
+// the lock they are.
+func (t *layer) sealEarly(msg []byte) ([]byte, error) {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	return t.early.keys.seal(nil, recordTypeHandshake, msg, nil)
+}
+
+// earlyDecided is the handshake telling that the server has taken the early
+// data or turned it away: no more is sent as early data either way.
+func (t *layer) earlyDecided(accepted bool) {
+	t.wmu.Lock()
+	t.early.active, t.early.accepted = false, accepted
+	t.wmu.Unlock()
+}
+
 // Send encrypts plaintext, or holds a copy of it until the handshake is done.
 func (t *layer) Send(first, second []byte) error {
 	if len(first)+len(second) == 0 {
@@ -620,6 +723,11 @@ func (t *layer) Send(first, second []byte) error {
 		return syscall.EPIPE
 	}
 	if !t.ready {
+		if e := t.early; e != nil && e.active && uint64(e.sent)+uint64(len(first)+len(second)) <= uint64(e.max) {
+			e.sent += uint32(len(first) + len(second))
+			e.copies = append(e.copies, bufferpool.Join(nil, first, second))
+			return t.sealSendWith(e.keys, recordTypeApplicationData, first, second)
+		}
 		t.pending = append(t.pending, bufferpool.Join(nil, first, second))
 		return nil
 	}
@@ -858,6 +966,9 @@ func (t *layer) feedNative(handler fib.Handler, hs nativeHandshake, data []byte)
 		t.nativeFailed(hs, herr, herr.err)
 		return
 	}
+	if es, ok := hs.(earlyServer); ok && !t.serveEarly(handler, hs, es) {
+		return
+	}
 	rest := buf[consumed:]
 	if !done {
 		if len(t.nbuf) > 0 {
@@ -868,6 +979,54 @@ func (t *layer) feedNative(handler fib.Handler, hs nativeHandshake, data []byte)
 		return
 	}
 	t.completeNative(handler, hs, rest)
+}
+
+// serveEarly sees to a server that takes early data: from the end of its flight
+// it sends under its application keys, so the writes that waited go out, the
+// handler learns what was negotiated, and the early data the client has sent
+// is delivered. It reports false if the connection failed meanwhile.
+func (t *layer) serveEarly(handler fib.Handler, hs nativeHandshake, es earlyServer) bool {
+	if !t.earlyOpened {
+		keys := es.earlyWriteKeys()
+		if keys == nil {
+			return true
+		}
+		t.earlyOpened = true
+		state := hs.connectionState()
+		t.state = &state
+		t.wmu.Lock()
+		t.tx = keys
+		pending, closeAfterSend := t.pending, t.closeAfterSend
+		t.pending = nil
+		var err error
+		for i, held := range pending {
+			if err == nil {
+				err = t.writeLocked(held, nil)
+			}
+			bufferpool.Put(held)
+			pending[i] = nil
+		}
+		if err != nil {
+			t.failed = true
+		} else {
+			t.ready = true
+			if closeAfterSend {
+				t.closeNotifyLocked()
+			}
+		}
+		t.wmu.Unlock()
+		if err != nil {
+			t.nativeFailed(hs, nil, err)
+			return false
+		}
+		if h, ok := handler.(HandshakeHandler); ok {
+			h.OnHandshake(t.c, state)
+		}
+	}
+	if data := es.takeEarly(); len(data) > 0 {
+		handler.(EarlyDataHandler).OnEarlyData(t.c, data)
+	}
+	return true
 }
 
 // nativeFailed ends a handshake that failed: the peer is told why, if it is
@@ -908,10 +1067,29 @@ func (t *layer) completeNative(handler fib.Handler, hs nativeHandshake, rest []b
 	t.state = &state
 	t.rx, t.tx = hs.recordKeys()
 
+	if k, ok := hs.(interface{ sink() *ticketSink }); ok {
+		t.sink = k.sink()
+	}
 	t.wmu.Lock()
 	pending, closeAfterSend := t.pending, t.closeAfterSend
 	t.pending = nil
 	var err error
+	if e := t.early; e != nil {
+		// What went as early data goes again if the server turned it away.
+		for _, copy := range e.copies {
+			if !e.accepted && err == nil {
+				err = t.writeLocked(copy, nil)
+			}
+			bufferpool.Put(copy)
+		}
+		t.early = nil
+	}
+	if es, ok := hs.(earlyServer); ok && t.earlyOpened {
+		// The ticket the handshake left to us, under the keys we send with.
+		if ticket := es.takeTicket(); ticket != nil {
+			err = t.sealSendLocked(recordTypeHandshake, ticket, nil)
+		}
+	}
 	for i, held := range pending {
 		if err == nil {
 			err = t.writeLocked(held, nil)
@@ -929,7 +1107,7 @@ func (t *layer) completeNative(handler fib.Handler, hs nativeHandshake, rest []b
 	}
 	t.wmu.Unlock()
 
-	if err == nil {
+	if err == nil && !t.earlyOpened {
 		// Before any plaintext reaches OnData, so that a handler can pick its
 		// protocol from what ALPN chose.
 		if h, ok := handler.(HandshakeHandler); ok {
@@ -988,4 +1166,12 @@ func (t *layer) fallbackBlocking(received []byte) {
 	bufferpool.Put(t.nbuf)
 	t.nbuf = nil
 	t.owner.startBlocking(t, initial)
+}
+
+func cmpOr[T comparable](v, def T) T {
+	var zero T
+	if v == zero {
+		return def
+	}
+	return v
 }

@@ -527,6 +527,12 @@ func (t *layer) handlePostHandshake(data []byte) bool {
 		rest := len(t.hsBuf) - size
 		switch {
 		case msg[0] == typeNewSessionTicket && t.client:
+			if t.sink != nil {
+				if herr := t.sink.store(msg[:size]); herr != nil {
+					t.fail(herr.alert)
+					return false
+				}
+			}
 		case msg[0] == typeKeyUpdate:
 			// A KeyUpdate ends its record, since the next one is under the
 			// new keys.
@@ -592,17 +598,22 @@ var errSequenceExhausted = errors.New("fib: tls sequence number exhausted")
 // sealSendLocked seals first followed by second into records of typ and sends
 // them. The caller holds wmu.
 func (t *layer) sealSendLocked(typ byte, first, second []byte) error {
+	return t.sealSendWith(t.tx, typ, first, second)
+}
+
+// sealSendWith is sealSendLocked under the keys given.
+func (t *layer) sealSendWith(keys *recordKeys, typ byte, first, second []byte) error {
 	n := len(first) + len(second)
 	records := max(1, (n+maxPlaintext-1)/maxPlaintext)
-	if t.tx.seq > ^uint64(0)-uint64(records) {
+	if keys.seq > ^uint64(0)-uint64(records) {
 		return errSequenceExhausted
 	}
-	buf := bufferpool.Get(n + records*t.tx.overhead())[:0]
+	buf := bufferpool.Get(n + records*keys.overhead())[:0]
 	for {
 		a := first[:min(len(first), maxPlaintext)]
 		b := second[:min(len(second), maxPlaintext-len(a))]
 		var err error
-		if buf, err = t.tx.seal(buf, typ, a, b); err != nil {
+		if buf, err = keys.seal(buf, typ, a, b); err != nil {
 			bufferpool.Put(buf)
 			return err
 		}

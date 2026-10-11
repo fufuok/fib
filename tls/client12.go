@@ -27,6 +27,9 @@ var (
 
 // serverHello12 handles a ServerHello that chose TLS 1.2.
 func (h *clientHS) serverHello12(msg []byte, random, sessionID []byte, cipherSuite uint16, exts map[uint16][]byte) *hsError {
+	// A server that speaks TLS 1.2 has no use for the session or the early data.
+	h.session = nil
+	h.rejectEarly()
 	if h.offers(stdtls.VersionTLS13) && (bytes.Equal(random[24:], downgradeTLS12) || bytes.Equal(random[24:], downgradeTLS11)) {
 		return fail(alertIllegalParameter, "downgrade attempt detected, possibly due to a MitM attack or a broken middlebox")
 	}

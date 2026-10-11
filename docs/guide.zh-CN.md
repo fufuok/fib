@@ -435,12 +435,22 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
   - **服务端**（`tls/server13.go`、`tls/server12.go`）：`Config` 自带 `Certificates`、不要求客户端认证、没有 `GetCertificate` /
     `GetConfigForClient`（它们要的 `ClientHelloInfo` 只有 `crypto/tls` 能构造）时，TLS 1.3 和 TLS 1.2 的握手都走状态机。
     服务端先读完 ClientHello 再决定：客户端不提供 `Config` 范围内的 TLS 1.3 / 1.2（比如只有 TLS 1.0 / 1.1，而 `MinVersion` 允许）、
-    要 0-RTT 的、没有 AES-GCM 套件（TLS 1.3）或没有 ECDHE 套件 / 证书能签的签名方案 / 共同曲线（TLS 1.2）的、ClientHello
+    没有 AES-GCM 套件（TLS 1.3）或没有 ECDHE 套件 / 证书能签的签名方案 / 共同曲线（TLS 1.2）的、ClientHello
     解析不了的，**在服务端什么都还没发之前**把已收到的字节原样交给 `crypto/tls`，客户端看不出区别。证书按 `ServerName`
     在 `Certificates` 里选（`SupportsCertificate`），ALPN 的选择和 `crypto/tls` 一致（包括 HTTP/1.1 客户端连 h2 服务端的特例），
     支持 HelloRetryRequest（1.3）、扩展主密钥、安全重协商标记、降级标记（服务端也支持 1.3 时，1.2 的 ServerHello 随机数结尾带
     `DOWNGRD\x01`）、OCSP / SCT、`CipherSuites`（1.2）、`VerifyConnection`、`KeyLogWriter`。TLS 1.2 只用 ECDHE（AES-GCM、
     AES-CBC），不支持 RSA 密钥交换（`crypto/tls` 默认也不再提供）。
+    **TCP 上的 0-RTT**（RFC 8446 2.3，默认关闭）：服务端设 `Handler.EarlyData`、被包装的 handler 实现 `EarlyDataHandler` 时，票据带
+    `early_data` 扩展（`MaxEarlyData`，默认 16 KiB），收到带 early data 的 ClientHello 就导出早期密钥、在 EncryptedExtensions 里确认，
+    随后到达的 early data 记录一到就交给 `OnEarlyData`（在 `OnHandshake` 之后、任何 `OnData` 之前），服务端发完自己的 Finished 之后、
+    客户端的 Finished 到达之前就可以回应（0.5-RTT，层从那时起用应用密钥发送，等在队列里的写入随即发出），客户端的 EndOfEarlyData 之后才
+    换成握手密钥。防重放同 QUIC：每张票据只接受一次、年龄偏差超过 10 秒或经过 HelloRetryRequest 就不接受。不接受的 early data
+    （没开、票据不允许、重放）按 RFC 8446 4.2.10 跳过随后到达的 early data 记录（总量限 64 KiB），握手照常完成，不再交给
+    `crypto/tls`（它会直接断开）。客户端设 `Handler.SessionCache`（`DialOptions.SessionCache`）恢复会话，再设 `EarlyData`，握手完成前的
+    `Send` 在票据允许时作为 early data 随 ClientHello 发出，保留一份副本，服务端拒绝时握手完成后重发。已用 OpenSSL 3.5 的
+    `s_client -early_data`（对服务端）和 `s_server -early_data`（对客户端）互通验证，包括重放被拒绝。HTTP/1、HTTP/2 的服务端还没有
+    接 `OnEarlyData`，要用得在 `tls` 这一层。
     会话恢复是自己的：TLS 1.3 发 NewSessionTicket（PSK 恢复），TLS 1.2 发 RFC 5077 的票据（恢复时是缩短的握手），票据用
     `Handler` 的密钥（每天轮换，保留 7 天；设了 `Config.SessionTicketKey` 就用它，多个进程可以共享）封装，无状态；
     `SessionTicketsDisabled` 关闭。`crypto/tls` 签发的票据它不认，客户端会做一次完整握手。

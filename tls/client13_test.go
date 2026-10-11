@@ -113,6 +113,12 @@ func (l *lockedBuffer) Write(p []byte) (int, error) {
 	return l.b.Write(p)
 }
 
+func (l *lockedBuffer) text() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
 func (l *lockedBuffer) lines() map[string]string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
