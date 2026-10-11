@@ -477,9 +477,19 @@ func (h *ServerHandler) handleFrames(state *connectionState, data []byte) {
 // not nil, pings are answered or handed to a PingHandler, pongs go to a
 // PongHandler, and a close is echoed. Both ends of a connection run it; they
 // differ only in the parser's direction and in whether ws masks what it sends.
+//
+// Nothing that arrives once ws has sent its Close is acted on: the
+// connection closes behind that Close, and a reply to a frame after it, such
+// as the pong to a ping, could not be sent, which the default ping handling
+// answers by closing the connection at once, taking the queued Close with it.
+// Over TLS each record is a call of its own, so a ping in the record after a
+// Close arrives here after the Close has been answered.
 func serveFrames(handler Handler, frames FrameHandler, ws *Connection, parser *Parser, data []byte) {
 	defer parser.ReleaseBorrowed()
 	for {
+		if ws.closeSent.Load() {
+			return
+		}
 		event, complete, err := parser.FeedOneBorrowed(data)
 		data = nil
 		if err != nil {
