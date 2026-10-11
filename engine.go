@@ -104,6 +104,7 @@ type Engine struct {
 	maxEvents          int
 	useWritev          bool
 	socketSyscalls     bool // see Config.SocketSyscalls
+	coalesceWrites     bool // see Config.CoalesceWrites
 	writeHighWatermark int
 	writeLowWatermark  int
 	maxPendingBytes    int64
@@ -242,6 +243,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents,
 		useWritev:          config.UseWritev,
 		socketSyscalls:     config.SocketSyscalls,
+		coalesceWrites:     config.CoalesceWrites,
 		writeHighWatermark: config.WriteBufferHighWatermark,
 		// Resume at a quarter of the budget rather than at the budget itself,
 		// so recovery admits a useful amount of work instead of re-pausing on
@@ -293,7 +295,7 @@ func (e *Engine) openPollers(config Config) error {
 	n := pollerCount(config)
 	for i := 0; i < n; i++ {
 		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents, useWritev: e.useWritev,
-			socketSyscalls:     e.socketSyscalls,
+			socketSyscalls: e.socketSyscalls, coalesceWrites: e.coalesceWrites,
 			writeHighWatermark: e.writeHighWatermark,
 			writeLowWatermark:  e.writeLowWatermark, maxPendingBytes: e.maxPendingBytes,
 			budgetResumeBytes: e.budgetResumeBytes, sendBufferSize: e.sendBufferSize,
@@ -879,6 +881,20 @@ type Config struct {
 	// every connection while the budget is exhausted. Zero means unlimited.
 	MaxPendingBytes int64
 	UseWritev       bool
+	// CoalesceWrites batches the replies a read round produces. With it, the
+	// sends a handler makes from OnData are held under a cork and written
+	// together, in as few writes as the socket takes, when the round ends: a
+	// read that brings k pipelined requests or messages costs one write, not
+	// k. A flush already under way is joined rather than followed by another,
+	// so what other goroutines queue while it writes leaves in its next write.
+	// Without it, every send from OnData is written at once, which answers a
+	// lone request a little sooner and a burst with a write for each reply.
+	// Cork and Flush work either way, and so does the drain that writes what a
+	// full socket left queued.
+	//
+	// DefaultConfig sets it. Only the native engines, on Linux, macOS and
+	// Windows, have read rounds; the portable backend ignores it.
+	CoalesceWrites bool
 	// SocketSyscalls has connections read and write their sockets with
 	// recvfrom, sendto and sendmsg rather than read, write and writev. Both
 	// sets end in the same socket code, but read, write and writev reach it
@@ -1015,7 +1031,7 @@ func DefaultConfig() Config {
 	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: sys.DefaultBacklog(), WorkerCount: sizing.WorkerCount,
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
-		UseWritev: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,
+		UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,
 		IOPollers: defaultIOPollers(defaultCPUs())}
 }
 

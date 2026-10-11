@@ -788,12 +788,15 @@ func (c *Connection) hasFlushableOutput() bool {
 }
 
 // drainInput reads until the socket is empty, handing each chunk to the
-// handler. Replies produced along the way are corked: rather than one write
-// syscall per message they accumulate in one contiguous buffer and reach the
-// socket in a single write when the round ends.
+// handler. With Config.CoalesceWrites, which is the default, replies produced
+// along the way are corked: rather than one write syscall per message they
+// accumulate in one contiguous buffer and reach the socket in a single write
+// when the round ends. Without it they are written as they are sent.
 func (c *Connection) drainInput() error {
 	c.mu.Lock()
-	c.corked = true
+	if c.engine.coalesceWrites {
+		c.corked = true
+	}
 	c.readStalled = false
 	c.readDeferred = false
 	c.mu.Unlock()
@@ -917,9 +920,11 @@ func (c *Connection) readLoop() error {
 					c.stallRead()
 					return nil
 				}
-				c.mu.Lock()
-				c.corked = true
-				c.mu.Unlock()
+				if c.engine.coalesceWrites {
+					c.mu.Lock()
+					c.corked = true
+					c.mu.Unlock()
+				}
 			}
 			if n < len(buf) {
 				// A short read means the socket buffer is empty, so the next

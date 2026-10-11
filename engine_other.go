@@ -404,6 +404,10 @@ type Config struct {
 	ReadBufferSize                  int
 	WriteBufferHighWatermark        int
 	UseWritev                       bool
+	// CoalesceWrites batches the replies a read round produces. This backend
+	// reads and writes through the net package, which has no read rounds to
+	// batch, and ignores it.
+	CoalesceWrites bool
 	// SocketSyscalls has a Linux engine read and write its sockets with
 	// recvfrom, sendto and sendmsg rather than read, write and writev. This
 	// backend reads and writes through the net package, and ignores it.
@@ -443,7 +447,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
-	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: defaultIOPollers(defaultCPUs())}
+	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: defaultIOPollers(defaultCPUs())}
 }
 
 type portableEvent struct {

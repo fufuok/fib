@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -1205,5 +1206,47 @@ func TestUDPDatagramsHandlerTakesBursts(t *testing.T) {
 	}
 	if len(bursts) != 2 {
 		t.Fatalf("datagrams arrived in bursts %v, want the five that piled up in one", bursts)
+	}
+}
+
+// A read round holds the replies its handler sends under a cork, to write them
+// together when it ends, unless Config.CoalesceWrites is off; either way every
+// reply arrives.
+func TestCoalesceWritesCorksReadRounds(t *testing.T) {
+	for _, coalesce := range []bool{true, false} {
+		t.Run(strconv.FormatBool(coalesce), func(t *testing.T) {
+			config := DefaultConfig()
+			if config.CoalesceWrites != true {
+				t.Fatal("CoalesceWrites is off in DefaultConfig")
+			}
+			config.CoalesceWrites = coalesce
+			corked := make(chan bool, 1)
+			_, addr := startEchoServer(t, config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+				c.mu.Lock()
+				held := c.corked
+				c.mu.Unlock()
+				select {
+				case corked <- held:
+				default:
+				}
+				_ = c.Send(b)
+			}})
+			conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			if _, err := conn.Write([]byte("ping")); err != nil {
+				t.Fatal(err)
+			}
+			reply := make([]byte, 4)
+			if _, err := io.ReadFull(conn, reply); err != nil || string(reply) != "ping" {
+				t.Fatalf("read %q, %v", reply, err)
+			}
+			if held := <-corked; held != coalesce {
+				t.Fatalf("corked during OnData = %v, want %v", held, coalesce)
+			}
+		})
 	}
 }
