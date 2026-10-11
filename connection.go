@@ -81,6 +81,9 @@ type Connection struct {
 	corked         bool
 	closeAfterSend bool
 	pendingBytes   atomic.Int64
+	// coalesceOverride is what SetCoalesceWrites chose for this connection:
+	// coalesceDefault leaves it to Config.CoalesceWrites.
+	coalesceOverride atomic.Int32
 	// charged is how much of pendingBytes counts against the server-wide
 	// budget; see chargeLocked. Guarded by mu.
 	charged    int64
@@ -130,6 +133,42 @@ func (c *Connection) Cork() {
 	c.mu.Lock()
 	c.corked = true
 	c.mu.Unlock()
+}
+
+const (
+	coalesceDefault int32 = iota
+	coalesceOn
+	coalesceOff
+)
+
+// SetCoalesceWrites sets whether the read rounds of this connection hold the
+// replies a handler sends from OnData and write them together when the round
+// ends, whatever Config.CoalesceWrites says for the engine. Call it from
+// OnOpen, so that every round sees it; one already running keeps what it began
+// with.
+//
+// It suits a protocol that knows how it writes. One that answers on the read
+// round, such as HTTP/1 or WebSocket, gains from the default; one whose
+// replies are produced away from the round, by handlers on a pool, batches
+// them itself, and the round has little to hold for it. It does nothing on a
+// UDP connection, whose sends are datagrams.
+func (c *Connection) SetCoalesceWrites(enabled bool) {
+	if enabled {
+		c.coalesceOverride.Store(coalesceOn)
+	} else {
+		c.coalesceOverride.Store(coalesceOff)
+	}
+}
+
+// coalesces reports whether a read round of c corks its replies.
+func (c *Connection) coalesces() bool {
+	switch c.coalesceOverride.Load() {
+	case coalesceOn:
+		return true
+	case coalesceOff:
+		return false
+	}
+	return c.engine.coalesceWrites
 }
 
 // Attachment returns application state associated with the connection.
@@ -794,7 +833,7 @@ func (c *Connection) hasFlushableOutput() bool {
 // when the round ends. Without it they are written as they are sent.
 func (c *Connection) drainInput() error {
 	c.mu.Lock()
-	if c.engine.coalesceWrites {
+	if c.coalesces() {
 		c.corked = true
 	}
 	c.readStalled = false
@@ -920,7 +959,7 @@ func (c *Connection) readLoop() error {
 					c.stallRead()
 					return nil
 				}
-				if c.engine.coalesceWrites {
+				if c.coalesces() {
 					c.mu.Lock()
 					c.corked = true
 					c.mu.Unlock()

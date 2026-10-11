@@ -1250,3 +1250,45 @@ func TestCoalesceWritesCorksReadRounds(t *testing.T) {
 		})
 	}
 }
+
+// SetCoalesceWrites decides for one connection, whichever way the engine's
+// Config.CoalesceWrites points.
+func TestSetCoalesceWritesOverridesEngine(t *testing.T) {
+	for _, engineOn := range []bool{true, false} {
+		for _, want := range []bool{true, false} {
+			t.Run(strconv.FormatBool(engineOn)+"/"+strconv.FormatBool(want), func(t *testing.T) {
+				config := DefaultConfig()
+				config.CoalesceWrites = engineOn
+				corked := make(chan bool, 1)
+				_, addr := startEchoServer(t, config, HandlerFuncs{
+					Open: func(c *Connection) { c.SetCoalesceWrites(want) },
+					Data: func(c *Connection, b []byte) {
+						c.mu.Lock()
+						held := c.corked
+						c.mu.Unlock()
+						select {
+						case corked <- held:
+						default:
+						}
+						_ = c.Send(b)
+					}})
+				conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+				if _, err := conn.Write([]byte("ping")); err != nil {
+					t.Fatal(err)
+				}
+				reply := make([]byte, 4)
+				if _, err := io.ReadFull(conn, reply); err != nil || string(reply) != "ping" {
+					t.Fatalf("read %q, %v", reply, err)
+				}
+				if held := <-corked; held != want {
+					t.Fatalf("corked during OnData = %v, want %v", held, want)
+				}
+			})
+		}
+	}
+}
