@@ -620,9 +620,17 @@ jobs:
         run: make -C c test CC=${{ matrix.cc }}
 
   autobahn:
-    name: Autobahn WebSocket (ws://)
+    name: Autobahn WebSocket (${{ matrix.scheme }}://)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scheme: ws
+            server: ./examples/websocket/nontls/server
+          - scheme: wss
+            server: ./examples/websocket/tls/server
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -630,7 +638,7 @@ jobs:
           go-version: stable
           cache-dependency-path: go.mod
       - name: Build echo server
-        run: go build -o "$RUNNER_TEMP/websocket_server" ./examples/websocket/nontls/server
+        run: go build -o "$RUNNER_TEMP/websocket_server" ${{ matrix.server }}
       - name: Start echo server
         run: |
           "$RUNNER_TEMP/websocket_server" -addr 127.0.0.1:9001 -compress > "$RUNNER_TEMP/server.log" 2>&1 &
@@ -641,9 +649,12 @@ jobs:
           echo "server did not start"
           cat "$RUNNER_TEMP/server.log"
           exit 1
-      # TLS is not covered. run.sh splits the cases across several wstest
+      # The wss:// run uses the TLS example, which issues itself a certificate;
+      # wstest does not verify it. run.sh splits the cases across several wstest
       # processes, merges their reports into reports/servers and checks it.
       - name: Run fuzzingclient
+        env:
+          AUTOBAHN_URL: ${{ matrix.scheme }}://127.0.0.1:9001
         run: |
           # Record memory use, so a run that is killed shows who grew.
           (while sleep 30; do
@@ -662,6 +673,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: autobahn-report
+          name: autobahn-report-${{ matrix.scheme }}
           path: reports/servers
           if-no-files-found: ignore
