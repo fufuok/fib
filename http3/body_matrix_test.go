@@ -687,10 +687,24 @@ func TestBodyMatrixAbort(t *testing.T) {
 			head, body := req.frames()
 			_ = s.Write(head, false)
 			_ = s.Write(body[:len(body)/2], false)
+			streams := m.streams(req)
+			if streams {
+				// The reset is to land in the middle of a body the handler is
+				// reading, so it waits for the handler to have begun: on a slow
+				// machine the half body can take longer than any fixed pause, and
+				// a reset that gets there first is of a body that never began.
+				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+					mu.Lock()
+					started := ran
+					mu.Unlock()
+					if started {
+						break
+					}
+				}
+			}
 			time.Sleep(50 * time.Millisecond)
 			s.Reset(uint64(ErrCodeRequestCancelled))
 
-			streams := m.streams(req)
 			deadline := time.Now().Add(5 * time.Second)
 			for streams && time.Now().Before(deadline) {
 				mu.Lock()
