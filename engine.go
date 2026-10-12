@@ -779,7 +779,7 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	// Record why, so a Read or Write that comes back to the connection is
 	// told what happened rather than only that it is closed, and drop the
 	// deadline timers, which have nothing left to close.
-	c.closeReason = closeErr
+	c.setCloseReasonLocked(closeErr)
 	c.stopDeadlinesLocked()
 	// Buffers the kernel is still sending from cannot go back to the pool: the
 	// next connection to take one would overwrite bytes still on their way out.
@@ -1399,7 +1399,7 @@ func (c *Connection) Protocol() Protocol {
 	switch {
 	case c.udp != nil:
 		return ProtocolUDP
-	case c.unix:
+	case c.flags.has(flagUnix):
 		return ProtocolUnix
 	}
 	return ProtocolTCP
@@ -1422,7 +1422,7 @@ func (c *Connection) RemoteAddrPort() netip.AddrPort {
 		ap := c.udp.raddr.AddrPort()
 		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 	}
-	if c.unix {
+	if c.flags.has(flagUnix) {
 		return netip.AddrPort{}
 	}
 	sa, err := c.peerSockaddr()

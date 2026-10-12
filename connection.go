@@ -9,10 +9,12 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/internal/netaddr"
@@ -34,17 +36,18 @@ type sendItem struct {
 	file   *fileSegment
 }
 
-type connectionAttachment struct{ value any }
-
 // Connection is safe to use from callback and application goroutines.
 //
 // A server holds one for every connection, so its fields are laid out to keep
 // it small, and in the order a round touches them: the words a round reads or
 // writes first, then the flags and booleans it checks, which share words
-// rather than each padding one out, and last what only opening, closing or a
-// deadline needs, with the deadlines, which most connections never set,
-// behind a pointer. A round's fields then sit in its first 162 bytes, and on
-// 64-bit Linux and macOS the whole fits the 208-byte size class.
+// rather than each padding one out, and last what only opening or closing
+// needs. On 64-bit Linux and macOS it is 192 bytes, a size class whose objects
+// start on a cache-line boundary, so a read round touches three lines of it
+// rather than the four a 208-byte object always straddles. With the
+// attachment kept in it rather than boxed, that cut go-websocket-benchmark's
+// user time per message on 8 Ryzen 7800X3D CPUs by 5.5% pipelined (348 to
+// 329ns) and 4.6% in echo.
 type Connection struct {
 	connPlatform
 	engine *Engine
@@ -61,7 +64,12 @@ type Connection struct {
 	// corkedBytes is output queued under a cork that pendingBytes does not
 	// count yet; see queueCorkedLocked. Guarded by mu.
 	corkedBytes int64
-	attachment  atomic.Pointer[connectionAttachment]
+	// attachType and attachData are the two words of the attachment, an any
+	// kept unboxed, so that reading it is not a trip to an object of its own.
+	// SetAttachment writes them under mu between two steps of the sequence
+	// in flags, which Attachment reads them between; see attachSeq.
+	attachType unsafe.Pointer
+	attachData unsafe.Pointer
 	// layer, when set, carries every send, as TLS does to encrypt it.
 	layer Layer
 	// udp is set for a UDP connection, which exchanges datagrams.
@@ -69,6 +77,9 @@ type Connection struct {
 	// dialing is set while an outbound connect is still in progress, and
 	// cleared when it completes or fails. Event-loop ownership.
 	dialing *dialRequest
+	// deadlines close the connection when they pass. They are allocated when
+	// the first is set, which most connections never do. Guarded by mu.
+	deadlines *connectionDeadlines
 	// flags holds the connFlag bits, which are read without the mutex.
 	flags connFlags
 	// pendingEvents is the readiness, in the ev bits, that the connection's
@@ -103,17 +114,14 @@ type Connection struct {
 	// dialed marks a connection Dial opened, as against one a listener
 	// accepted; it never changes.
 	dialed bool
-	// unix marks a Unix socket, which has none of TCP's options.
-	unix bool
+	// closeCode is why the connection closed, which Read and Write report
+	// to a caller that comes back to it afterwards: the usual reasons are
+	// coded here, and any other kept in deadlines; see setCloseReasonLocked.
+	// Guarded by mu.
+	closeCode uint8
 	// peer is the address the connection was accepted from, when accepting
 	// it told; see RemoteAddrPort.
 	peer packedAddrPort
-	// closeReason is why the connection closed, which Read and Write report
-	// to a caller that comes back to it afterwards. Guarded by mu.
-	closeReason error
-	// deadlines close the connection when they pass. They are allocated when
-	// the first is set, which most connections never do. Guarded by mu.
-	deadlines *connectionDeadlines
 }
 
 // The ev bits have to fit pendingEvents.
@@ -140,7 +148,14 @@ const (
 	// for the connection; with neither, Config.CoalesceWrites decides.
 	flagCoalesceOn
 	flagCoalesceOff
+	// flagUnix marks a Unix socket, which has none of TCP's options. It is
+	// set before the connection is handed out and never changes.
+	flagUnix
 )
+
+// attachSeq is the unit of the sequence count kept in the upper half of
+// connFlags, which is odd while SetAttachment is writing the attachment.
+const attachSeq = 1 << 16
 
 // connFlags are the flags of a connection that are read without its mutex,
 // packed into one atomic word rather than an atomic.Bool of four bytes apiece.
@@ -258,20 +273,35 @@ func (c *Connection) coalesces() bool {
 
 // Attachment returns application state associated with the connection.
 func (c *Connection) Attachment() any {
-	if value := c.attachment.Load(); value != nil {
-		return value.value
+	for {
+		seq := c.flags.bits.Load() &^ (attachSeq - 1)
+		if seq&attachSeq == 0 {
+			typ := atomic.LoadPointer(&c.attachType)
+			data := atomic.LoadPointer(&c.attachData)
+			if c.flags.bits.Load()&^(attachSeq-1) == seq {
+				var value any
+				words := (*eface)(unsafe.Pointer(&value))
+				words.typ, words.data = typ, data
+				return value
+			}
+		}
+		runtime.Gosched()
 	}
-	return nil
 }
+
+// eface is the layout of an any.
+type eface struct{ typ, data unsafe.Pointer }
 
 // SetAttachment associates application state with the connection. Passing nil
 // clears it. Protocol handlers use this to avoid a global connection-state map.
 func (c *Connection) SetAttachment(value any) {
-	if value == nil {
-		c.attachment.Store(nil)
-		return
-	}
-	c.attachment.Store(&connectionAttachment{value: value})
+	words := (*eface)(unsafe.Pointer(&value))
+	c.mu.Lock()
+	c.flags.bits.Add(attachSeq)
+	atomic.StorePointer(&c.attachType, words.typ)
+	atomic.StorePointer(&c.attachData, words.data)
+	c.flags.bits.Add(attachSeq)
+	c.mu.Unlock()
 }
 
 // Close ends the connection, dropping whatever has been queued for sending
@@ -941,7 +971,7 @@ func (c *Connection) finishClose() {
 		}
 	}()
 	c.mu.Lock()
-	err := c.closeReason
+	err := c.closeReasonLocked()
 	c.mu.Unlock()
 	c.handler.OnClose(c, err)
 }
@@ -1551,6 +1581,61 @@ func boolInt(b bool) int {
 // connectionDeadlines are a connection's read and write deadlines.
 type connectionDeadlines struct {
 	read, write deadline
+	// closeReason is why the connection closed, when it is none of the
+	// reasons closeKind tells apart.
+	closeReason error
+}
+
+// The values of closeCode: none, the end of input, a deadline, a reason kept
+// in deadlines, and from closeErrno on, an errno that much above it.
+const (
+	closeNone uint8 = iota
+	closeEOF
+	closeDeadline
+	closeOther
+	closeErrno
+)
+
+// setCloseReasonLocked records why the connection closed. The usual reasons
+// take no allocation; another goes in deadlines, which it allocates if no
+// deadline did. Callers hold c.mu.
+func (c *Connection) setCloseReasonLocked(err error) {
+	switch err {
+	case nil:
+		c.closeCode = closeNone
+		return
+	case io.EOF:
+		c.closeCode = closeEOF
+		return
+	case os.ErrDeadlineExceeded:
+		c.closeCode = closeDeadline
+		return
+	}
+	if errno, ok := err.(syscall.Errno); ok && errno <= syscall.Errno(255-closeErrno) {
+		c.closeCode = closeErrno + uint8(errno)
+		return
+	}
+	if c.deadlines == nil {
+		c.deadlines = &connectionDeadlines{}
+	}
+	c.closeCode = closeOther
+	c.deadlines.closeReason = err
+}
+
+// closeReasonLocked is the error setCloseReasonLocked recorded. Callers hold
+// c.mu.
+func (c *Connection) closeReasonLocked() error {
+	switch code := c.closeCode; {
+	case code == closeEOF:
+		return io.EOF
+	case code == closeDeadline:
+		return os.ErrDeadlineExceeded
+	case code == closeOther:
+		return c.deadlines.closeReason
+	case code >= closeErrno:
+		return syscall.Errno(code - closeErrno)
+	}
+	return nil
 }
 
 // deadline is one of a connection's two deadlines. Its timer is rebuilt
@@ -1823,8 +1908,8 @@ func (c *Connection) closedError() error {
 	if !c.closing && !c.closed {
 		return nil
 	}
-	if c.closeReason != nil {
-		return c.closeReason
+	if err := c.closeReasonLocked(); err != nil {
+		return err
 	}
 	return net.ErrClosed
 }

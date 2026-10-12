@@ -653,7 +653,7 @@ func TestRecycledDescriptorGetsFreshConnection(t *testing.T) {
 	_, addr := startEchoServer(t, config, HandlerFuncs{
 		Open: func(c *Connection) {
 			mu.Lock()
-			tokensByFD[c.FD()] = append(tokensByFD[c.FD()], c.token)
+			tokensByFD[c.FD()] = append(tokensByFD[c.FD()], c.token())
 			mu.Unlock()
 		},
 		Data: func(c *Connection, b []byte) {
@@ -734,10 +734,10 @@ func TestConnectionForRejectsStaleToken(t *testing.T) {
 			}
 		}
 		switch {
-		case server.connectionFor(c.token) != c:
+		case server.connectionFor(c.token()) != c:
 			report("connectionFor(live token) did not return the live connection")
 		// Same descriptor, different generation.
-		case server.connectionFor(c.token^(1<<32)) != nil:
+		case server.connectionFor(c.token()^(1<<32)) != nil:
 			report("connectionFor(stale token) resolved to a connection")
 		// A descriptor past the end of the table must not panic.
 		case server.connectionFor(uint64(uint32(len(server.connections)+100))) != nil:
@@ -831,7 +831,6 @@ func TestPriorityDataUsesDedicatedCallback(t *testing.T) {
 // for exercising queue bookkeeping directly.
 func newOfflineConnection(e *Engine) *Connection {
 	c := &Connection{engine: e}
-	c.token = 1
 	c.fd.Store(-1)
 	return c
 }

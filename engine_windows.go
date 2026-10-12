@@ -606,7 +606,8 @@ func (e *Engine) adopt(l *winListener, s syscall.Handle) error {
 		// back until the peer's delayed ACK.
 		_ = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 	}
-	c := &Connection{engine: e, handler: e.handler, unix: l.family == syscall.AF_UNIX}
+	c := &Connection{engine: e, handler: e.handler}
+	c.flags.set(flagUnix, l.family == syscall.AF_UNIX)
 	c.handle.Store(uintptr(s))
 	c.readOp = ioOp{kind: opRead, conn: c}
 	c.writeOp = ioOp{kind: opWrite, conn: c}
@@ -1088,7 +1089,8 @@ func (e *Engine) connectUnix(d *dialRequest) (c *Connection, connected bool, err
 		syscall.Closesocket(s)
 		return nil, false, err
 	}
-	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true, unix: true}
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true}
+	c.flags.set(flagUnix, true)
 	c.handle.Store(uintptr(s))
 	c.readOp = ioOp{kind: opRead, conn: c}
 	c.writeOp = ioOp{kind: opWrite, conn: c}

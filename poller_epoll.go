@@ -277,7 +277,8 @@ func (e *Engine) setReadPaused(c *Connection, paused bool) error {
 	if paused {
 		events &^= syscall.EPOLLIN
 	}
-	ev := syscall.EpollEvent{Events: events, Fd: int32(c.token), Pad: int32(c.token >> 32)}
+	token := c.token()
+	ev := syscall.EpollEvent{Events: events, Fd: int32(token), Pad: int32(token >> 32)}
 	return syscall.EpollCtl(e.epollFD, syscall.EPOLL_CTL_MOD, c.FD(), &ev)
 }
 

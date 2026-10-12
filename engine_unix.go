@@ -77,9 +77,14 @@ type enginePlatform struct {
 }
 
 type connPlatform struct {
-	fd    atomic.Int32
-	token uint64
+	fd atomic.Int32
+	// gen is the generation half of the connection's token; see newToken.
+	// The descriptor half is fd, so the pair fits the word a whole token took.
+	gen uint32
 }
+
+// token returns the token the connection is registered with.
+func (c *Connection) token() uint64 { return uint64(uint32(c.fd.Load())) | uint64(c.gen)<<32 }
 
 // udpPlatform is empty here: a dialed UDP connection reads its own descriptor
 // and a peer sends through its listener's.
@@ -389,7 +394,7 @@ func (e *Engine) connectionAt(fd int) *Connection {
 // reused descriptor never resolves to the connection that previously held it.
 func (e *Engine) connectionFor(token uint64) *Connection {
 	c := e.connectionAt(int(uint32(token)))
-	if c == nil || c.token != token {
+	if c == nil || c.gen != uint32(token>>32) {
 		return nil
 	}
 	return c
@@ -506,13 +511,13 @@ func (e *Engine) acceptConnections(listenFD int) {
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		}
 		if len(e.pollers) == 0 {
-			e.admit(&Connection{engine: e, handler: e.handler, unix: !e.tcpListeners, peer: packAddrPort(peer)}, fd)
+			e.admit(newAccepted(e, e.handler, !e.tcpListeners, peer), fd)
 			continue
 		}
 		// The poller registers the descriptor itself, since its table and
 		// its backend are its loop's alone.
 		p := e.pollers[fd%len(e.pollers)]
-		c := &Connection{engine: p, handler: e.handler, unix: !e.tcpListeners, peer: packAddrPort(peer)}
+		c := newAccepted(p, e.handler, !e.tcpListeners, peer)
 		c.fd.Store(int32(fd))
 		if !p.request(command{kind: commandAccept, connection: c}) {
 			syscall.Close(fd)
@@ -540,7 +545,7 @@ func (e *Engine) admit(c *Connection, fd int) {
 	// indexes the table, and the generation makes an event left over from a
 	// previous owner of the same descriptor resolve to nothing.
 	token := e.newToken(fd)
-	c.token = token
+	c.gen = uint32(token >> 32)
 	c.fd.Store(int32(fd))
 	// Write interest is registered up front and never modified again. The
 	// descriptor is edge-triggered, so an always-armed write interest only
@@ -778,8 +783,9 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 		return nil, false, err
 	}
 	token := e.newToken(fd)
-	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true, unix: netaddr.IsUnix(d.network)}
-	c.token = token
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true}
+	c.flags.set(flagUnix, netaddr.IsUnix(d.network))
+	c.gen = uint32(token >> 32)
 	c.fd.Store(int32(fd))
 	// Registering an unconnected socket is what makes the connect
 	// asynchronous: its first write edge says the connect has finished, one
@@ -813,7 +819,7 @@ func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool,
 	token := e.newToken(fd)
 	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true,
 		udp: &udpState{raddr: &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}}}
-	c.token = token
+	c.gen = uint32(token >> 32)
 	c.fd.Store(int32(fd))
 	if err = e.registerDatagram(fd, token); err != nil {
 		syscall.Close(fd)
@@ -1042,4 +1048,11 @@ func fileName(local, remote net.Addr) string {
 		name += "->" + remote.String()
 	}
 	return name
+}
+
+// newAccepted returns a connection for a socket a listener accepted from peer.
+func newAccepted(e *Engine, handler Handler, unix bool, peer netip.AddrPort) *Connection {
+	c := &Connection{engine: e, handler: handler, peer: packAddrPort(peer)}
+	c.flags.set(flagUnix, unix)
+	return c
 }
