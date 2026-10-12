@@ -38,11 +38,13 @@ const (
 	// fewer pauses for bursty peers over allocation under sustained backlog;
 	// memory-sensitive deployments with many connections should lower it.
 	defaultWriteHighWatermark = 64 << 10
-	// defaultMaxPendingBytes is the server-wide outbound budget. It is the
-	// bound that actually holds at high connection counts, where the
-	// per-connection watermark alone would admit its own limit times the
-	// connection count.
-	defaultMaxPendingBytes = 1 << 30
+	// defaultMaxPendingBytes leaves the server-wide outbound budget off, so by
+	// default only the per-connection watermark pauses reads. A budget pauses
+	// every connection once the sum reaches it, including ones with nothing of
+	// their own queued, which lets a few slow peers stall the rest; it is for
+	// deployments where the watermark times the connection count is more
+	// memory than they can spare.
+	defaultMaxPendingBytes = 0
 )
 
 // Readiness a connection accumulates between rounds. The values are epoll's,
@@ -184,8 +186,8 @@ func (e *Engine) noteUnixPath(network, path string) {
 // twice and helped neither: a 4KB class left 736MB of buffers about a third
 // full, and stepping down to 1KB classes made it worse still at 1181MB,
 // because each class retains idle buffers of its own. Resident peak did not
-// move for any of them, so the bound that matters is MaxPendingBytes, not the
-// shape of the buffers underneath it.
+// move for any of them, so the bound that matters is the backlog the watermark
+// and MaxPendingBytes admit, not the shape of the buffers underneath it.
 func (e *Engine) acquireSendBuffer() []byte {
 	return bufferpool.Get(e.sendBufferSize)[:0]
 }
@@ -878,7 +880,9 @@ type Config struct {
 	// connections waiting for their sockets. WriteBufferHighWatermark bounds a
 	// single connection, which at 100k connections still admits a per-server
 	// total of watermark*100k; this is the bound on the sum. Reads pause on
-	// every connection while the budget is exhausted. Zero means unlimited.
+	// every connection while the budget is exhausted. Zero means unlimited,
+	// which is what DefaultConfig sets: only the per-connection watermark
+	// applies unless a deployment opts into this one.
 	MaxPendingBytes int64
 	UseWritev       bool
 	// CoalesceWrites batches the replies a read round produces. With it, the

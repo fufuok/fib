@@ -56,14 +56,11 @@ func TestDefaultConfigPoolSizing(t *testing.T) {
 	if config.WriteBufferHighWatermark != defaultWriteHighWatermark {
 		t.Fatalf("WriteBufferHighWatermark = %d, want %d", config.WriteBufferHighWatermark, defaultWriteHighWatermark)
 	}
-	if config.MaxPendingBytes != defaultMaxPendingBytes {
-		t.Fatalf("MaxPendingBytes = %d, want %d", config.MaxPendingBytes, defaultMaxPendingBytes)
-	}
-	// The server-wide budget has to sit well above a single connection's, or it
-	// would pause every connection as soon as one of them backed up.
-	if config.MaxPendingBytes <= int64(config.WriteBufferHighWatermark) {
-		t.Fatalf("MaxPendingBytes = %d, want more than the per-connection watermark %d",
-			config.MaxPendingBytes, config.WriteBufferHighWatermark)
+	// The server-wide budget is off by default: it pauses every connection once
+	// the sum reaches it, so only the per-connection watermark applies unless a
+	// deployment opts in.
+	if config.MaxPendingBytes != 0 {
+		t.Fatalf("MaxPendingBytes = %d, want 0 (no server-wide budget)", config.MaxPendingBytes)
 	}
 	if config.TaskPoolMode != taskpool.ModeAdaptive {
 		t.Fatalf("TaskPoolMode = %v, want adaptive", config.TaskPoolMode)

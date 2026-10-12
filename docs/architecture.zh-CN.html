@@ -283,7 +283,7 @@ flowchart TD
   F -- 否 --> QU
   Q -- "否；轮内 corked" --> QU["剩余部分入发送队列&lt;br/&gt;pendingBytes 与 pendingTotal 同步增加"]
   QU --> CK["轮末 uncork：flushOutput&lt;br/&gt;writev 至多 64 项 / sendfile"]
-  QU --> WM{"到高水位 64KB&lt;br/&gt;或总预算 1GiB 用尽"}
+  QU --> WM{"到高水位 64KB&lt;br/&gt;或总预算用尽（若设置）"}
   WM -- 是 --> RF["commandRefresh → 循环&lt;br/&gt;pauseDecision → EPOLL_CTL_MOD 去掉 EPOLLIN"]
   QU --> EDGE["EPOLLOUT 边沿 → 一轮 → flushOutput"]
   EDGE --> LOW{"回落到低水位 16KB&lt;br/&gt;总预算回到 1/4"}
@@ -301,7 +301,7 @@ flowchart TD
   <ul class="notes">
     <li><b>写关注常驻</b>：EPOLLOUT 从注册起一直开着，排队本身不需要改注册，只有越过水位才需要一次 <code>epoll_ctl</code>。</li>
     <li><b>cork</b>：一轮之内的回复先攒在一个连续缓冲里，轮末一次写出。流式响应想先把前一部分发出去时调 <code>Flush</code>；应用也可以自己 <code>Cork</code>。</li>
-    <li><b>滞回</b>：暂停在高水位（默认 64KB），恢复在其 1/4，避免每个回复都来回越线；总预算（默认 1GiB）同样在 1/4 处恢复。连接数很多时真正起作用的是总预算。</li>
+    <li><b>滞回</b>：暂停在高水位（默认 64KB），恢复在其 1/4，避免每个回复都来回越线；总预算（<code>MaxPendingBytes</code>，默认关闭）同样在 1/4 处恢复。连接数很多时，单靠水位线允许的总量是水位线乘连接数，总预算限制的是这个总和。</li>
     <li><b>被总预算暂停的连接</b>自己可能没有任何待发数据，不会有自己的事件来重新评估，所以循环把它们记在 <code>budgetPaused</code> 里，预算回落时统一恢复；释放预算的连接在别的 poller 上时会唤醒这些循环。</li>
     <li><b>读侧背压</b>：<code>HoldReads</code> 让应用在自己消化不完时暂停读（流式请求 body 就是这样用的），释放后重新交付 socket 里已有的字节。</li>
     <li><code>Stats()</code> 报告两种暂停各发生多少次、已恢复多少次和当前排队总量；<code>SendFile</code> 走 sendfile，不计入预算。</li>

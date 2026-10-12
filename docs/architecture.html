@@ -283,7 +283,7 @@ flowchart TD
   F -- no --> QU
   Q -- "no; corked in a round" --> QU["queue the rest&lt;br/&gt;pendingBytes and pendingTotal grow together"]
   QU --> CK["end of round, uncork: flushOutput&lt;br/&gt;writev of up to 64 items / sendfile"]
-  QU --> WM{"high watermark, 64KB&lt;br/&gt;or the 1GiB budget exhausted"}
+  QU --> WM{"high watermark, 64KB&lt;br/&gt;or the budget exhausted, if set"}
   WM -- yes --> RF["commandRefresh → loop&lt;br/&gt;pauseDecision → EPOLL_CTL_MOD drops EPOLLIN"]
   QU --> EDGE["EPOLLOUT edge → a round → flushOutput"]
   EDGE --> LOW{"down to the low watermark, 16KB&lt;br/&gt;budget back to a quarter"}
@@ -300,7 +300,7 @@ flowchart TD
   <ul class="notes">
     <li><b>Write interest is permanent.</b> EPOLLOUT is armed from registration on, so queueing needs no registration change; only a watermark crossing costs an <code>epoll_ctl</code>.</li>
     <li><b>Cork.</b> A round's replies accumulate in one contiguous buffer and reach the socket in one write when it ends. A handler streaming a response calls <code>Flush</code> to send its first part early, and an application may <code>Cork</code> for itself.</li>
-    <li><b>Hysteresis.</b> Reads pause at the high watermark (64KB by default) and resume at a quarter of it, so that replies do not cross the line back and forth; the budget (1GiB by default) likewise resumes at a quarter. At high connection counts the budget is the bound that holds.</li>
+    <li><b>Hysteresis.</b> Reads pause at the high watermark (64KB by default) and resume at a quarter of it, so that replies do not cross the line back and forth; the budget, off by default and set with <code>MaxPendingBytes</code>, likewise resumes at a quarter. At high connection counts it is the bound on the sum, which the watermark alone admits times the connection count.</li>
     <li><b>A connection paused by the budget</b> may have nothing of its own left to flush, and so no event of its own to re-evaluate it. The loop keeps such connections in <code>budgetPaused</code> and resumes them when the budget recovers, and a connection on another poller that drains the budget wakes the loops holding some.</li>
     <li><b>Read-side backpressure.</b> <code>HoldReads</code> lets an application stop reading while it works through what it has, as a streamed request body does; releasing it redelivers what the socket already held.</li>
     <li><code>Stats()</code> reports how often each kind of pause happened, how many have been lifted and the total queued now. <code>SendFile</code> uses sendfile and is not charged to the budget.</li>

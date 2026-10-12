@@ -52,8 +52,9 @@ uSockets, workflow, axum, h2, quiche and rustls.
   systems such as FreeBSD fall back to the standard `net` package.
 - **Per-connection scheduling**: each connection's events run in order, one at a time, on any idle
   worker. No connection is tied to a thread, so load spreads by real work rather than by fd count.
-- **Backpressure**: a per-connection write watermark (64 KiB) and a server-wide budget for pending
-  bytes (1 GiB). Reads pause when either one fills, and `HoldReads` gives read-side flow control.
+- **Backpressure**: a per-connection write watermark (64 KiB) pauses reads when it fills, and an
+  optional server-wide budget for pending bytes (`MaxPendingBytes`, off by default) bounds the sum.
+  `HoldReads` gives read-side flow control.
 - **Pools**: an adaptive worker pool that grows and shrinks with load, and a size-classed buffer
   pool aligned to the Go allocator's size classes.
 - **Async clients**: non-blocking dial, plus HTTP/1.x, HTTP/2, HTTP/3 and WebSocket clients that
@@ -378,9 +379,9 @@ have the full picture, with one diagram per protocol.
   start of a round and go back at the end, so an idle connection holds no I/O buffer at all. The
   pool's size classes match the Go allocator's, so nothing is lost to rounding. A reserve survives
   GC, so a collection does not empty the pool.
-- **Bounded backlog.** The per-connection watermark and the server-wide `MaxPendingBytes` budget
-  cap how much output can queue up. When either is reached, fib stops reading from the
-  connections that are behind. In the HTTP/1 and WebSocket pipeline benchmarks this keeps fib at
+- **Bounded backlog.** The per-connection watermark, and the server-wide `MaxPendingBytes` budget
+  when one is set, cap how much output can queue up. When either is reached, fib stops reading
+  from the connections that are behind. In the HTTP/1 and WebSocket pipeline benchmarks this keeps fib at
   32–36 MB while most other servers grow to hundreds of MB.
 - **TLS state is dropped after the handshake.** On the fast path, the `tls.Conn` and its input and
   handshake buffers are released, keeping only the keys and sequence numbers.

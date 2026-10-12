@@ -77,9 +77,9 @@
   （`ReadsPausedByWatermark`、`ReadsPausedByBudget`、`ReadsResumed`、
   `PendingBytes`）：
   - `WriteBufferHighWatermark` 只看这条连接自己积压了多少，是对端跟不上；
-  - `MaxPendingBytes` 是整个 server 共享的总量，被别的连接耗尽时，**一条自己
-    几乎没有积压的连接也会被暂停读**。排查「水位线明明远大于单条消息却触发了
-    背压」时，先看这两个计数哪个在涨。
+  - `MaxPendingBytes` 是整个 server 共享的总量（默认 0，即不设全局预算），设置后
+    被别的连接耗尽时，**一条自己几乎没有积压的连接也会被暂停读**。排查「水位线
+    明明远大于单条消息却触发了背压」时，先看这两个计数哪个在涨。
 - 注意水位线要比**一轮读取**产生的回包总量大，而不只是比单条消息大：一轮读取
   是 corked 的，这一轮内所有回包先进队列、轮末一次性 flush，所以即使 TCP 发送
   缓冲区是空的，队列里也会短暂地存在这一轮的全部回包；一轮最多读
@@ -105,7 +105,8 @@
   `WorkerCount`、`SharedTaskPool` 和池容量配置都不再生效；Engine 关闭时不会
   停止该池，由调用方在所有使用它的 Engine 关闭后自行停止。`GoTasks` 返回接受的
   前缀长度，未被接受的任务对应的连接会被关闭，所以池只应在停止时拒绝任务。
-- 默认 `WriteBufferHighWatermark` 为 64 KiB，`MaxPendingBytes` 为 1 GiB。
+- 默认 `WriteBufferHighWatermark` 为 64 KiB，`MaxPendingBytes` 为 0（不设全局预算，只有
+  每连接水位线生效）；连接数很多、水位线乘连接数超出内存承受范围时再设置它。
 - `Send` 先直接发送，余量复制进发送队列。默认启用自适应 writev：单缓冲走
   write，`SendParts` 的两段数据和包含多个缓冲的发送队列走 writev；仅在背压
   时复制未发送部分。
@@ -1580,7 +1581,7 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
   handler 交给 `<Name>-streams`（`Engine.HandlerPool()`），不与 Engine 的协程池共用。
 - `tls` 子 package 的解密和加密、WebSocket 的分帧和消息回调，同样都在连接的一轮里、在 worker
   上执行，一个阻塞的回调只拖住它自己的连接。
-- `MaxPendingBytes` 仍是整个 Engine（含所有 poller）的总预算；一个 poller 上的连接把预算
+- 设置了 `MaxPendingBytes` 时，它仍是整个 Engine（含所有 poller）的总预算；一个 poller 上的连接把预算
   释放到恢复线以下时，会唤醒其他因预算暂停了连接的 poller。`Stats()` 汇总所有 poller 的计数，
   `Connection.Engine()` 返回的仍是用户创建的那个 Engine。
 

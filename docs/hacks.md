@@ -339,7 +339,7 @@ working together:
    heap locks are the bottleneck (see [§6](#6-object-reuse-using-context-like-fasthttp)).
 5. **Bounded backlog.** When the peer does not read its responses, the write queue grows to
    `WriteBufferHighWatermark` and then fib stops reading that peer's requests
-   (`MaxPendingBytes` is the server-wide total). That is why memory stays at a few tens of MB in
+   (`MaxPendingBytes`, off by default, optionally bounds the server-wide total). That is why memory stays at a few tens of MB in
    pipeline tests rather than growing to hundreds.
 
 **Getting the same benefit in your own protocol**
@@ -522,8 +522,8 @@ Data: func(c *fib.Connection, data []byte) {
   back to the pool.
 
 To debug "backpressure triggered although the watermark is far above one message", look at
-`ReadsPausedByWatermark` and `ReadsPausedByBudget` in `Engine.Stats()`. The latter means the
-`MaxPendingBytes` budget was used up by other connections, **and a connection with almost no
+`ReadsPausedByWatermark` and `ReadsPausedByBudget` in `Engine.Stats()`. The latter, which only
+moves when `MaxPendingBytes` is set, means that budget was used up by other connections, **and a connection with almost no
 backlog of its own is paused too**.
 
 ---

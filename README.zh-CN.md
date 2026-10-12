@@ -51,8 +51,8 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
   回退到标准库 `net`。
 - **按连接调度**：同一连接的事件按顺序、一次一个地在任意空闲 worker 上执行。连接不绑定线程，
   负载按实际工作量分摊，而不是按 fd 数量。
-- **背压**：每连接有写水位线（64 KiB），全服务有待发字节预算（1 GiB），任一满了就暂停读取；
-  `HoldReads` 提供读端流控。
+- **背压**：每连接有写水位线（64 KiB），满了就暂停读取；全服务待发字节预算（`MaxPendingBytes`）
+  可选、默认关闭，用来限制总量；`HoldReads` 提供读端流控。
 - **池**：随负载伸缩的自适应 worker 池；按 Go 分配器 size class 对齐的分级 buffer 池。
 - **异步客户端**：非阻塞 dial，以及 HTTP/1.x、HTTP/2、HTTP/3、WebSocket 客户端，结果通过回调或
   future 返回。
@@ -353,8 +353,8 @@ poller 数量（`Config.IOPollers`、`IOPollerCount`）取决于 CPU 数：4 核
 - **buffer 只借用一轮。** 读写 buffer 在一轮开始时从 `bufferpool` 取、结束时归还，空闲连接不持有
   任何 I/O buffer。池的 size class 与 Go 分配器一致，没有取整浪费；还有一份能扛过 GC 的储备，
   GC 不会把池清空。
-- **有上限的积压。** 每连接水位线和全服务 `MaxPendingBytes` 预算限制排队输出的总量，达到任一
-  上限就停止读取落后的连接。在 HTTP/1 和 WebSocket 的 pipeline 测试中，fib 因此保持在 32–36 MB，
+- **有上限的积压。** 每连接水位线（以及设置了时的全服务 `MaxPendingBytes` 预算）限制排队输出
+  的总量，达到任一上限就停止读取落后的连接。在 HTTP/1 和 WebSocket 的 pipeline 测试中，fib 因此保持在 32–36 MB，
   而多数其他实现涨到几百 MB。
 - **握手后丢弃 TLS 状态。** 快速路径上，`tls.Conn` 及其输入和握手 buffer 都被释放，只保留密钥和
   序列号。

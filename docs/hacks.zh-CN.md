@@ -296,7 +296,7 @@ HTTP/1 pipeline（一次写 N 个请求、按顺序读 N 个响应）和 WebSock
 4. **复用对象，零分配。** 请求、Header、URL、Context 默认都回收复用；Router 每请求零分配，
    在这种每秒千万级请求的场景里，GC 与堆锁才是瓶颈（见 [§6](#6-对象复用像-fasthttp-一样用-context)）。
 5. **有上限的积压。** 对端不读响应时，写队列涨到 `WriteBufferHighWatermark` 就停止读它的请求
-   （`MaxPendingBytes` 是全服务总量），所以 pipeline 压测中内存稳定在几十 MB，而不是涨到几百 MB。
+   （可选的 `MaxPendingBytes` 限制全服务总量，默认关闭），所以 pipeline 压测中内存稳定在几十 MB，而不是涨到几百 MB。
 
 **你自己写协议时怎么吃到同样的红利**
 
@@ -450,7 +450,7 @@ Data: func(c *fib.Connection, data []byte) {
 - 这与"回调里阻塞"根本不同：阻塞会占着 worker；`HoldReads` 让连接**不再被调度**，worker 立即还给池。
 
 排查"明明水位线远大于单条消息却触发了背压"：看 `Engine.Stats()` 的 `ReadsPausedByWatermark`
-和 `ReadsPausedByBudget`，后者是 `MaxPendingBytes` 总预算被别的连接耗尽——**一条自己几乎没有积压的
+和 `ReadsPausedByBudget`，后者只在设置了 `MaxPendingBytes` 时才会涨，是总预算被别的连接耗尽——**一条自己几乎没有积压的
 连接也会因此被暂停读**。
 
 ---
