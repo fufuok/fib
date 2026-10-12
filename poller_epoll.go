@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"syscall"
+	"unsafe"
 
 	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/taskpool"
@@ -169,9 +170,33 @@ func (e *Engine) runLoop() error {
 // handler, served 1.27M requests a second with the loop blocking, with 26.6ms
 // for the median request, and with two Ps 2.02M.
 //
-// The runtime's poller watches a duplicate of the descriptor, so that the
-// engine keeps closing its own as before. Where that cannot be set up, wait
-// blocks in epoll_wait as the loop always did.
+// The runtime's poller does not watch the loop's epoll instance itself but a
+// relay: a second epoll instance holding the first, which reports it only
+// while the loop is parked. Watched directly, the loop's instance was looked
+// at by every P that ran out of work, since the runtime's poller looks at
+// every descriptor that reported itself since its last look, and a busy
+// loop's instance reports itself with every event its connections raise.
+// Looking at it takes the instance's lock, which the loop holds while it
+// copies out a batch of events, and the Ps that came for it spun on that lock
+// rather than looking for work: in go-websocket-benchmark's echo over 20k
+// connections, with one poller on 8 CPUs, they spun for 4.3% of the server's
+// CPU time, and one poller served 4.9% more echoes with the relay. Disarmed,
+// the relay hears the loop's instance and lets it go, and the runtime's
+// poller never hears of it.
+//
+// Those looks did earn a lightly loaded loop something: each of its events
+// woke a thread parked in the runtime's poller, which took an idle P and went
+// looking for the workers the loop had just woken. One poller serving 100
+// connections echoed 5.5% less without them; two, as 8 CPUs get by default,
+// echoed the same at every count from 100 connections to 50k. Keeping the
+// relay armed while batches are small won that back, but cost two pollers
+// 1.6% at 20k and 50k connections, where their batches are small too: every
+// event then passes through one more epoll instance. Switching the duplicate
+// itself in and out is no cheaper: adding an epoll instance to another makes
+// the kernel walk every descriptor it holds.
+//
+// Where the relay cannot be set up, wait blocks in epoll_wait as the loop
+// always did.
 type epollWaiter struct {
 	file *os.File
 	conn syscall.RawConn
@@ -180,6 +205,7 @@ type epollWaiter struct {
 	// loop waits once per round. epfd and events are what it polls, and n and
 	// err what it found.
 	poll   func(uintptr) bool
+	relay  int
 	epfd   int
 	events []syscall.EpollEvent
 	n      int
@@ -187,50 +213,90 @@ type epollWaiter struct {
 }
 
 func newEpollWaiter(epfd int) *epollWaiter {
-	fd, err := syscall.Dup(epfd)
+	relay, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil
 	}
-	syscall.CloseOnExec(fd)
-	// The runtime only polls a descriptor that is non-blocking. The flag is
-	// shared with the engine's own descriptor, which epoll_wait ignores.
-	if err := syscall.SetNonblock(fd, true); err != nil {
-		syscall.Close(fd)
+	// Added disarmed; see arm. The runtime only polls a descriptor that is
+	// non-blocking.
+	ev := syscall.EpollEvent{}
+	if err := syscall.EpollCtl(relay, syscall.EPOLL_CTL_ADD, epfd, &ev); err != nil {
+		syscall.Close(relay)
 		return nil
 	}
-	file := os.NewFile(uintptr(fd), "fib-epoll")
+	if err := syscall.SetNonblock(relay, true); err != nil {
+		syscall.Close(relay)
+		return nil
+	}
+	file := os.NewFile(uintptr(relay), "fib-epoll")
 	conn, err := file.SyscallConn()
 	if err != nil {
 		file.Close()
 		return nil
 	}
-	w := &epollWaiter{file: file, conn: conn, epfd: epfd}
+	w := &epollWaiter{file: file, conn: conn, relay: relay, epfd: epfd}
 	w.poll = func(uintptr) bool {
-		w.n, w.err = syscall.EpollWait(w.epfd, w.events, 0)
+		w.n, w.err = pollEvents(w.epfd, w.events)
 		return w.n != 0 || (w.err != nil && w.err != syscall.EINTR)
 	}
 	return w
 }
 
+// arm has the relay report the loop's instance readable, or with no events,
+// only the error and hang-up epoll always adds, not report it at all: the
+// instance announces its events to the relay as readable, which those do not
+// include.
+func (w *epollWaiter) arm(events uint32) error {
+	ev := syscall.EpollEvent{Events: events}
+	return syscall.EpollCtl(w.relay, syscall.EPOLL_CTL_MOD, w.epfd, &ev)
+}
+
 // wait returns the events that are ready, waiting for some if there are none.
-// Read looks for them before it parks, and again each time the runtime
-// reports the descriptor readable, so a loop with events waiting makes one
-// call to epoll_wait, as it did blocking.
+// A loop with events waiting, as a busy one has, takes them without parking
+// and without touching the relay. Read looks for events again before it
+// parks, and each time the runtime reports the relay readable, so events
+// that arrive while the relay is armed are never missed: arming it with the
+// instance already readable reports it at once.
 func (w *epollWaiter) wait(epfd int, events []syscall.EpollEvent) (int, error) {
-	if w != nil {
-		w.events = events
-		readErr := w.conn.Read(w.poll)
-		w.events = nil
-		if readErr == nil {
-			return w.n, w.err
+	if w != nil && w.file != nil {
+		if n, err := pollEvents(epfd, events); n != 0 || (err != nil && err != syscall.EINTR) {
+			return n, err
 		}
-		// The runtime cannot poll the descriptor after all.
+		if w.arm(syscall.EPOLLIN) == nil {
+			w.events = events
+			readErr := w.conn.Read(w.poll)
+			w.events = nil
+			if w.arm(0) == nil && readErr == nil {
+				return w.n, w.err
+			}
+			if readErr == nil {
+				// The events are taken; the relay is given up from the
+				// next wait on.
+				w.close()
+				w.file = nil
+				return w.n, w.err
+			}
+		}
+		// The runtime cannot poll the relay after all.
+		w.close()
+		w.file = nil
 	}
 	return syscall.EpollWait(epfd, events, -1)
 }
 
+// pollEvents returns the events that are ready without waiting. It never
+// blocks, so it makes the call raw, as the sockets' reads and writes are.
+func pollEvents(epfd int, events []syscall.EpollEvent) (int, error) {
+	r, _, errno := syscall.RawSyscall6(syscall.SYS_EPOLL_PWAIT, uintptr(epfd),
+		uintptr(unsafe.Pointer(unsafe.SliceData(events))), uintptr(len(events)), 0, 0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(r), nil
+}
+
 func (w *epollWaiter) close() {
-	if w != nil {
+	if w != nil && w.file != nil {
 		w.file.Close()
 	}
 }
