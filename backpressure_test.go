@@ -537,6 +537,66 @@ func TestCorkHoldsSendsUntilFlush(t *testing.T) {
 	}
 }
 
+// A send held by a cork is only counted when something needs the backlog, and
+// a round deciding whether to read is one: output corked past the watermark
+// holds the peer's next request back until Flush sends it, as it did when every
+// send was counted at once.
+func TestCorkedSendsCountAgainstTheWatermark(t *testing.T) {
+	const watermark = 8 << 10
+	config := DefaultConfig()
+	config.WriteBufferHighWatermark = watermark
+	opened := make(chan *Connection, 1)
+	received := make(chan string, 4)
+	_, addr := startEchoServer(t, config, HandlerFuncs{
+		Open: func(c *Connection) { opened <- c },
+		Data: func(c *Connection, b []byte) { received <- string(b) },
+	})
+	peer, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	c := <-opened
+	c.Cork()
+	header, body := []byte("head"), bytes.Repeat([]byte{'x'}, watermark)
+	if err := c.SendParts(header, body); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	backlog := c.pendingBytes.Load() + c.corkedBytes
+	c.mu.Unlock()
+	if want := int64(len(header) + len(body)); backlog != want {
+		t.Fatalf("backlog = %d, want %d", backlog, want)
+	}
+	if _, err := peer.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-received:
+		t.Fatalf("read %q while the corked output was past the watermark", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-received:
+		if got != "ping" {
+			t.Fatalf("read %q, want ping", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read held back for the corked output never came after Flush")
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got := make([]byte, len(header)+len(body))
+	if _, err := io.ReadFull(peer, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, append(header, body...)) {
+		t.Fatal("the corked output arrived changed")
+	}
+}
+
 func TestEngineServesOnAdaptivePool(t *testing.T) {
 	config := DefaultConfig()
 	config.SetTaskPoolMode(taskpool.ModeAdaptive)

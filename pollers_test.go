@@ -858,7 +858,7 @@ func TestReadDeferredBehindAnotherGoroutinesFlush(t *testing.T) {
 				if !waitFor(func() bool {
 					c.mu.Lock()
 					defer c.mu.Unlock()
-					return c.pendingEvents&evIn != 0
+					return uint32(c.pendingEvents)&evIn != 0
 				}) {
 					t.Error("the event loop never noted the next read")
 				}

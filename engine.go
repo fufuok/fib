@@ -640,7 +640,7 @@ func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
 	// Coalescing duplicate notifications avoids a slice scan and keeps a hot
 	// connection from allocating an unbounded event queue while its worker is
 	// draining the socket.
-	c.pendingEvents |= events
+	c.pendingEvents |= uint16(events)
 	submit := !c.scheduled
 	c.scheduled = true
 	c.mu.Unlock()
@@ -691,6 +691,7 @@ func (e *Engine) drainCommands() {
 func (e *Engine) refreshConnection(c *Connection) {
 	c.mu.Lock()
 	usable := !c.closing && !c.closed
+	c.foldCorkedLocked()
 	pauseReads, byBudget := c.pauseDecision(c.readPaused)
 	changed := c.readPaused != pauseReads
 	c.readPaused = pauseReads
@@ -795,6 +796,7 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	// that abandons its queue, so a closed connection cannot hold the budget
 	// against the ones still running.
 	c.pendingBytes.Store(0)
+	c.corkedBytes = 0
 	if charged := c.charged; charged > 0 {
 		c.charged = 0
 		e.releaseBudget(charged)
@@ -1410,7 +1412,7 @@ func (c *Connection) Protocol() Protocol {
 // shows it. For a connection the engine accepted it is the address accept
 // returned, which takes no system call and no allocation to report.
 func (c *Connection) RemoteAddrPort() netip.AddrPort {
-	if c.peer.valid {
+	if c.peer.valid() {
 		return c.peer.unpack()
 	}
 	if c.udp != nil {

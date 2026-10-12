@@ -3,6 +3,7 @@
 package fib
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -38,10 +39,12 @@ type connectionAttachment struct{ value any }
 // Connection is safe to use from callback and application goroutines.
 //
 // A server holds one for every connection, so its fields are laid out to keep
-// it small: words first, then the four-byte fields, the peer address and the
-// booleans, which then share words instead of each padding one out, and the
-// deadlines, which most connections never set, behind a pointer. On 64-bit
-// Linux and macOS it fits the 208-byte size class.
+// it small, and in the order a round touches them: the words a round reads or
+// writes first, then the flags and booleans it checks, which share words
+// rather than each padding one out, and last what only opening, closing or a
+// deadline needs, with the deadlines, which most connections never set,
+// behind a pointer. A round's fields then sit in its first 162 bytes, and on
+// 64-bit Linux and macOS the whole fits the 208-byte size class.
 type Connection struct {
 	connPlatform
 	engine *Engine
@@ -54,35 +57,28 @@ type Connection struct {
 	pendingBytes atomic.Int64
 	// charged is how much of pendingBytes counts against the server-wide
 	// budget; see chargeLocked. Guarded by mu.
-	charged    int64
-	attachment atomic.Pointer[connectionAttachment]
+	charged int64
+	// corkedBytes is output queued under a cork that pendingBytes does not
+	// count yet; see queueCorkedLocked. Guarded by mu.
+	corkedBytes int64
+	attachment  atomic.Pointer[connectionAttachment]
 	// layer, when set, carries every send, as TLS does to encrypt it.
 	layer Layer
 	// udp is set for a UDP connection, which exchanges datagrams.
 	udp *udpState
-	// closeReason is why the connection closed, which Read and Write report
-	// to a caller that comes back to it afterwards. Guarded by mu.
-	closeReason error
 	// dialing is set while an outbound connect is still in progress, and
 	// cleared when it completes or fails. Event-loop ownership.
 	dialing *dialRequest
-	// deadlines close the connection when they pass. They are allocated when
-	// the first is set, which most connections never do. Guarded by mu.
-	deadlines     *connectionDeadlines
-	pendingEvents uint32
-	// coalesceOverride is what SetCoalesceWrites chose for this connection:
-	// coalesceDefault leaves it to Config.CoalesceWrites.
-	coalesceOverride atomic.Int32
 	// flags holds the connFlag bits, which are read without the mutex.
 	flags connFlags
-	// peer is the address the connection was accepted from, when accepting
-	// it told; see RemoteAddrPort.
-	peer         packedAddrPort
-	scheduled    bool
-	closing      bool
-	closed       bool
-	readPaused   bool
-	budgetPaused bool
+	// pendingEvents is the readiness, in the ev bits, that the connection's
+	// next round is to act on. Guarded by mu.
+	pendingEvents uint16
+	scheduled     bool
+	closing       bool
+	closed        bool
+	readPaused    bool
+	budgetPaused  bool
 	// readStalled records that a read round stopped with bytes possibly
 	// still in the socket, because the write backlog filled up first. Those
 	// bytes raise no further edge on their own, so the event loop owes the
@@ -99,17 +95,29 @@ type Connection struct {
 	flushing       bool
 	corked         bool
 	closeAfterSend bool
-	// dialed marks a connection Dial opened, as against one a listener
-	// accepted; it never changes.
-	dialed bool
-	// unix marks a Unix socket, which has none of TCP's options.
-	unix bool
 	// writeShut records CloseWrite, after which sends are refused, and
 	// shutWritePending a CloseWrite still waiting for queued output to reach
 	// the socket before it shuts the write side. Guarded by mu.
 	writeShut        bool
 	shutWritePending bool
+	// dialed marks a connection Dial opened, as against one a listener
+	// accepted; it never changes.
+	dialed bool
+	// unix marks a Unix socket, which has none of TCP's options.
+	unix bool
+	// peer is the address the connection was accepted from, when accepting
+	// it told; see RemoteAddrPort.
+	peer packedAddrPort
+	// closeReason is why the connection closed, which Read and Write report
+	// to a caller that comes back to it afterwards. Guarded by mu.
+	closeReason error
+	// deadlines close the connection when they pass. They are allocated when
+	// the first is set, which most connections never do. Guarded by mu.
+	deadlines *connectionDeadlines
 }
+
+// The ev bits have to fit pendingEvents.
+const _ = uint16(evAll)
 
 // connFlag is a bit of a connection's flags.
 type connFlag uint32
@@ -128,6 +136,10 @@ const (
 	// flagReadShut records CloseRead: the connection reads nothing more, and
 	// the end of input that shutting the read side raises does not close it.
 	flagReadShut
+	// flagCoalesceOn and flagCoalesceOff record what SetCoalesceWrites chose
+	// for the connection; with neither, Config.CoalesceWrites decides.
+	flagCoalesceOn
+	flagCoalesceOff
 )
 
 // connFlags are the flags of a connection that are read without its mutex,
@@ -144,16 +156,29 @@ func (f *connFlags) set(flag connFlag, on bool) bool {
 	return f.bits.And(^uint32(flag))&uint32(flag) != 0
 }
 
+// replace sets flag and clears other in one step, so that no reader sees both
+// or neither.
+func (f *connFlags) replace(other, flag connFlag) {
+	for {
+		bits := f.bits.Load()
+		if f.bits.CompareAndSwap(bits, bits&^uint32(other)|uint32(flag)) {
+			return
+		}
+	}
+}
+
 // packedAddrPort is an IP address and port without a zone, which is what
-// accepting a connection reports its peer as, in 20 bytes rather than the 32
-// of a netip.AddrPort, whose address keeps a pointer for the zone.
+// accepting a connection reports its peer as, in 19 bytes rather than the 32
+// of a netip.AddrPort, whose address keeps a pointer for the zone. It is all
+// bytes, so it needs no alignment and packs among the booleans.
 type packedAddrPort struct {
-	// addr is the address in its 16-byte form, where an IPv4 address, which
-	// is4 marks, is mapped into IPv6.
-	addr  [16]byte
-	port  uint16
-	valid bool
-	is4   bool
+	// addr is the address in its 16-byte form, where an IPv4 address is
+	// mapped into IPv6.
+	addr [16]byte
+	// port is big-endian.
+	port [2]byte
+	// kind is 4 for an IPv4 address, 6 for an IPv6 one, and 0 for none.
+	kind byte
 }
 
 // packAddrPort packs ap, which must have no zone.
@@ -161,18 +186,27 @@ func packAddrPort(ap netip.AddrPort) packedAddrPort {
 	if !ap.IsValid() {
 		return packedAddrPort{}
 	}
-	return packedAddrPort{addr: ap.Addr().As16(), port: ap.Port(), valid: true, is4: ap.Addr().Is4()}
+	p := packedAddrPort{addr: ap.Addr().As16(), kind: 6}
+	binary.BigEndian.PutUint16(p.port[:], ap.Port())
+	if ap.Addr().Is4() {
+		p.kind = 4
+	}
+	return p
 }
+
+// valid reports whether p holds an address.
+func (p *packedAddrPort) valid() bool { return p.kind != 0 }
 
 // unpack returns the AddrPort p was packed from.
 func (p *packedAddrPort) unpack() netip.AddrPort {
-	if !p.valid {
-		return netip.AddrPort{}
+	port := binary.BigEndian.Uint16(p.port[:])
+	switch p.kind {
+	case 4:
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte(p.addr[12:])), port)
+	case 6:
+		return netip.AddrPortFrom(netip.AddrFrom16(p.addr), port)
 	}
-	if p.is4 {
-		return netip.AddrPortFrom(netip.AddrFrom4([4]byte(p.addr[12:])), p.port)
-	}
-	return netip.AddrPortFrom(netip.AddrFrom16(p.addr), p.port)
+	return netip.AddrPort{}
 }
 
 // Cork holds what is sent on the connection from now on until Flush, rather
@@ -192,12 +226,6 @@ func (c *Connection) Cork() {
 	c.mu.Unlock()
 }
 
-const (
-	coalesceDefault int32 = iota
-	coalesceOn
-	coalesceOff
-)
-
 // SetCoalesceWrites sets whether the read rounds of this connection hold the
 // replies a handler sends from OnData and write them together when the round
 // ends, whatever Config.CoalesceWrites says for the engine. Call it from
@@ -211,18 +239,18 @@ const (
 // UDP connection, whose sends are datagrams.
 func (c *Connection) SetCoalesceWrites(enabled bool) {
 	if enabled {
-		c.coalesceOverride.Store(coalesceOn)
+		c.flags.replace(flagCoalesceOff, flagCoalesceOn)
 	} else {
-		c.coalesceOverride.Store(coalesceOff)
+		c.flags.replace(flagCoalesceOn, flagCoalesceOff)
 	}
 }
 
 // coalesces reports whether a read round of c corks its replies.
 func (c *Connection) coalesces() bool {
-	switch c.coalesceOverride.Load() {
-	case coalesceOn:
+	switch bits := c.flags.bits.Load(); {
+	case bits&uint32(flagCoalesceOn) != 0:
 		return true
-	case coalesceOff:
+	case bits&uint32(flagCoalesceOff) != 0:
 		return false
 	}
 	return c.engine.coalesceWrites
@@ -393,6 +421,30 @@ func (c *Connection) queueLocked(first, second []byte) {
 	c.sends = append(c.sends, sendItem{data: data, pooled: true})
 }
 
+// queueCorkedLocked is how a corked connection takes a send, which is how a
+// read round takes every reply its handler makes. Nothing is written while
+// corked, so a send only has to be queued, and it nearly always merges into
+// the item the round's first reply started. The rest of a send's work waits
+// for whoever next needs it: the bytes are counted in corkedBytes, which
+// foldCorkedLocked moves into pendingBytes before anything reads or moves the
+// backlog, and whether the budget counts them, or a watermark has been
+// crossed, is settled when the cork comes off, as it was before. Callers hold
+// c.mu.
+func (c *Connection) queueCorkedLocked(first, second []byte) {
+	c.queueLocked(first, second)
+	c.corkedBytes += int64(len(first) + len(second))
+}
+
+// foldCorkedLocked counts in pendingBytes what queueCorkedLocked queued
+// without counting. Whatever reads or moves the backlog calls it first.
+// Callers hold c.mu.
+func (c *Connection) foldCorkedLocked() {
+	if n := c.corkedBytes; n != 0 {
+		c.corkedBytes = 0
+		c.pendingBytes.Add(n)
+	}
+}
+
 // queueOwnedLocked queues data the caller handed over. The connection does not
 // own the array, so the item carries no pooled buffer and later chunks cannot
 // merge into it. Callers hold c.mu.
@@ -408,6 +460,7 @@ func (c *Connection) queueOwnedLocked(data []byte) {
 // refreshConnection makes, so that a refresh is only requested when the event
 // loop actually has an epoll_ctl to perform. Callers hold c.mu.
 func (c *Connection) pauseStateChangedLocked() bool {
+	c.foldCorkedLocked()
 	pause, _ := c.pauseDecision(c.readPaused)
 	return pause != c.readPaused
 }
@@ -474,6 +527,7 @@ func (c *Connection) addPending(n int64) {
 // 16.6M without. Only what a write leaves behind is counted, which is what the
 // budget bounds anyway: output the peers are not taking. Callers hold c.mu.
 func (c *Connection) chargeLocked() {
+	c.foldCorkedLocked()
 	if delta := c.pendingBytes.Load() - c.charged; delta > 0 {
 		c.charged += delta
 		c.engine.pendingTotal.Add(delta)
@@ -488,15 +542,16 @@ func (c *Connection) chargeLocked() {
 // budget that cannot see what they hold.
 const roundChargeBytes = 32 << 10
 
-// chargeRound counts a round's output against the budget once it has grown
-// past roundChargeBytes, so that the budget sees it before the round decides
-// whether to read on. A round that holds less costs one atomic load.
+// chargeRound brings the backlog up to date before a round decides whether to
+// read on: it counts the replies its cork appended uncounted, and counts the
+// round's output against the budget once it has grown past roundChargeBytes,
+// so that the budget sees it first.
 func (c *Connection) chargeRound() {
-	if c.pendingBytes.Load() < roundChargeBytes {
-		return
-	}
 	c.mu.Lock()
-	c.chargeLocked()
+	c.foldCorkedLocked()
+	if c.pendingBytes.Load() >= roundChargeBytes {
+		c.chargeLocked()
+	}
 	c.mu.Unlock()
 }
 
@@ -507,6 +562,7 @@ func (c *Connection) subPending(n int64) {
 	if n <= 0 {
 		return
 	}
+	c.foldCorkedLocked()
 	pending := c.pendingBytes.Add(-n)
 	if pending < 0 {
 		c.pendingBytes.Store(0)
@@ -587,6 +643,11 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 			bufferpool.Put(data)
 		}
 		return syscall.EPIPE
+	}
+	if mode == sendCopy && c.corked {
+		c.queueCorkedLocked(data, nil)
+		c.mu.Unlock()
+		return nil
 	}
 	sent := 0
 	direct := c.canWriteDirectlyLocked()
@@ -673,6 +734,11 @@ func (c *Connection) SendParts(first, second []byte) error {
 		c.mu.Unlock()
 		return syscall.EPIPE
 	}
+	if c.corked {
+		c.queueCorkedLocked(first, second)
+		c.mu.Unlock()
+		return nil
+	}
 	sent := 0
 	direct := c.canWriteDirectlyLocked()
 	if direct {
@@ -755,8 +821,8 @@ func (c *Connection) process() {
 	var deferred uint32
 	for {
 		c.mu.Lock()
-		c.pendingEvents |= deferred
-		if c.pendingEvents == deferred && (deferred == 0 || c.sendHead != len(c.sends)) {
+		c.pendingEvents |= uint16(deferred)
+		if c.pendingEvents == uint16(deferred) && (deferred == 0 || c.sendHead != len(c.sends)) {
 			// Only the deferred readiness remains. Stop here instead of spinning,
 			// and leave the read to whoever empties the queue. That need not be
 			// a write edge: a Flush from another goroutine that took the cork
@@ -775,15 +841,23 @@ func (c *Connection) process() {
 			}
 			return
 		}
-		events := c.pendingEvents
+		events := uint32(c.pendingEvents)
 		c.pendingEvents = 0
 		closed := c.closed || c.closing
-		c.mu.Unlock()
 		if c.flags.has(flagReadShut) {
 			// CloseRead ended input: what the socket still reports, the end
 			// of input the shutdown itself raises among it, is not read.
 			events &^= evIn | evPri | evRdHup
 		}
+		// Most rounds bring input to a connection with nothing queued, which
+		// leaves nothing to flush first and no output to defer the read for.
+		// Such a round begins its read under this lock, rather than taking
+		// it again for each of those checks and once more to begin.
+		readNow := !closed && c.udp == nil && events&(evIn|evPri) == evIn && c.sendHead == len(c.sends)
+		if readNow {
+			c.beginReadLocked()
+		}
+		c.mu.Unlock()
 		deferred = 0
 		alive := !closed
 		if c.udp != nil {
@@ -795,43 +869,51 @@ func (c *Connection) process() {
 			continue
 		}
 		var closeErr error
-		// Flush before reading, so that a round which both frees socket send
-		// space and delivers new input hands the older output to the socket
-		// first.
-		if alive && events&evOut != 0 && c.hasFlushableOutput() {
-			closeErr = c.flushOutput()
+		if readNow {
+			closeErr = c.readRound()
 			alive = closeErr == nil
-		}
-		if alive && events&evPri != 0 {
-			closeErr = c.drainPriorityInput()
-			alive = closeErr == nil
-		}
-		if alive && events&evIn != 0 {
-			if c.hasQueuedOutput() && (c.engine.writeHighWatermark <= 0 || c.readShouldStop()) {
-				// The output queued already fills the connection's budget, or
-				// the handler holds reads, or there is no watermark and the
-				// queue is all that bounds this connection's buffering. Queued
-				// output means write interest is armed or a write is in
-				// flight, so a later round is guaranteed. Carry the read, and
-				// any half-close that arrived with it, into that round so the
-				// peer's final bytes are still delivered after the flush.
-				//
-				// Output queued below the watermark does not stop the read: the
-				// watermark is what bounds a connection's buffering. Stopping at
-				// the first queued byte left the peer's requests in the socket
-				// while it waited for their replies, and a pipelining client
-				// kept sending into a receive queue that filled with small
-				// segments until the kernel dropped them: go-websocket-benchmark's
-				// pipelined echo (50k connections, 8 server CPUs, the client on
-				// their SMT siblings) retransmitted 310-330k segments a second
-				// and served 3.06-3.10M messages a second, and reading on to the
-				// watermark halved the retransmits and served 3.96-3.99M.
-				deferred = evIn | events&evRdHup
-			} else {
-				closeErr = c.drainInput()
+			if alive {
+				c.rearmRead()
+			}
+		} else {
+			// Flush before reading, so that a round which both frees socket send
+			// space and delivers new input hands the older output to the socket
+			// first.
+			if alive && events&evOut != 0 && c.hasFlushableOutput() {
+				closeErr = c.flushOutput()
 				alive = closeErr == nil
-				if alive {
-					c.rearmRead()
+			}
+			if alive && events&evPri != 0 {
+				closeErr = c.drainPriorityInput()
+				alive = closeErr == nil
+			}
+			if alive && events&evIn != 0 {
+				if c.hasQueuedOutput() && (c.engine.writeHighWatermark <= 0 || c.readShouldStop()) {
+					// The output queued already fills the connection's budget, or
+					// the handler holds reads, or there is no watermark and the
+					// queue is all that bounds this connection's buffering. Queued
+					// output means write interest is armed or a write is in
+					// flight, so a later round is guaranteed. Carry the read, and
+					// any half-close that arrived with it, into that round so the
+					// peer's final bytes are still delivered after the flush.
+					//
+					// Output queued below the watermark does not stop the read: the
+					// watermark is what bounds a connection's buffering. Stopping at
+					// the first queued byte left the peer's requests in the socket
+					// while it waited for their replies, and a pipelining client
+					// kept sending into a receive queue that filled with small
+					// segments until the kernel dropped them: go-websocket-benchmark's
+					// pipelined echo (50k connections, 8 server CPUs, the client on
+					// their SMT siblings) retransmitted 310-330k segments a second
+					// and served 3.06-3.10M messages a second, and reading on to the
+					// watermark halved the retransmits and served 3.96-3.99M.
+					deferred = evIn | events&evRdHup
+				} else {
+					closeErr = c.drainInput()
+					alive = closeErr == nil
+					if alive {
+						c.rearmRead()
+					}
 				}
 			}
 		}
@@ -866,8 +948,12 @@ func (c *Connection) finishClose() {
 
 // hasQueuedOutput reports whether bytes accepted by Send are still waiting for
 // the socket. Reads are deferred while it is true.
+//
+// It also brings the backlog up to date for readShouldStop, which the caller
+// consults next without the lock.
 func (c *Connection) hasQueuedOutput() bool {
 	c.mu.Lock()
+	c.foldCorkedLocked()
 	queued := c.sendHead != len(c.sends)
 	c.mu.Unlock()
 	return queued
@@ -894,12 +980,24 @@ func (c *Connection) hasFlushableOutput() bool {
 // when the round ends. Without it they are written as they are sent.
 func (c *Connection) drainInput() error {
 	c.mu.Lock()
+	c.beginReadLocked()
+	c.mu.Unlock()
+	return c.readRound()
+}
+
+// beginReadLocked sets a read round up: it corks the connection if its
+// rounds coalesce, and clears what the last round left owed. Callers hold
+// c.mu.
+func (c *Connection) beginReadLocked() {
 	if c.coalesces() {
 		c.corked = true
 	}
 	c.readStalled = false
 	c.readDeferred = false
-	c.mu.Unlock()
+}
+
+// readRound is drainInput once beginReadLocked has set the round up.
+func (c *Connection) readRound() error {
 	err := c.readLoop()
 	if flushErr := c.uncork(); err == nil {
 		err = flushErr
@@ -917,12 +1015,13 @@ func (c *Connection) uncork() error {
 	c.mu.Lock()
 	wasCorked := c.corked
 	c.corked = false
-	queued := c.sendHead != len(c.sends)
-	c.mu.Unlock()
-	if !wasCorked || !queued {
+	c.foldCorkedLocked()
+	if !wasCorked || c.sendHead == len(c.sends) {
+		c.mu.Unlock()
 		return nil
 	}
-	return c.flushOutput()
+	// The flush goes on under the same lock.
+	return c.flushLocked()
 }
 
 // Flush hands what has been sent so far to the socket now. Sends made from
@@ -1001,6 +1100,18 @@ func (c *Connection) readLoop() error {
 		n, err := c.sysRead(buf)
 		if n > 0 {
 			c.handler.OnData(c, buf[:n])
+			if n < len(buf) {
+				// A short read means the socket buffer is empty, so the next
+				// read would only return EAGAIN. Data arriving after this
+				// point raises a fresh edge, which resubmits the connection.
+				//
+				// The round ends here, with nothing left in the socket to stop
+				// for, and its uncork settles the replies: it counts them,
+				// flushes them, counts against the budget what the socket did
+				// not take, and asks the loop to pause reads if that crosses a
+				// watermark. A handler that holds reads asked the loop itself.
+				return nil
+			}
 			c.chargeRound()
 			if c.readShouldStop() {
 				// Either the replies queued so far already fill the write
@@ -1025,12 +1136,6 @@ func (c *Connection) readLoop() error {
 					c.corked = true
 					c.mu.Unlock()
 				}
-			}
-			if n < len(buf) {
-				// A short read means the socket buffer is empty, so the next
-				// read would only return EAGAIN. Data arriving after this
-				// point raises a fresh edge, which resubmits the connection.
-				return nil
 			}
 			continue
 		}
@@ -1072,6 +1177,14 @@ func (c *Connection) drainPriorityInput() error {
 
 func (c *Connection) flushOutput() error {
 	c.mu.Lock()
+	return c.flushLocked()
+}
+
+// flushLocked is flushOutput for a caller that already holds c.mu, which it
+// releases. The lock is held across each write, and a write that takes the
+// whole queue is settled under the same lock, so the usual flush takes it
+// once.
+func (c *Connection) flushLocked() error {
 	if c.closing || c.closed || c.flushing || c.writeBusyLocked() {
 		usable := !c.closing && !c.closed
 		if usable {
@@ -1086,9 +1199,7 @@ func (c *Connection) flushOutput() error {
 		return syscall.EPIPE
 	}
 	c.flushing = true
-	c.mu.Unlock()
 	for {
-		c.mu.Lock()
 		if c.sendHead == len(c.sends) {
 			c.resetQueueLocked()
 			c.flushing = false
@@ -1167,11 +1278,15 @@ func (c *Connection) flushOutput() error {
 				}
 				return nil
 			}
-			c.mu.Unlock()
+			if c.sendHead != len(c.sends) {
+				// More is queued than one write takes. Let a send, or the
+				// event loop, have the lock between writes.
+				c.mu.Unlock()
+				c.mu.Lock()
+			}
 			continue
 		}
 		if err == syscall.EINTR {
-			c.mu.Unlock()
 			continue
 		}
 		c.flushing = false
@@ -1544,6 +1659,7 @@ func (c *Connection) armDeadlineLocked(d *deadline, t time.Time, write bool) {
 func (c *Connection) expireDeadline(d *deadline, gen uint64, write bool) {
 	c.mu.Lock()
 	stale := d.gen != gen || c.closing || c.closed
+	c.foldCorkedLocked()
 	c.mu.Unlock()
 	if stale {
 		return
