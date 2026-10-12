@@ -260,20 +260,31 @@ func (c *Connection) sendFrame(opcode Opcode, payload []byte, compressed bool) e
 	if c.client {
 		return c.sendMaskedFrame(opcode, payload, compressed)
 	}
-	// The header goes to the connection beside the payload, and the compiler
-	// cannot see that the connection copies it, so an array on the stack here
-	// would be moved to the heap and every frame sent would allocate one. A
-	// pooled buffer is the same header without that.
-	header := bufferpool.Get(maxFrameHeader)
-	defer bufferpool.Put(header)
-	headerLen, err := frameHeader(header, opcode, len(payload))
+	// The header stays on this stack only if nothing it is handed to can keep
+	// it. A *fib.Connection copies it, which the compiler sees through a
+	// direct call; through the transport interface it cannot, so any other
+	// transport gets a pooled copy instead.
+	var header [maxFrameHeader]byte
+	headerLen, err := frameHeader(header[:], opcode, len(payload))
 	if err != nil {
 		return err
 	}
 	if compressed {
 		header[0] |= 0x40
 	}
-	return c.conn.SendParts(header[:headerLen], payload)
+	if conn, ok := c.conn.(*fib.Connection); ok {
+		return conn.SendParts(header[:headerLen], payload)
+	}
+	return sendPartsCopied(c.conn, header[:headerLen], payload)
+}
+
+// sendPartsCopied sends first and second through t with first copied into a
+// pooled buffer, so that first itself does not escape.
+func sendPartsCopied(t transport, first, second []byte) error {
+	copied := bufferpool.Get(len(first))
+	defer bufferpool.Put(copied)
+	copy(copied, first)
+	return t.SendParts(copied[:len(first)], second)
 }
 
 // sendMaskedFrame is sendFrame for a client, which has to mask every frame

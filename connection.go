@@ -598,7 +598,11 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 // socket is backpressured, only the unsent suffix is copied before returning.
 func (c *Connection) SendParts(first, second []byte) error {
 	if l := c.layer; l != nil {
-		return l.Send(first, second)
+		// Layer.Send is an interface call, so whatever it is handed escapes to
+		// the heap. Only second would be harmless, being the caller's buffer
+		// already; first is usually a frame header on the caller's stack,
+		// which a copy keeps there for every connection without a layer.
+		return l.Send(append([]byte(nil), first...), second)
 	}
 	if c.udp != nil {
 		return c.sendDatagramParts(first, second)
