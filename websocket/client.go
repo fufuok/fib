@@ -361,7 +361,7 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	remainder := cc.response[headerEnd:]
 	cc.response = nil
 	cc.ws = Connection{conn: conn, subprotocol: subprotocol, client: true, compress: compress,
-		windowBits: deflate.windowBits}
+		windowBits: uint8(deflate.windowBits)}
 	cc.parser = Parser{maxMessageBytes: cc.dialer.config.MaxMessageBytes, fromServer: true, deflate: compress,
 		contextTakeover: compress && deflate.peerContextTakeover, perFrame: cc.frames != nil}
 	cc.upgraded.Store(true)

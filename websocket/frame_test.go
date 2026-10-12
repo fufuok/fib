@@ -277,7 +277,7 @@ func TestParserPerFrameDeliversEachFrame(t *testing.T) {
 				i, event.Opcode, event.Payload, event.Fin, want[i].Opcode, want[i].Payload, want[i].Fin)
 		}
 	}
-	if parser.fragment != nil {
+	if parser.fragment() != nil {
 		t.Fatal("a completed message left state behind")
 	}
 }
@@ -318,7 +318,7 @@ func TestParserPerFrameStreamsPastMaxMessageBytes(t *testing.T) {
 	if received != frames*frameSize {
 		t.Fatalf("received %d bytes, want %d", received, frames*frameSize)
 	}
-	if parser.fragment != nil || len(parser.buffer) != 0 {
+	if parser.fragment() != nil || len(parser.buffer) != 0 {
 		t.Fatalf("parser held %d bytes of a streamed message", len(parser.buffer))
 	}
 

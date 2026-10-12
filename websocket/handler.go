@@ -163,14 +163,14 @@ type Connection struct {
 	// ServerHandler.Upgrade switched, on HTTP/1.1, HTTP/2 or HTTP/3.
 	conn        transport
 	subprotocol string
+	closeState  atomic.Pointer[connectionCloseState]
+	closeSent   atomic.Bool
 	// client marks the dialing side, whose frames must be masked.
 	client bool
 	// compress says permessage-deflate is in use, and windowBits bounds how
 	// far back what this side sends may refer.
 	compress   bool
-	windowBits int
-	closeSent  atomic.Bool
-	closeState atomic.Pointer[connectionCloseState]
+	windowBits uint8
 }
 
 // transport is what a Connection sends its frames through, which a
@@ -243,7 +243,7 @@ func (c *Connection) writeFrame(opcode Opcode, payload []byte) error {
 		return errors.New("websocket: close already sent")
 	}
 	if c.compress && (opcode == Text || opcode == Binary) {
-		compressor, compressed := compressMessage(payload, c.windowBits)
+		compressor, compressed := compressMessage(payload, int(c.windowBits))
 		err := c.sendFrame(opcode, compressed, true)
 		compressor.release()
 		return err
@@ -327,12 +327,21 @@ func (c *Connection) sendClose(payload []byte) error {
 	return nil
 }
 
+// connectionState is what a server keeps for each connection. Every
+// connection of a server has one, so it is kept within 160 bytes on a 64-bit
+// platform, a size class of its own: the parser holds the state of only some
+// messages behind a pointer, and whether the handshake is done is read from
+// websocket rather than kept beside it.
 type connectionState struct {
 	handshake *handshakeParser
 	wsParser  Parser
+	// websocket is the connection the handshake opened. Its conn is nil until
+	// then.
 	websocket Connection
-	upgraded  bool
 }
+
+// upgraded reports whether the opening handshake has completed.
+func (s *connectionState) upgraded() bool { return s.websocket.conn != nil }
 
 type ServerHandler struct {
 	config           Config
@@ -389,7 +398,7 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 		h.OnOpen(c)
 		state, _ = c.Attachment().(*connectionState)
 	}
-	if state.upgraded {
+	if state.upgraded() {
 		h.handleFrames(state, data)
 		return
 	}
@@ -456,12 +465,11 @@ func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, reque
 	}
 	compress := result.extensions != ""
 	state.websocket = Connection{conn: c, subprotocol: result.subprotocol, compress: compress,
-		windowBits: result.deflate.windowBits}
+		windowBits: uint8(result.deflate.windowBits)}
 	state.wsParser.maxMessageBytes = h.config.MaxMessageBytes
 	state.wsParser.deflate = compress
 	state.wsParser.contextTakeover = compress && result.deflate.peerContextTakeover
 	state.wsParser.perFrame = h.frames != nil
-	state.upgraded = true
 	if state.handshake != nil && remainder == nil {
 		remainder = state.handshake.TakeBuffered()
 	}
@@ -767,7 +775,7 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 		return
 	}
 	h.releaseHandshakeParser(state)
-	if state.upgraded {
+	if state.upgraded() {
 		code, reason := state.websocket.closeStatus()
 		h.handler.OnClose(&state.websocket, code, reason, err)
 	}

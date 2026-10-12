@@ -71,7 +71,7 @@ func (h *ServerHandler) Upgrade(c *epollhttp.Context, header stdhttp.Header) (*C
 	}
 	compress := result.extensions != ""
 	u := &upgradedConn{handler: h, request: request}
-	u.ws = Connection{subprotocol: result.subprotocol, compress: compress, windowBits: result.deflate.windowBits}
+	u.ws = Connection{subprotocol: result.subprotocol, compress: compress, windowBits: uint8(result.deflate.windowBits)}
 	u.parser = Parser{maxMessageBytes: h.config.MaxMessageBytes, deflate: compress,
 		contextTakeover: compress && result.deflate.peerContextTakeover, perFrame: h.frames != nil}
 	if _, err := c.Upgrade("websocket", response, u); err != nil {
