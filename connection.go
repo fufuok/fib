@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/bits"
 	"net"
 	"net/netip"
 	"os"
@@ -355,21 +356,79 @@ func (c *Connection) canWriteDirectlyLocked() bool {
 	return c.sendHead == len(c.sends) && !c.flushing && !c.corked
 }
 
-// rewindQueueLocked restarts an emptied item queue. Every item has already
-// surrendered its buffer as it drained, so there is nothing left to return.
-// Callers hold c.mu.
-func (c *Connection) rewindQueueLocked() {
-	if cap(c.sends) > maxWritevItems*2 {
-		c.sends = nil
-	} else {
-		c.sends = c.sends[:0]
+// sendQueueClasses is how many capacities of item array the send queues share
+// between them: 1, 2, 4 and so on up to twice the items one writev takes. A
+// queue that outgrows the largest grows as append grows it, and its array is
+// left to the garbage collector once it drains.
+const sendQueueClasses = 8
+
+// sendQueues hold the item arrays of drained send queues, one pool for each
+// class, by the address of the first item, which an interface holds without
+// an allocation of its own.
+//
+// A connection gives its array back whenever its queue drains, which is at the
+// end of nearly every read round, since a round queues its replies under its
+// cork and writes them all when it ends. Keeping the array instead would cost
+// every connection that ever replied an array for good, 48 bytes for the one
+// item a round usually needs, and 96 for a pipelining peer's two, for no
+// purpose once it is idle. A round takes one back and returns it on the same
+// worker, which keeps the two to sync.Pool's per-CPU slot.
+var sendQueues [sendQueueClasses]sync.Pool
+
+// takeSendQueue returns an empty item array with room for 1<<class items.
+func takeSendQueue(class int) []sendItem {
+	if first, _ := sendQueues[class].Get().(*sendItem); first != nil {
+		return unsafe.Slice(first, 1<<class)[:0]
 	}
-	c.sendHead = 0
+	return make([]sendItem, 0, 1<<class)
 }
 
-// resetQueueLocked restarts an emptied queue. Callers hold c.mu.
+// giveSendQueue hands back an array whose items have all been cleared, if it
+// is one of the classes the queues share.
+func giveSendQueue(items []sendItem) {
+	n := cap(items)
+	if n == 0 || n&(n-1) != 0 || n > 1<<(sendQueueClasses-1) {
+		return
+	}
+	sendQueues[bits.TrailingZeros(uint(n))].Put(&items[:1][0])
+}
+
+// pushLocked appends item to the send queue, taking an array for it when the
+// queue has none or no room left. Callers hold c.mu.
+func (c *Connection) pushLocked(item sendItem) {
+	if c.sendHead == len(c.sends) {
+		// Nothing is queued any more, so the item slice can start over.
+		c.sends, c.sendHead = c.sends[:0], 0
+	}
+	if len(c.sends) == cap(c.sends) {
+		c.growQueueLocked()
+	}
+	c.sends = append(c.sends, item)
+}
+
+// growQueueLocked moves the queue to an array twice the size, or to one item
+// for a queue that has none, leaving behind the items that have already
+// drained. Callers hold c.mu.
+func (c *Connection) growQueueLocked() {
+	old := c.sends
+	var next []sendItem
+	if class := bits.Len(uint(cap(old))); class < sendQueueClasses {
+		next = takeSendQueue(class)
+	} else {
+		next = make([]sendItem, 0, 2*cap(old))
+	}
+	c.sends = append(next, old[c.sendHead:]...)
+	c.sendHead = 0
+	clear(old)
+	giveSendQueue(old)
+}
+
+// resetQueueLocked gives up the array of a drained queue. Every item has
+// already surrendered its buffer and been cleared as it drained. Callers hold
+// c.mu.
 func (c *Connection) resetQueueLocked() {
-	c.rewindQueueLocked()
+	giveSendQueue(c.sends)
+	c.sends, c.sendHead = nil, 0
 }
 
 // releaseItemLocked returns a drained item's buffer to the pool. A file item
@@ -440,15 +499,11 @@ func (c *Connection) queueLocked(first, second []byte) {
 			return
 		}
 	}
-	if c.sendHead == len(c.sends) {
-		// Nothing is queued any more, so the item slice can start over.
-		c.rewindQueueLocked()
-	}
 	// A chunk larger than the pooled size grows through the pool as well, so
 	// that even an outsized message comes from a class rather than from a
 	// fresh allocation append would have had to make.
 	data := bufferpool.Join(c.engine.acquireSendBuffer(), first, second)
-	c.sends = append(c.sends, sendItem{data: data, pooled: true})
+	c.pushLocked(sendItem{data: data, pooled: true})
 }
 
 // queueCorkedLocked is how a corked connection takes a send, which is how a
@@ -479,10 +534,7 @@ func (c *Connection) foldCorkedLocked() {
 // own the array, so the item carries no pooled buffer and later chunks cannot
 // merge into it. Callers hold c.mu.
 func (c *Connection) queueOwnedLocked(data []byte) {
-	if c.sendHead == len(c.sends) {
-		c.rewindQueueLocked()
-	}
-	c.sends = append(c.sends, sendItem{data: data})
+	c.pushLocked(sendItem{data: data})
 }
 
 // pauseStateChangedLocked reports whether queued output has crossed a watermark
@@ -717,10 +769,7 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 	default:
 		// Kept whole, with what the socket took past as the item's offset,
 		// so that it goes back to the pool in the size class it came from.
-		if c.sendHead == len(c.sends) {
-			c.rewindQueueLocked()
-		}
-		c.sends = append(c.sends, sendItem{data: data, offset: sent, pooled: true})
+		c.pushLocked(sendItem{data: data, offset: sent, pooled: true})
 	}
 	c.addPending(int64(len(queued)))
 	// Write interest stays armed, so queueing alone needs no registration
@@ -1811,10 +1860,7 @@ func (c *Connection) SendFile(f File, offset, count int64) error {
 		return syscall.EPIPE
 	}
 	direct := c.canWriteDirectlyLocked()
-	if c.sendHead == len(c.sends) {
-		c.rewindQueueLocked()
-	}
-	c.sends = append(c.sends, sendItem{file: seg})
+	c.pushLocked(sendItem{file: seg})
 	c.mu.Unlock()
 	if !direct {
 		// Whatever is queued ahead of the file is being flushed, or will be

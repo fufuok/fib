@@ -788,6 +788,7 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 		for i := c.sendHead; i < len(c.sends); i++ {
 			c.releaseItemLocked(&c.sends[i])
 		}
+		c.resetQueueLocked()
 	}
 	c.sends = nil
 	c.sendHead = 0
