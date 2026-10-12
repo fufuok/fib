@@ -506,13 +506,13 @@ func (e *Engine) acceptConnections(listenFD int) {
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		}
 		if len(e.pollers) == 0 {
-			e.admit(&Connection{engine: e, handler: e.handler, unix: !e.tcpListeners, peer: peer}, fd)
+			e.admit(&Connection{engine: e, handler: e.handler, unix: !e.tcpListeners, peer: packAddrPort(peer)}, fd)
 			continue
 		}
 		// The poller registers the descriptor itself, since its table and
 		// its backend are its loop's alone.
 		p := e.pollers[fd%len(e.pollers)]
-		c := &Connection{engine: p, handler: e.handler, unix: !e.tcpListeners, peer: peer}
+		c := &Connection{engine: p, handler: e.handler, unix: !e.tcpListeners, peer: packAddrPort(peer)}
 		c.fd.Store(int32(fd))
 		if !p.request(command{kind: commandAccept, connection: c}) {
 			syscall.Close(fd)
@@ -568,7 +568,7 @@ func (e *Engine) detach(c *Connection) {
 	// Closing the last descriptor of a socket takes it out of the event
 	// loop's interest set, so only one that may have been duplicated needs
 	// taking out first, a system call every connection would otherwise make.
-	if c.rawExposed.Load() {
+	if c.flags.has(flagRawExposed) {
 		e.unregister(fd)
 	}
 	_ = syscall.Close(fd)
@@ -1016,7 +1016,7 @@ func (c *Connection) File() (*os.File, error) {
 	name := fileName(c.LocalAddr(), c.RemoteAddr())
 	var f *os.File
 	err := c.control("dup", func(s int) error {
-		c.rawExposed.Store(true)
+		c.flags.set(flagRawExposed, true)
 		syscall.ForkLock.RLock()
 		dup, err := syscall.Dup(s)
 		if err == nil {

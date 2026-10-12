@@ -1406,8 +1406,8 @@ func (c *Connection) Protocol() Protocol {
 // shows it. For a connection the engine accepted it is the address accept
 // returned, which takes no system call and no allocation to report.
 func (c *Connection) RemoteAddrPort() netip.AddrPort {
-	if c.peer.IsValid() {
-		return c.peer
+	if c.peer.valid {
+		return c.peer.unpack()
 	}
 	if c.udp != nil {
 		if c.udp.raddr == nil || c.udp.raddr.Zone != "" {

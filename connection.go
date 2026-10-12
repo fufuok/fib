@@ -36,34 +36,53 @@ type sendItem struct {
 type connectionAttachment struct{ value any }
 
 // Connection is safe to use from callback and application goroutines.
+//
+// A server holds one for every connection, so its fields are laid out to keep
+// it small: words first, then the four-byte fields, the peer address and the
+// booleans, which then share words instead of each padding one out, and the
+// deadlines, which most connections never set, behind a pointer. On 64-bit
+// Linux and macOS it fits the 208-byte size class.
 type Connection struct {
 	connPlatform
 	engine *Engine
-	// peer is the address the connection was accepted from, when accepting
-	// it told; see RemoteAddrPort.
-	peer netip.AddrPort
-	// rawExposed records that the socket has been handed out, through File
-	// or a RawConn, and so may have been duplicated: closing a socket then
-	// leaves it in the event loop's interest set, from which it has to be
-	// taken out first. It is set under mu, before the socket is handed out,
-	// so a close, which marks the connection closed under mu first, sees it.
-	rawExposed atomic.Bool
 	// handler receives this connection's callbacks: the engine's handler for
 	// an accepted connection, or the one DialWithHandler was given.
-	handler       Handler
-	mu            sync.Mutex
+	handler      Handler
+	mu           sync.Mutex
+	sends        []sendItem
+	sendHead     int
+	pendingBytes atomic.Int64
+	// charged is how much of pendingBytes counts against the server-wide
+	// budget; see chargeLocked. Guarded by mu.
+	charged    int64
+	attachment atomic.Pointer[connectionAttachment]
+	// layer, when set, carries every send, as TLS does to encrypt it.
+	layer Layer
+	// udp is set for a UDP connection, which exchanges datagrams.
+	udp *udpState
+	// closeReason is why the connection closed, which Read and Write report
+	// to a caller that comes back to it afterwards. Guarded by mu.
+	closeReason error
+	// dialing is set while an outbound connect is still in progress, and
+	// cleared when it completes or fails. Event-loop ownership.
+	dialing *dialRequest
+	// deadlines close the connection when they pass. They are allocated when
+	// the first is set, which most connections never do. Guarded by mu.
+	deadlines     *connectionDeadlines
 	pendingEvents uint32
-	sends         []sendItem
-	sendHead      int
-	scheduled     bool
-	closing       bool
-	closed        bool
-	readPaused    bool
-	budgetPaused  bool
-	// readHeld is an application-driven pause, set through HoldReads by a
-	// handler that has more input buffered than it has consumed. It is read
-	// without the mutex by the read loop, which checks it between reads.
-	readHeld atomic.Bool
+	// coalesceOverride is what SetCoalesceWrites chose for this connection:
+	// coalesceDefault leaves it to Config.CoalesceWrites.
+	coalesceOverride atomic.Int32
+	// flags holds the connFlag bits, which are read without the mutex.
+	flags connFlags
+	// peer is the address the connection was accepted from, when accepting
+	// it told; see RemoteAddrPort.
+	peer         packedAddrPort
+	scheduled    bool
+	closing      bool
+	closed       bool
+	readPaused   bool
+	budgetPaused bool
 	// readStalled records that a read round stopped with bytes possibly
 	// still in the socket, because the write backlog filled up first. Those
 	// bytes raise no further edge on their own, so the event loop owes the
@@ -80,42 +99,80 @@ type Connection struct {
 	flushing       bool
 	corked         bool
 	closeAfterSend bool
-	pendingBytes   atomic.Int64
-	// coalesceOverride is what SetCoalesceWrites chose for this connection:
-	// coalesceDefault leaves it to Config.CoalesceWrites.
-	coalesceOverride atomic.Int32
-	// charged is how much of pendingBytes counts against the server-wide
-	// budget; see chargeLocked. Guarded by mu.
-	charged    int64
-	attachment atomic.Pointer[connectionAttachment]
-	// dialing is set while an outbound connect is still in progress, and
-	// cleared when it completes or fails. Event-loop ownership.
-	dialing *dialRequest
 	// dialed marks a connection Dial opened, as against one a listener
 	// accepted; it never changes.
 	dialed bool
-	// readDeadline and writeDeadline close the connection when they pass.
-	// Guarded by mu.
-	readDeadline  deadline
-	writeDeadline deadline
-	// closeReason is why the connection closed, which Read and Write report
-	// to a caller that comes back to it afterwards. Guarded by mu.
-	closeReason error
-	// layer, when set, carries every send, as TLS does to encrypt it.
-	layer Layer
-	// udp is set for a UDP connection, which exchanges datagrams.
-	udp *udpState
 	// unix marks a Unix socket, which has none of TCP's options.
 	unix bool
-	// readShut records CloseRead: the connection reads nothing more, and the
-	// end of input that shutting the read side raises does not close it. It
-	// is read without the mutex by the read loop, as readHeld is.
-	readShut atomic.Bool
 	// writeShut records CloseWrite, after which sends are refused, and
 	// shutWritePending a CloseWrite still waiting for queued output to reach
 	// the socket before it shuts the write side. Guarded by mu.
 	writeShut        bool
 	shutWritePending bool
+}
+
+// connFlag is a bit of a connection's flags.
+type connFlag uint32
+
+const (
+	// flagRawExposed records that the socket has been handed out, through
+	// File or a RawConn, and so may have been duplicated: closing a socket
+	// then leaves it in the event loop's interest set, from which it has to be
+	// taken out first. It is set under mu, before the socket is handed out,
+	// so a close, which marks the connection closed under mu first, sees it.
+	flagRawExposed connFlag = 1 << iota
+	// flagReadHeld is an application-driven pause, set through HoldReads by a
+	// handler that has more input buffered than it has consumed. The read
+	// loop checks it between reads.
+	flagReadHeld
+	// flagReadShut records CloseRead: the connection reads nothing more, and
+	// the end of input that shutting the read side raises does not close it.
+	flagReadShut
+)
+
+// connFlags are the flags of a connection that are read without its mutex,
+// packed into one atomic word rather than an atomic.Bool of four bytes apiece.
+type connFlags struct{ bits atomic.Uint32 }
+
+func (f *connFlags) has(flag connFlag) bool { return f.bits.Load()&uint32(flag) != 0 }
+
+// set sets flag to on and reports whether it was set before.
+func (f *connFlags) set(flag connFlag, on bool) bool {
+	if on {
+		return f.bits.Or(uint32(flag))&uint32(flag) != 0
+	}
+	return f.bits.And(^uint32(flag))&uint32(flag) != 0
+}
+
+// packedAddrPort is an IP address and port without a zone, which is what
+// accepting a connection reports its peer as, in 20 bytes rather than the 32
+// of a netip.AddrPort, whose address keeps a pointer for the zone.
+type packedAddrPort struct {
+	// addr is the address in its 16-byte form, where an IPv4 address, which
+	// is4 marks, is mapped into IPv6.
+	addr  [16]byte
+	port  uint16
+	valid bool
+	is4   bool
+}
+
+// packAddrPort packs ap, which must have no zone.
+func packAddrPort(ap netip.AddrPort) packedAddrPort {
+	if !ap.IsValid() {
+		return packedAddrPort{}
+	}
+	return packedAddrPort{addr: ap.Addr().As16(), port: ap.Port(), valid: true, is4: ap.Addr().Is4()}
+}
+
+// unpack returns the AddrPort p was packed from.
+func (p *packedAddrPort) unpack() netip.AddrPort {
+	if !p.valid {
+		return netip.AddrPort{}
+	}
+	if p.is4 {
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte(p.addr[12:])), p.port)
+	}
+	return netip.AddrPortFrom(netip.AddrFrom16(p.addr), p.port)
 }
 
 // Cork holds what is sent on the connection from now on until Flush, rather
@@ -368,7 +425,7 @@ func (c *Connection) pauseDecision(readPaused bool) (pause, byBudget bool) {
 		// for, and a flood is bounded by the receive queue instead.
 		return false, false
 	}
-	if c.readHeld.Load() {
+	if c.flags.has(flagReadHeld) {
 		// The application asked for the socket to be left alone; only it can
 		// say when reads resume.
 		return true, false
@@ -722,7 +779,7 @@ func (c *Connection) process() {
 		c.pendingEvents = 0
 		closed := c.closed || c.closing
 		c.mu.Unlock()
-		if c.readShut.Load() {
+		if c.flags.has(flagReadShut) {
 			// CloseRead ended input: what the socket still reports, the end
 			// of input the shutdown itself raises among it, is not read.
 			events &^= evIn | evPri | evRdHup
@@ -907,14 +964,14 @@ func (c *Connection) stallRead() {
 // call wins, and a hold left set on a closed connection is harmless. It does
 // nothing on a UDP connection, whose datagrams the event loop has already read.
 func (c *Connection) HoldReads(hold bool) {
-	if c.udp != nil || c.readHeld.Swap(hold) == hold {
+	if c.udp != nil || c.flags.set(flagReadHeld, hold) == hold {
 		return
 	}
 	c.engine.request(command{kind: commandRefresh, connection: c})
 }
 
 // ReadsHeld reports whether HoldReads is currently holding reads back.
-func (c *Connection) ReadsHeld() bool { return c.readHeld.Load() }
+func (c *Connection) ReadsHeld() bool { return c.flags.has(flagReadHeld) }
 
 // readShouldStop reports whether this round should stop reading: either queued
 // output has reached the budget that bounds how much this connection, or the
@@ -928,11 +985,11 @@ func (c *Connection) readLoop() error {
 	buf := bufferpool.Get(c.engine.readBufferSize)
 	defer bufferpool.Put(buf)
 	for {
-		if c.readShut.Load() {
+		if c.flags.has(flagReadShut) {
 			// CloseRead, perhaps from inside OnData, ended input.
 			return nil
 		}
-		if c.readHeld.Load() {
+		if c.flags.has(flagReadHeld) {
 			// The application is holding reads until it has worked through
 			// what it already has. Leave the rest in the socket, where TCP
 			// flow control slows the peer down instead of this side growing:
@@ -1221,7 +1278,7 @@ func (c *Connection) CloseRead() error {
 		return nil
 	}
 	return c.control("shutdown", func(s rawSocket) error {
-		if c.readShut.Swap(true) {
+		if c.flags.set(flagReadShut, true) {
 			return nil
 		}
 		return c.shutdownReadLocked()
@@ -1297,7 +1354,7 @@ type rawConn struct{ c *Connection }
 
 func (r rawConn) Control(f func(fd uintptr)) error {
 	return r.c.control("raw-control", func(s rawSocket) error {
-		r.c.rawExposed.Store(true)
+		r.c.flags.set(flagRawExposed, true)
 		f(uintptr(s))
 		return nil
 	})
@@ -1305,7 +1362,7 @@ func (r rawConn) Control(f func(fd uintptr)) error {
 
 func (r rawConn) Read(f func(fd uintptr) bool) error {
 	return r.c.control("raw-read", func(s rawSocket) error {
-		r.c.rawExposed.Store(true)
+		r.c.flags.set(flagRawExposed, true)
 		if !f(uintptr(s)) {
 			return ErrWouldBlock
 		}
@@ -1315,7 +1372,7 @@ func (r rawConn) Read(f func(fd uintptr) bool) error {
 
 func (r rawConn) Write(f func(fd uintptr) bool) error {
 	return r.c.control("raw-write", func(s rawSocket) error {
-		r.c.rawExposed.Store(true)
+		r.c.flags.set(flagRawExposed, true)
 		if !f(uintptr(s)) {
 			return ErrWouldBlock
 		}
@@ -1376,6 +1433,11 @@ func boolInt(b bool) int {
 	return 0
 }
 
+// connectionDeadlines are a connection's read and write deadlines.
+type connectionDeadlines struct {
+	read, write deadline
+}
+
 // deadline is one of a connection's two deadlines. Its timer is rebuilt
 // whenever the deadline moves, and gen tells a timer that fires while it is
 // moving from the one that is current, so a connection given more time is not
@@ -1402,8 +1464,10 @@ func (c *Connection) SetDeadline(t time.Time) error {
 	c.mu.Lock()
 	closed := c.closing || c.closed
 	if !closed {
-		c.armDeadlineLocked(&c.readDeadline, t, false)
-		c.armDeadlineLocked(&c.writeDeadline, t, true)
+		if d := c.deadlinesLocked(t); d != nil {
+			c.armDeadlineLocked(&d.read, t, false)
+			c.armDeadlineLocked(&d.write, t, true)
+		}
 	}
 	c.mu.Unlock()
 	if closed {
@@ -1415,27 +1479,43 @@ func (c *Connection) SetDeadline(t time.Time) error {
 // SetReadDeadline closes the connection at t, whether or not the peer has sent
 // anything. See SetDeadline.
 func (c *Connection) SetReadDeadline(t time.Time) error {
-	return c.setDeadline(&c.readDeadline, t, false)
+	return c.setDeadline(t, false)
 }
 
 // SetWriteDeadline closes the connection at t if output accepted by Send has
 // still not reached the kernel by then; output that has all gone out leaves
 // the connection alone. See SetDeadline.
 func (c *Connection) SetWriteDeadline(t time.Time) error {
-	return c.setDeadline(&c.writeDeadline, t, true)
+	return c.setDeadline(t, true)
 }
 
-func (c *Connection) setDeadline(d *deadline, t time.Time, write bool) error {
+func (c *Connection) setDeadline(t time.Time, write bool) error {
 	c.mu.Lock()
 	closed := c.closing || c.closed
 	if !closed {
-		c.armDeadlineLocked(d, t, write)
+		if d := c.deadlinesLocked(t); d != nil {
+			if write {
+				c.armDeadlineLocked(&d.write, t, true)
+			} else {
+				c.armDeadlineLocked(&d.read, t, false)
+			}
+		}
 	}
 	c.mu.Unlock()
 	if closed {
 		return net.ErrClosed
 	}
 	return nil
+}
+
+// deadlinesLocked returns the connection's deadlines, allocating them when t
+// is the first to be set, or nil when none has been and t, a zero time, has
+// none to remove. Callers hold c.mu.
+func (c *Connection) deadlinesLocked(t time.Time) *connectionDeadlines {
+	if c.deadlines == nil && !t.IsZero() {
+		c.deadlines = &connectionDeadlines{}
+	}
+	return c.deadlines
 }
 
 // armDeadlineLocked points d at t. A deadline set to the time it already holds
@@ -1479,7 +1559,10 @@ func (c *Connection) expireDeadline(d *deadline, gen uint64, write bool) {
 // stopDeadlinesLocked drops both timers, so a closed connection is not kept
 // reachable by a deadline it will never reach.
 func (c *Connection) stopDeadlinesLocked() {
-	for _, d := range [...]*deadline{&c.readDeadline, &c.writeDeadline} {
+	if c.deadlines == nil {
+		return
+	}
+	for _, d := range [...]*deadline{&c.deadlines.read, &c.deadlines.write} {
 		if d.timer != nil {
 			d.timer.Stop()
 			d.timer = nil

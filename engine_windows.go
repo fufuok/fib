@@ -623,7 +623,7 @@ func (e *Engine) completeRead(c *Connection, err error) *Connection {
 	c.mu.Lock()
 	c.readArmed = false
 	closed := c.closed
-	if err != nil && !closed && !c.readShut.Load() {
+	if err != nil && !closed && !c.flags.has(flagReadShut) {
 		c.failure = err
 	}
 	c.mu.Unlock()
@@ -631,7 +631,7 @@ func (e *Engine) completeRead(c *Connection, err error) *Connection {
 		e.forget(c)
 		return nil
 	}
-	if c.readShut.Load() {
+	if c.flags.has(flagReadShut) {
 		// CloseRead cancelled the read, or shut the side it was waiting on.
 		return nil
 	}
@@ -831,7 +831,7 @@ func (c *Connection) rearmRead() {
 }
 
 func (c *Connection) armReadLocked() error {
-	if c.readArmed || c.readPaused || c.closing || c.closed || c.readShut.Load() {
+	if c.readArmed || c.readPaused || c.closing || c.closed || c.flags.has(flagReadShut) {
 		return nil
 	}
 	c.readOp.ov = syscall.Overlapped{}
