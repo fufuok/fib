@@ -30,8 +30,9 @@ const (
 	maxWaitBatch = 1024
 	// defaultWriteHighWatermark is the per-connection outbound budget. Two
 	// costs sit either side of it. Lower, and ordinary traffic crosses it on
-	// every reply, and each crossing costs an eventfd write and an epoll_ctl:
-	// at 4KB that churn was 16% of a 100k-connection profile. Higher, and a
+	// every reply: a round that crosses it flushes before it reads on, and a
+	// crossing once cost an eventfd write and an epoll_ctl too, which at 4KB
+	// was 16% of a 100k-connection profile. Higher, and a
 	// backlog grows past the buffer size the pool retains: at 64KB against the
 	// default 16KB read buffer, a 15-second rate test allocated 13.7GB against
 	// the same run's 254MB live. The default sits at that upper end, favouring
@@ -123,7 +124,7 @@ type Engine struct {
 	// engine's pollers share with it.
 	pendingTotal *atomic.Int64
 	// Backpressure counters, reported by Stats. They move only when a
-	// connection's read interest actually changes, which is rare by design.
+	// connection's reads actually pause or resume, which is rare by design.
 	readsPausedByWatermark atomic.Uint64
 	readsPausedByBudget    atomic.Uint64
 	readsResumed           atomic.Uint64
@@ -654,6 +655,18 @@ func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
 		// learns from that flush when the socket has failed; see waitOutput.
 		c.noteWritableLocked()
 	}
+	if pausesInPlace && c.readPaused && events&evIn != 0 && events&^(evIn|evOut) == 0 {
+		// Reads pause in place, so input still raises edges. The read is
+		// owed rather than run, and resuming hands it back; the round it
+		// would start only finds the backlog that paused it. A hang-up or
+		// an error still schedules the round, which reads what is left.
+		c.readStalled = true
+		events &^= evIn
+		if events == 0 {
+			c.mu.Unlock()
+			return nil
+		}
+	}
 	if events == evOut && c.sendHead == len(c.sends) && c.pendingEvents == 0 {
 		// Write interest is armed for the connection's whole life, so the
 		// socket reports itself writable the moment it is registered and again
@@ -730,13 +743,14 @@ func (e *Engine) refreshConnection(c *Connection) {
 	if !pauseReads {
 		c.budgetPaused = false
 	}
-	// A stalled read is settled once reads are running again. Resuming them
-	// re-arms the backend, and re-arming reports bytes already waiting, so
-	// only a connection that was never paused needs its read handed back.
+	// A stalled read is settled once reads are running again. Where resuming
+	// them re-arms the backend, re-arming reports bytes already waiting, and
+	// only a connection that was never paused needs its read handed back;
+	// where they pause in place, nothing reports them.
 	redeliver := false
 	if c.readStalled && !pauseReads {
 		c.readStalled = false
-		redeliver = usable && !changed
+		redeliver = usable && (!changed || pausesInPlace)
 	}
 	c.mu.Unlock()
 	if redeliver {
@@ -903,10 +917,10 @@ type Config struct {
 	// bytes are waiting to be written. This bounds userspace buffering while
 	// TCP backpressure catches up. Set below zero to disable write backpressure.
 	//
-	// Crossing it is not free: the worker hands a command to the event loop,
-	// which costs an eventfd write and an epoll_ctl. A watermark near the
-	// message size makes every reply a crossing, so keep it well above one
-	// round's worth of output.
+	// Crossing it is not free: a round that crosses it flushes before it
+	// reads on, and on Windows pausing and resuming go through the event
+	// loop. A watermark near the message size makes every reply a crossing,
+	// so keep it well above one round's worth of output.
 	WriteBufferHighWatermark int
 	// MaxPendingBytes caps the bytes this server may hold across all of its
 	// connections waiting for their sockets. WriteBufferHighWatermark bounds a

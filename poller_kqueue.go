@@ -234,22 +234,12 @@ func (e *Engine) registerDatagram(fd int, _ uint64) error {
 // unregister does nothing: closing a descriptor removes its kevents.
 func (e *Engine) unregister(int) {}
 
-// setReadPaused removes the read filter to pause reads and adds it back to
-// resume them. Adding a filter evaluates it straight away, so bytes that were
-// already waiting in the socket raise an event without the peer sending more,
-// which is the redelivery the paused read relies on.
-func (e *Engine) setReadPaused(c *Connection, paused bool) error {
-	change := [1]syscall.Kevent_t{{Ident: uint64(c.FD()), Filter: syscall.EVFILT_READ,
-		Flags: syscall.EV_ADD | syscall.EV_CLEAR}}
-	if paused {
-		change[0].Flags = syscall.EV_DELETE
-	}
-	_, err := syscall.Kevent(e.kq, change[:], nil, nil)
-	if paused && err == syscall.ENOENT {
-		err = nil
-	}
-	return err
-}
+// pausesInPlace says reads pause by the connection's readPaused flag alone,
+// as with epoll: the read filter, which clears on delivery, stays added.
+const pausesInPlace = true
+
+// setReadPaused does nothing; see pausesInPlace.
+func (e *Engine) setReadPaused(*Connection, bool) error { return nil }
 
 // Darwin names the idle time TCP_KEEPALIVE, and the syscall package leaves
 // the other two out on amd64.

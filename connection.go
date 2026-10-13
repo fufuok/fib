@@ -542,13 +542,56 @@ func (c *Connection) queueOwnedLocked(data []byte) {
 }
 
 // pauseStateChangedLocked reports whether queued output has crossed a watermark
-// so that the epoll read interest no longer matches it. It mirrors the decision
-// refreshConnection makes, so that a refresh is only requested when the event
-// loop actually has an epoll_ctl to perform. Callers hold c.mu.
+// so that the backend's read registration no longer matches it, where reads do
+// not pause in place. It mirrors the decision refreshConnection makes, so that
+// a refresh is only requested when the event loop actually has a change to
+// make. Callers hold c.mu.
 func (c *Connection) pauseStateChangedLocked() bool {
 	c.foldCorkedLocked()
 	pause, _ := c.pauseDecision(c.readPaused)
 	return pause != c.readPaused
+}
+
+// settlePauseLocked brings the pause up to date with the backlog wherever
+// it runs, and hands a read the connection is owed back to the round that is
+// running, and reports whether the event loop has to settle the rest. owed
+// says the caller just recorded such a read.
+//
+// Where the backend leaves read readiness registered while reads are
+// paused (see pausesInPlace), pausing and resuming is the readPaused flag
+// alone, which needs no event loop: a worker that drains its backlog below
+// the low watermark resumes its own reads and goes on to read in the same
+// round, rather than asking the loop to re-register the socket and waiting
+// for the event that re-registering raises and the task that event starts.
+// The server-wide budget stays the loop's, which keeps the connections it
+// holds back. Callers hold c.mu.
+func (c *Connection) settlePauseLocked(owed bool) bool {
+	c.foldCorkedLocked()
+	pause, byBudget := c.pauseDecision(c.readPaused)
+	if !pausesInPlace || byBudget || c.budgetPaused {
+		return owed || pause != c.readPaused
+	}
+	if c.closing || c.closed {
+		return false
+	}
+	if pause != c.readPaused {
+		c.readPaused = pause
+		if pause {
+			c.engine.readsPausedByWatermark.Add(1)
+		} else {
+			c.engine.readsResumed.Add(1)
+		}
+	}
+	if pause || !c.readStalled {
+		return false
+	}
+	if !c.scheduled {
+		// No round is running to take the read; the loop hands it over.
+		return true
+	}
+	c.readStalled = false
+	c.pendingEvents |= uint16(evIn)
+	return false
 }
 
 // pauseDecision is the single definition of whether a connection's reads should
@@ -582,7 +625,8 @@ func (c *Connection) pauseDecision(readPaused bool) (pause, byBudget bool) {
 	}
 	// Hysteresis: once paused, stay paused until the backlog falls well below
 	// the watermark. Resuming at the watermark itself would make every reply
-	// re-cross it, and each crossing costs an eventfd write and an epoll_ctl.
+	// re-cross it, and each crossing pauses and resumes reads: a flag where
+	// they pause in place, a trip through the event loop where they do not.
 	return readPaused && pendingBytes > int64(e.writeLowWatermark), false
 }
 
@@ -779,14 +823,14 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 		c.pushLocked(sendItem{data: data, offset: sent, pooled: true})
 	}
 	c.addPending(int64(len(queued)))
-	// Write interest stays armed, so queueing alone needs no registration
-	// change; only a watermark crossing does. While corked the flush at the end
-	// of the read round settles the read interest instead.
+	// Write interest stays armed, so queueing alone changes nothing; only a
+	// watermark crossing does. While corked the flush at the end of the read
+	// round settles the pause instead.
 	var armErr error
 	if direct {
 		armErr = c.awaitWritableLocked()
 	}
-	refresh := !c.corked && c.pauseStateChangedLocked()
+	refresh := !c.corked && c.settlePauseLocked(false)
 	c.mu.Unlock()
 	if armErr != nil {
 		c.closeWithError(armErr)
@@ -858,7 +902,7 @@ func (c *Connection) SendParts(first, second []byte) error {
 	if direct {
 		armErr = c.awaitWritableLocked()
 	}
-	refresh := !c.corked && c.pauseStateChangedLocked()
+	refresh := !c.corked && c.settlePauseLocked(false)
 	c.mu.Unlock()
 	if armErr != nil {
 		c.closeWithError(armErr)
@@ -1273,8 +1317,11 @@ func (e *Engine) trackOutputWait(c *Connection, waiting bool) {
 func (c *Connection) stallRead() {
 	c.mu.Lock()
 	c.readStalled = true
+	refresh := c.settlePauseLocked(true)
 	c.mu.Unlock()
-	c.engine.request(command{kind: commandRefresh, connection: c})
+	if refresh {
+		c.engine.request(command{kind: commandRefresh, connection: c})
+	}
 }
 
 // HoldReads stops or resumes reading from this connection's socket. It is the
@@ -1319,8 +1366,8 @@ func (c *Connection) readLoop() error {
 			// The application is holding reads until it has worked through
 			// what it already has. Leave the rest in the socket, where TCP
 			// flow control slows the peer down instead of this side growing:
-			// releasing the hold refreshes the connection, and re-arming
-			// reads redelivers whatever was left behind.
+			// releasing the hold refreshes the connection, which hands back
+			// the read owed for whatever was left behind.
 			c.stallRead()
 			return nil
 		}
@@ -1432,14 +1479,14 @@ func (c *Connection) flushLocked() error {
 			c.flushing = false
 			c.finishCloseWriteLocked()
 			closeAfterSend := c.closeAfterSend
-			refresh := c.pauseStateChangedLocked()
-			if c.readDeferred {
-				// A round left its read to this drain; see process. The
-				// event loop hands it back as it does a stalled one.
+			owed := c.readDeferred
+			if owed {
+				// A round left its read to this drain; see process. It is
+				// handed back as a stalled one is.
 				c.readDeferred = false
 				c.readStalled = true
-				refresh = true
 			}
+			refresh := c.settlePauseLocked(owed)
 			c.mu.Unlock()
 			if closeAfterSend {
 				c.closeWithError(nil)
@@ -1495,7 +1542,7 @@ func (c *Connection) flushLocked() error {
 				c.flushing = false
 				c.chargeLocked()
 				armErr := c.awaitWritableLocked()
-				refresh := c.pauseStateChangedLocked()
+				refresh := c.settlePauseLocked(false)
 				c.mu.Unlock()
 				if armErr != nil {
 					return armErr
@@ -1520,7 +1567,7 @@ func (c *Connection) flushLocked() error {
 		if sys.IsWouldBlock(err) {
 			c.chargeLocked()
 			armErr := c.awaitWritableLocked()
-			refresh := c.pauseStateChangedLocked()
+			refresh := c.settlePauseLocked(false)
 			c.mu.Unlock()
 			if armErr != nil {
 				return armErr

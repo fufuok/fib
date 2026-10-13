@@ -717,6 +717,10 @@ func (e *Engine) wake() {
 // dequeued by the time the loop drains commands.
 func (e *Engine) ackWake() {}
 
+// pausesInPlace is false: a paused connection does not re-arm its zero-byte
+// read, and resuming re-arms it, which reports bytes already waiting.
+const pausesInPlace = false
+
 // setReadPaused re-arms the zero-byte read when reads resume. Pausing needs no
 // call: a read already armed may still complete, but the round it starts finds
 // the output that caused the pause still queued and defers, and it does not

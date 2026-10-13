@@ -338,15 +338,15 @@ func (e *Engine) unregister(fd int) {
 	_ = syscall.EpollCtl(e.epollFD, syscall.EPOLL_CTL_DEL, fd, nil)
 }
 
-func (e *Engine) setReadPaused(c *Connection, paused bool) error {
-	events := allEvents
-	if paused {
-		events &^= syscall.EPOLLIN
-	}
-	token := c.token()
-	ev := syscall.EpollEvent{Events: events, Fd: int32(token), Pad: int32(token >> 32)}
-	return syscall.EpollCtl(e.epollFD, syscall.EPOLL_CTL_MOD, c.FD(), &ev)
-}
+// pausesInPlace says reads pause by the connection's readPaused flag alone:
+// the socket stays registered for input, an edge it raises while paused is
+// noted as a read owed, and resuming hands that read back; see
+// settlePauseLocked. Taking input interest out and putting it back cost an
+// epoll_ctl each, and a round trip through the event loop to make them.
+const pausesInPlace = true
+
+// setReadPaused does nothing; see pausesInPlace.
+func (e *Engine) setReadPaused(*Connection, bool) error { return nil }
 
 const (
 	tcpKeepIdle     = syscall.TCP_KEEPIDLE
