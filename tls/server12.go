@@ -57,21 +57,23 @@ func (h *serverHS) allowsSuite12(id uint16) bool {
 	return len(h.config.CipherSuites) == 0 || slices.Contains(h.config.CipherSuites, id)
 }
 
-// plan12 works out how to serve ch with TLS 1.2, or reports that it cannot.
-func (h *serverHS) plan12(ch *clientHelloMsg) *plan12 {
+// plan12 works out how to serve ch with TLS 1.2, or reports that it cannot,
+// with no plan, or that the certificate failed, or errCertWait while
+// GetCertificate has yet to answer.
+func (h *serverHS) plan12(ch *clientHelloMsg) (*plan12, *hsError) {
 	if !slices.Contains(ch.compression, 0) || len(ch.sigAlgs) == 0 || len(ch.groups) == 0 {
-		return nil
+		return nil, nil
 	}
 	if ch.havePoints && !slices.Contains(ch.pointFormat, 0) {
-		return nil
+		return nil, nil
 	}
 	cert, herr := h.selectCertificate(ch)
 	if herr != nil {
-		return nil
+		return nil, herr
 	}
 	alg, herr := h.selectSignature(cert, ch, true)
 	if herr != nil {
-		return nil
+		return nil, nil
 	}
 	var ecdsaKey bool
 	switch cert.PrivateKey.(crypto.Signer).Public().(type) {
@@ -79,7 +81,7 @@ func (h *serverHS) plan12(ch *clientHelloMsg) *plan12 {
 		ecdsaKey = true
 	case *rsa.PublicKey:
 	default:
-		return nil
+		return nil, nil
 	}
 	p := &plan12{cert: cert, alg: alg}
 	for _, s := range serverSuites12 {
@@ -92,7 +94,7 @@ func (h *serverHS) plan12(ch *clientHelloMsg) *plan12 {
 		}
 	}
 	if p.suite == 0 {
-		return nil
+		return nil, nil
 	}
 	for _, g := range h.groups {
 		if slices.Contains(ch.groups, g) {
@@ -101,9 +103,9 @@ func (h *serverHS) plan12(ch *clientHelloMsg) *plan12 {
 		}
 	}
 	if p.group == 0 {
-		return nil
+		return nil, nil
 	}
-	return p
+	return p, nil
 }
 
 // sendPlain sends a handshake message in the clear, split across records if
@@ -213,6 +215,11 @@ func (h *serverHS) resume12(ch *clientHelloMsg) (ticketState12, bool) {
 	if _, ok := lookupSuite(stdtls.VersionTLS12, state.suite); !ok {
 		return ticketState12{}, false
 	}
+	certs, chains, ok := h.sessionPeer(state.certs, state.chains)
+	if !ok {
+		return ticketState12{}, false
+	}
+	h.peerRaw, h.peerCerts, h.peerChains = state.certs, certs, chains
 	return state, true
 }
 
@@ -311,8 +318,12 @@ func (h *serverHS) flightFull12(p *plan12, out *[]byte) *hsError {
 	kx.vec16(func(b *builder) { b.raw(signature) })
 	h.sendPlain(out, finishMessage(&kx))
 
-	h.sendPlain(out, []byte{hsServerHelloDone, 0, 0, 0})
 	h.state = srv12AwaitKeyExchange
+	if h.requestsCert() {
+		h.sendPlain(out, h.requestCertificate(true))
+		h.state = srv12AwaitClientCert
+	}
+	h.sendPlain(out, []byte{hsServerHelloDone, 0, 0, 0})
 	return nil
 }
 
@@ -344,6 +355,9 @@ func (h *serverHS) clientKeyExchange(msg []byte) *hsError {
 		return herr
 	}
 	h.state = srv12AwaitCCS
+	if len(h.peerCerts) > 0 {
+		h.state = srv12AwaitClientCertVerify
+	}
 	return nil
 }
 
@@ -367,6 +381,7 @@ func (h *serverHS) sendFinished12(out *[]byte) *hsError {
 		now := h.now()
 		if ticket, ok := h.tickets.seal12(ticketState12{
 			suite: h.suiteID, created: now, master: h.master, ems: h.ems, server: h.ch.serverName,
+			certs: h.peerRaw, chains: rawChains(h.peerChains),
 		}, now); ok {
 			var b builder
 			b.u8(hsNewSessionTicket)
@@ -463,5 +478,7 @@ func (h *serverHS) connectionState12() stdtls.ConnectionState {
 		NegotiatedProtocolIsMutual: h.protocol != "",
 		ServerName:                 h.ch.serverName,
 		TLSUnique:                  bytes.Clone(unique),
+		PeerCertificates:           h.peerCerts,
+		VerifiedChains:             h.peerChains,
 	}
 }

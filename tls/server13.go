@@ -2,16 +2,14 @@ package tls
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/ecdh"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/elliptic"
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/rand"
-	"crypto/rsa"
 	stdtls "crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -51,16 +49,15 @@ import (
 var errFallback = &hsError{err: errors.New("tls: handled by crypto/tls")}
 
 // nativeServer reports whether a server handshake with config can be run by
-// serverHS. The Config must hold its certificates itself: GetCertificate and
-// GetConfigForClient hand callbacks a ClientHelloInfo whose context and
-// connection crypto/tls fills in, which cannot be built from outside it, and
-// they have nothing to ask a client for that was not offered. Client
-// authentication, encrypted client hello, and keys that cannot sign by
-// themselves are crypto/tls's too.
+// serverHS. The Config needs certificates, its own or GetCertificate's (see
+// auth.go), and may authenticate clients. GetConfigForClient, which may change
+// anything about the handshake once the client has spoken, encrypted client
+// hello, and keys that cannot sign by themselves are crypto/tls's.
 func nativeServer(config *stdtls.Config) bool {
-	if config == nil || config.GetCertificate != nil || config.GetConfigForClient != nil ||
-		config.ClientAuth != stdtls.NoClientCert || config.EncryptedClientHelloKeys != nil ||
-		len(config.Certificates) == 0 || config.Renegotiation != stdtls.RenegotiateNever {
+	if config == nil || config.GetConfigForClient != nil || config.EncryptedClientHelloKeys != nil ||
+		len(config.Certificates) == 0 && config.GetCertificate == nil ||
+		config.ClientAuth < stdtls.NoClientCert || config.ClientAuth > stdtls.RequireAndVerifyClientCert ||
+		config.Renegotiation != stdtls.RenegotiateNever {
 		return false
 	}
 	if allow13, allow12 := serverVersions(config); !allow13 && !allow12 {
@@ -101,10 +98,17 @@ type srvState uint8
 const (
 	srvAwaitHello srvState = iota
 	srvAwaitHello2
+	// The client's certificate and its CertificateVerify, if it was asked for
+	// one.
+	srvAwaitClientCert
+	srvAwaitClientCertVerify
 	srvAwaitFinished
-	// TLS 1.2: the client's key exchange, its change_cipher_spec, and its
-	// Finished.
+	// TLS 1.2: the client's certificate if it was asked for one, its key
+	// exchange, its CertificateVerify if it sent a certificate, its
+	// change_cipher_spec, and its Finished.
+	srv12AwaitClientCert
 	srv12AwaitKeyExchange
+	srv12AwaitClientCertVerify
 	srv12AwaitCCS
 	srv12AwaitFinished
 	srvDone
@@ -141,6 +145,15 @@ type serverHS struct {
 	suite   suite
 	cert    *stdtls.Certificate
 	alg     uint16
+	// pick is Config.GetCertificate, called off the handshake's goroutine
+	// where there is a layer to wake it again (see auth.go).
+	pick certCall
+
+	// The client's certificates, if it was asked for them and sent any, as
+	// sent and parsed, and the chains they were verified with.
+	peerRaw    [][]byte
+	peerCerts  []*x509.Certificate
+	peerChains [][]*x509.Certificate
 
 	// TLS 1.2: the ECDHE key, the master secret, and whether it is the
 	// extended one; the Finished messages, which are the connection's
@@ -274,6 +287,8 @@ type clientHelloMsg struct {
 	binders    [][]byte
 	bindersLen int
 	pskModes   []byte
+	// extBlock is the extensions as they were sent, in their order.
+	extBlock []byte
 	// TLS 1.2: whether the client offers the extended master secret, the
 	// session ticket extension and the ticket it holds, the point formats it
 	// reads, and whether it signalled secure renegotiation.
@@ -283,6 +298,17 @@ type clientHelloMsg struct {
 	pointFormat []byte
 	havePoints  bool
 	renegotiate bool
+}
+
+// extensionIDs are the types of the extensions in the order they were sent.
+func (ch *clientHelloMsg) extensionIDs() []uint16 {
+	ids := make([]uint16, 0, len(ch.exts))
+	r := newReader(ch.extBlock)
+	for len(r.b) > 0 && r.ok {
+		ids = append(ids, r.u16())
+		r.vec16()
+	}
+	return ids
 }
 
 type clientPSK struct {
@@ -314,7 +340,7 @@ func parseClientHello(msg []byte) (*clientHelloMsg, bool) {
 	if herr != nil {
 		return nil, false
 	}
-	ch.exts = exts
+	ch.exts, ch.extBlock = exts, extensions
 	for typ, data := range exts {
 		d := newReader(data)
 		switch typ {
@@ -430,37 +456,53 @@ func parseClientHello(msg []byte) (*clientHelloMsg, bool) {
 // it and there is a certificate, suite and group to serve it with, else zero,
 // and crypto/tls gets the connection. A client that offers TLS 1.3 is not
 // offered 1.2 instead when it asks for something 1.3 here does not do, as
-// crypto/tls would not.
-func (h *serverHS) choose(ch *clientHelloMsg) uint16 {
+// crypto/tls would not. TLS 1.2 needs the certificate to decide, and an error
+// is GetCertificate's, or errCertWait while it has not answered.
+func (h *serverHS) choose(ch *clientHelloMsg) (uint16, *hsError) {
 	if h.allow13 && slices.Contains(ch.versions, stdtls.VersionTLS13) {
 		if !slices.Contains(ch.compression, 0) {
-			return 0
+			return 0, nil
 		}
 		if !slices.Contains(ch.suites, stdtls.TLS_AES_128_GCM_SHA256) && !slices.Contains(ch.suites, stdtls.TLS_AES_256_GCM_SHA384) {
-			return 0
+			return 0, nil
 		}
 		for _, g := range h.groups {
 			if slices.Contains(ch.groups, g) {
-				return stdtls.VersionTLS13
+				return stdtls.VersionTLS13, nil
 			}
 		}
-		return 0
+		return 0, nil
 	}
 	if h.allow12 && slices.Contains(ch.versions, stdtls.VersionTLS12) {
-		if plan := h.plan12(ch); plan != nil {
+		plan, herr := h.plan12(ch)
+		if herr != nil {
+			return 0, herr
+		}
+		if plan != nil {
 			h.plan = plan
-			return stdtls.VersionTLS12
+			return stdtls.VersionTLS12, nil
 		}
 	}
-	return 0
+	return 0, nil
 }
 
-// serves reports whether this handshake can serve ch.
-func (h *serverHS) serves(ch *clientHelloMsg) bool {
+// serves reports whether this handshake can serve ch, or that it cannot tell
+// before GetCertificate has answered: peekServe, peekFallback or peekMore. A
+// client that GetCertificate fails is served, to be told so.
+func (h *serverHS) serves(ch *clientHelloMsg) int {
 	if h.quic != nil {
-		return h.servesQUIC(ch)
+		if h.servesQUIC(ch) {
+			return peekServe
+		}
+		return peekFallback
 	}
-	return h.choose(ch) != 0
+	switch v, herr := h.choose(ch); {
+	case herr == errCertWait:
+		return peekMore
+	case herr != nil || v != 0:
+		return peekServe
+	}
+	return peekFallback
 }
 
 // servesQUIC is serves for QUIC, whose ClientHello must offer TLS 1.3 and
@@ -507,7 +549,6 @@ func (h *serverHS) suite13(id uint16) (suite, bool) {
 func (h *serverHS) peek(in []byte) (status int) {
 	const (
 		needMore = peekMore
-		serve    = peekServe
 		fallback = peekFallback
 	)
 	var msg []byte
@@ -531,10 +572,10 @@ func (h *serverHS) peek(in []byte) (status int) {
 			}
 			if len(msg) >= size {
 				ch, ok := parseClientHello(msg[:size])
-				if !ok || !h.serves(ch) {
+				if !ok {
 					return fallback
 				}
-				return serve
+				return h.serves(ch)
 			}
 		}
 	}
@@ -552,7 +593,9 @@ const (
 // process consumes the records in in that are complete, as clientHS.process
 // does, and reports how much of it that was, what to send the peer, and
 // whether the handshake is over. Until the ClientHello has arrived and been
-// accepted it consumes nothing.
+// accepted it consumes nothing. While GetCertificate has not answered, it
+// consumes nothing either; once it has, a call goes on from where the
+// handshake stopped, with more of in or none.
 func (h *serverHS) process(in []byte) (consumed int, out []byte, done bool, err *hsError) {
 	if !h.decided {
 		switch h.peek(in) {
@@ -563,7 +606,10 @@ func (h *serverHS) process(in []byte) (consumed int, out []byte, done bool, err 
 		}
 		h.decided = true
 	}
-	for h.state != srvDone && len(in)-consumed >= recordHeaderLen {
+	if waiting, herr := h.pick.proceed(&out); waiting || herr != nil {
+		return 0, out, false, herr
+	}
+	for h.state != srvDone && !h.pick.waiting() && len(in)-consumed >= recordHeaderLen {
 		rec := in[consumed:]
 		length := int(rec[3])<<8 | int(rec[4])
 		limit := maxCiphertext13
@@ -637,7 +683,7 @@ func (h *serverHS) record(record []byte, out *[]byte) *hsError {
 		}
 		inner, plain, alert, ok := h.rx.open(record)
 		if !ok {
-			if h.state == srvAwaitFinished && h.skipEarlyRecord(record) {
+			if h.awaitsClientFlight() && h.skipEarlyRecord(record) {
 				return nil
 			}
 			return fail(alert, "bad record")
@@ -672,26 +718,11 @@ func (h *serverHS) handshakeData(data []byte, out *[]byte) *hsError {
 			break
 		}
 		msg := h.hsBuf[:size:size]
-		var herr *hsError
-		switch {
-		case (h.state == srvAwaitHello || h.state == srvAwaitHello2) && msg[0] == hsClientHello:
-			herr = h.clientHello(msg, out)
-		case h.state == srvAwaitFinished && h.earlyOn && msg[0] == hsEndOfEarlyData:
-			herr = h.endOfEarlyData(msg)
-		case h.state == srvAwaitFinished && !h.earlyOn && msg[0] == hsFinished:
-			herr = h.finished(msg, out)
-		case h.state == srv12AwaitKeyExchange && msg[0] == hsClientKeyExchange:
-			herr = h.clientKeyExchange(msg)
-		case h.state == srv12AwaitFinished && msg[0] == hsFinished:
-			herr = h.finished12(msg, out)
-		default:
-			herr = fail(alertUnexpectedMessage, "unexpected handshake message %d", msg[0])
-		}
-		if herr != nil {
+		if herr := h.message(msg, out); herr != nil {
 			return herr
 		}
 		h.hsBuf = h.hsBuf[size:]
-		if len(h.hsBuf) != 0 && h.state != srvAwaitFinished && h.state != srv12AwaitFinished {
+		if len(h.hsBuf) != 0 && msg[0] == hsClientHello {
 			// The keys change after the ClientHello, or it is our turn.
 			return fail(alertUnexpectedMessage, "handshake data after the last message of a flight")
 		}
@@ -703,6 +734,44 @@ func (h *serverHS) handshakeData(data []byte, out *[]byte) *hsError {
 		h.hsBuf = nil
 	}
 	return nil
+}
+
+// message handles one handshake message from the client.
+func (h *serverHS) message(msg []byte, out *[]byte) *hsError {
+	switch typ := msg[0]; {
+	case (h.state == srvAwaitHello || h.state == srvAwaitHello2) && typ == hsClientHello:
+		return h.clientHello(msg, out)
+	case h.state == srvAwaitFinished && h.earlyOn && typ == hsEndOfEarlyData:
+		return h.endOfEarlyData(msg)
+	case h.state == srvAwaitClientCert && typ == hsCertificate:
+		return h.clientCertificate13(msg)
+	case h.state == srvAwaitClientCertVerify && typ == hsCertificateVerify:
+		return h.clientCertificateVerify13(msg)
+	case h.state == srvAwaitFinished && !h.earlyOn && typ == hsFinished:
+		return h.finished(msg, out)
+	case h.state == srv12AwaitClientCert && typ == hsCertificate:
+		return h.clientCertificate12(msg)
+	case h.state == srv12AwaitKeyExchange && typ == hsClientKeyExchange:
+		return h.clientKeyExchange(msg)
+	case h.state == srv12AwaitClientCertVerify && typ == hsCertificateVerify:
+		return h.clientCertificateVerify12(msg)
+	case h.state == srv12AwaitFinished && typ == hsFinished:
+		return h.finished12(msg, out)
+	}
+	return fail(alertUnexpectedMessage, "unexpected handshake message %d", msg[0])
+}
+
+// awaitsClientFlight reports whether a TLS 1.3 handshake waits for the
+// client's second flight, which ends in its Finished.
+func (h *serverHS) awaitsClientFlight() bool {
+	return h.state == srvAwaitClientCert || h.state == srvAwaitClientCertVerify || h.state == srvAwaitFinished
+}
+
+// requestsCert says whether the handshake asks the client for a certificate:
+// whenever the Config authenticates clients, except when it resumes a session,
+// which carries the certificates the client sent before.
+func (h *serverHS) requestsCert() bool {
+	return h.config.ClientAuth != stdtls.NoClientCert && !h.resumed
 }
 
 func (h *serverHS) transcriptHash() []byte { return hashBytes(h.suite.hash, h.transcript) }
@@ -728,7 +797,15 @@ func (h *serverHS) clientHello(msg []byte, out *[]byte) *hsError {
 		h.peerParams = bytes.Clone(ch.exts[extQUICParams])
 		h.quic.peer(h.peerParams)
 	} else {
-		switch h.choose(ch) {
+		v, herr := h.choose(ch)
+		if herr == errCertWait {
+			// peek waited for the answer, so this cannot be.
+			return fail(alertInternalError, "GetCertificate has not answered")
+		}
+		if herr != nil {
+			return herr
+		}
+		switch v {
 		case stdtls.VersionTLS12:
 			h.version = stdtls.VersionTLS12
 			return h.clientHello12(ch, msg, out)
@@ -825,10 +902,15 @@ func (h *serverHS) clientHello(msg []byte, out *[]byte) *hsError {
 }
 
 // serve is the rest of the answer to a ClientHello, once it is known whether
-// it resumes a session: the certificate, the key exchange, the flight.
+// it resumes a session: the certificate, the key exchange, the flight. Until
+// GetCertificate has answered, it is set aside, and runs again once it has.
 func (h *serverHS) serve(ch *clientHelloMsg, share *keyShare, pskIndex int, out *[]byte) *hsError {
 	if !h.resumed {
 		cert, herr := h.selectCertificate(ch)
+		if herr == errCertWait {
+			h.pick.wait(func(out *[]byte) *hsError { return h.serve(ch, share, pskIndex, out) })
+			return nil
+		}
 		if herr != nil {
 			return herr
 		}
@@ -896,6 +978,10 @@ func (h *serverHS) resume(ch *clientHelloMsg, prior []byte) (psk []byte, index i
 		if s, valid := h.suite13(state.suite); !valid || s.hash().Size() != f().Size() {
 			continue
 		}
+		certs, chains, usable := h.sessionPeer(state.certs, state.chains)
+		if !usable {
+			continue
+		}
 		early, err := hkdf.Extract(f, state.psk, nil)
 		if err != nil {
 			continue
@@ -911,6 +997,7 @@ func (h *serverHS) resume(ch *clientHelloMsg, prior []byte) (psk []byte, index i
 		mac := hmac.New(f, key)
 		mac.Write(hashed)
 		if hmac.Equal(mac.Sum(nil), ch.binders[i]) {
+			h.peerRaw, h.peerCerts, h.peerChains = state.certs, certs, chains
 			return state.psk, i, state, true
 		}
 	}
@@ -944,7 +1031,8 @@ func (h *serverHS) selectProtocol() *hsError {
 	return fail(alertNoApplicationProtocol, "client requested unsupported application protocols (%s)", client)
 }
 
-// hello is what a certificate is chosen against.
+// hello is what a certificate is chosen against, and what GetCertificate is
+// handed.
 func (h *serverHS) hello(ch *clientHelloMsg) *stdtls.ClientHelloInfo {
 	groups := make([]stdtls.CurveID, 0, len(ch.groups))
 	groups = append(groups, ch.groups...)
@@ -952,22 +1040,50 @@ func (h *serverHS) hello(ch *clientHelloMsg) *stdtls.ClientHelloInfo {
 	for i, alg := range ch.sigAlgs {
 		schemes[i] = stdtls.SignatureScheme(alg)
 	}
-	return &stdtls.ClientHelloInfo{
-		CipherSuites:      ch.suites,
+	points := []uint8{0}
+	if ch.havePoints {
+		points = bytes.Clone(ch.pointFormat)
+	}
+	info := &stdtls.ClientHelloInfo{
+		CipherSuites:      slices.Clone(ch.suites),
 		ServerName:        ch.serverName,
 		SupportedCurves:   groups,
-		SupportedPoints:   []uint8{0},
+		SupportedPoints:   points,
 		SignatureSchemes:  schemes,
-		SupportedProtos:   ch.protos,
-		SupportedVersions: ch.versions,
+		SupportedProtos:   slices.Clone(ch.protos),
+		SupportedVersions: slices.Clone(ch.versions),
+		Extensions:        ch.extensionIDs(),
 		Conn:              h.conn,
 	}
+	setContext(info, helloCtxOffset, context.Background())
+	return info
 }
 
-// selectCertificate picks the certificate the client's hello fits: the only
-// one, or the first that supports it, or else the first.
+// selectCertificate picks the certificate for the client's hello as
+// crypto/tls's Config does: GetCertificate's, if it has one for a client that
+// names a server or the Config has no certificates of its own, or else the
+// only one, or the first that supports the hello, or the first. errCertWait
+// means that GetCertificate has yet to answer.
 func (h *serverHS) selectCertificate(ch *clientHelloMsg) (*stdtls.Certificate, *hsError) {
 	certs := h.config.Certificates
+	if get := h.config.GetCertificate; get != nil && (len(certs) == 0 || ch.serverName != "") {
+		a, ok := h.pick.ask(func() (*stdtls.Certificate, error) { return get(h.hello(ch)) })
+		if !ok {
+			return nil, errCertWait
+		}
+		if a.err != nil {
+			return nil, certError(a.err)
+		}
+		if a.cert != nil {
+			if herr := usableCertificate(a.cert); herr != nil {
+				return nil, herr
+			}
+			return a.cert, nil
+		}
+	}
+	if len(certs) == 0 {
+		return nil, fail(alertUnrecognizedName, "no certificates configured")
+	}
 	if len(certs) == 1 {
 		return &certs[0], nil
 	}
@@ -981,46 +1097,11 @@ func (h *serverHS) selectCertificate(ch *clientHelloMsg) (*stdtls.Certificate, *
 }
 
 // selectSignature picks the scheme the certificate's key signs with that the
-// client accepts, in the client's order.
+// client accepts: in the client's order in TLS 1.3, and in the server's in
+// TLS 1.2, which also signs a key exchange with PKCS #1.
 func (h *serverHS) selectSignature(cert *stdtls.Certificate, ch *clientHelloMsg, tls12 bool) (uint16, *hsError) {
-	var candidates []uint16
-	switch key := cert.PrivateKey.(crypto.Signer).Public().(type) {
-	case *rsa.PublicKey:
-		for _, alg := range []uint16{0x0804, 0x0805, 0x0806} {
-			// PSS needs room for the digest and the salt twice, plus padding.
-			if hash, _ := signatureHash(alg); key.Size() >= 2*hash.Size()+2 {
-				candidates = append(candidates, alg)
-			}
-		}
-		if tls12 {
-			// TLS 1.2 also signs a key exchange with PKCS #1.
-			candidates = append(candidates, 0x0401, 0x0501, 0x0601)
-		}
-	case *ecdsa.PublicKey:
-		switch key.Curve {
-		case elliptic.P256():
-			candidates = []uint16{0x0403}
-		case elliptic.P384():
-			candidates = []uint16{0x0503}
-		case elliptic.P521():
-			candidates = []uint16{0x0603}
-		}
-	case ed25519.PublicKey:
-		candidates = []uint16{0x0807}
-	}
-	if tls12 {
-		// In the server's order of preference.
-		for _, alg := range candidates {
-			if slices.Contains(ch.sigAlgs, alg) {
-				return alg, nil
-			}
-		}
-	} else {
-		for _, alg := range ch.sigAlgs {
-			if slices.Contains(candidates, alg) {
-				return alg, nil
-			}
-		}
+	if alg, ok := chooseSignature(cert.PrivateKey.(crypto.Signer).Public(), ch.sigAlgs, tls12, tls12); ok {
+		return alg, nil
 	}
 	return 0, fail(alertHandshakeFailure, "client doesn't support any of the certificate's signature algorithms")
 }
@@ -1223,6 +1304,11 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 	if herr := send(eem); herr != nil {
 		return herr
 	}
+	if h.requestsCert() {
+		if herr := send(h.requestCertificate(false)); herr != nil {
+			return herr
+		}
+	}
 
 	if !h.resumed {
 		// Certificate: the chain, with the OCSP response and the signed
@@ -1269,22 +1355,11 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 		}
 
 		// CertificateVerify.
-		signed := bytes.Repeat([]byte{0x20}, 64)
-		signed = append(signed, "TLS 1.3, server CertificateVerify"...)
-		signed = append(signed, 0)
-		signed = append(signed, h.transcriptHash()...)
-		signature, herr := h.sign(signed)
+		signature, herr := h.sign(certificateVerifyContent(true, h.transcriptHash()))
 		if herr != nil {
 			return herr
 		}
-		var cv builder
-		cv.u8(hsCertificateVerify)
-		cv.u24(0)
-		cv.u16(h.alg)
-		cv.vec16(func(b *builder) { b.raw(signature) })
-		cvm := cv.b
-		cvm[1], cvm[2], cvm[3] = byte((len(cvm)-4)>>16), byte((len(cvm)-4)>>8), byte(len(cvm)-4)
-		if herr := send(cvm); herr != nil {
+		if herr := send(appendCertificateVerify(h.alg, signature)); herr != nil {
 			return herr
 		}
 
@@ -1321,7 +1396,7 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 		// The server writes under its application keys from here; the
 		// client's Finished is still read under its handshake keys.
 		h.quic.setWrite(stdtls.QUICEncryptionLevelApplication, h.suiteID, h.appServer)
-		h.state = srvAwaitFinished
+		h.state = h.clientFlightState()
 		return nil
 	}
 	if h.appRx, err = newKeys13(h.suite.keyLen, f, h.appClient); err != nil {
@@ -1332,25 +1407,23 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 	if h.tx, err = newKeys13(h.suite.keyLen, f, h.appServer); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
-	h.state = srvAwaitFinished
+	h.state = h.clientFlightState()
 	return nil
 }
 
-// sign signs the CertificateVerify content with the certificate's key.
-func (h *serverHS) sign(signed []byte) ([]byte, *hsError) {
-	signer := h.cert.PrivateKey.(crypto.Signer)
-	ch, _ := signatureHash(h.alg)
-	var signature []byte
-	var err error
-	switch h.alg {
-	case 0x0807:
-		signature, err = signer.Sign(h.rander(), signed, crypto.Hash(0))
-	case 0x0804, 0x0805, 0x0806:
-		signature, err = signer.Sign(h.rander(), hashBytes(ch.New, signed),
-			&rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: ch})
-	default:
-		signature, err = signer.Sign(h.rander(), hashBytes(ch.New, signed), ch)
+// clientFlightState is what a TLS 1.3 handshake waits for once its flight is
+// out: the client's certificate if it asked for one, else its Finished.
+func (h *serverHS) clientFlightState() srvState {
+	if h.requestsCert() {
+		return srvAwaitClientCert
 	}
+	return srvAwaitFinished
+}
+
+// sign signs the CertificateVerify content, or in TLS 1.2 the key exchange,
+// with the certificate's key.
+func (h *serverHS) sign(signed []byte) ([]byte, *hsError) {
+	signature, err := signHandshake(h.cert.PrivateKey.(crypto.Signer), h.alg, h.rander(), signed)
 	if err != nil {
 		return nil, fail(alertInternalError, "failed to sign handshake: %v", err)
 	}
@@ -1478,7 +1551,7 @@ func (h *serverHS) ticketMessage(earlyData bool, extra [][]byte) ([]byte, *hsErr
 	now := h.now()
 	ticket, ok := h.tickets.seal(ticketState{
 		suite: h.suiteID, created: now, ageAdd: binary.BigEndian.Uint32(ageAdd[:]), psk: psk, server: h.ch.serverName,
-		earlyData: earlyData, alpn: h.protocol, extra: extra,
+		earlyData: earlyData, alpn: h.protocol, extra: extra, certs: h.peerRaw, chains: rawChains(h.peerChains),
 	}, now)
 	if !ok {
 		return nil, nil
@@ -1521,6 +1594,8 @@ func (h *serverHS) connectionState() stdtls.ConnectionState {
 		NegotiatedProtocol:         h.protocol,
 		NegotiatedProtocolIsMutual: h.protocol != "",
 		ServerName:                 h.ch.serverName,
+		PeerCertificates:           h.peerCerts,
+		VerifiedChains:             h.peerChains,
 	}
 }
 

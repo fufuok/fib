@@ -201,27 +201,30 @@ const (
 )
 
 func (h *clientHS) certificateRequest12(msg []byte) *hsError {
-	r := newReader(msg[4:])
-	types := r.vec8()
-	algs := r.vec16()
-	authorities := r.vec16()
-	if !r.empty() || types == nil || algs == nil || authorities == nil {
-		return fail(alertDecodeError, "malformed CertificateRequest")
+	if herr := h.parseCertificateRequest12(msg); herr != nil {
+		return herr
 	}
-	h.certReq = true
 	h.transcript = append(h.transcript, msg...)
 	h.state = hs12ExpectServerHelloDone
 	return nil
 }
 
-// serverHelloDone ends the server's flight, and is answered with ours: the
-// certificate it asked for, if any, our key share, and the change_cipher_spec
-// and Finished that switch to the keys they make.
+// serverHelloDone ends the server's flight, and is answered with ours once
+// the certificate it asked for, if it did, is known.
 func (h *clientHS) serverHelloDone(msg []byte, out *[]byte) *hsError {
 	if len(msg) != 4 {
 		return fail(alertDecodeError, "malformed ServerHelloDone")
 	}
 	h.transcript = append(h.transcript, msg...)
+	h.flightEnd = true
+	return h.clientFlight(out, h.finish12)
+}
+
+// finish12 sends the client's flight of TLS 1.2: the certificate the server
+// asked for, if it did, our key share, the CertificateVerify that proves the
+// certificate is ours, and the change_cipher_spec and Finished that switch to
+// the keys they make.
+func (h *clientHS) finish12(out *[]byte) *hsError {
 	curve := curveOf(h.skxCurve)
 	key, err := curve.GenerateKey(h.rander())
 	if err != nil {
@@ -237,23 +240,38 @@ func (h *clientHS) serverHelloDone(msg []byte, out *[]byte) *hsError {
 	}
 
 	var flight []byte
+	plain := func(msg []byte) {
+		h.transcript = append(h.transcript, msg...)
+		for len(msg) > 0 {
+			n := min(len(msg), maxPlaintext)
+			flight = appendRecord(flight, recordTypeHandshake, 0x0303, msg[:n])
+			msg = msg[n:]
+		}
+	}
 	if h.certReq {
-		// No certificate to offer; see certificate in client13.go.
-		cert := []byte{hsCertificate, 0, 0, 3, 0, 0, 0}
-		h.transcript = append(h.transcript, cert...)
-		flight = appendRecord(flight, recordTypeHandshake, 0x0303, cert)
+		// The certificate, or an empty Certificate to say there is none.
+		plain(h.certificateMessage12())
 	}
 	public := key.PublicKey().Bytes()
-	exchange := append([]byte{hsClientKeyExchange, 0, 0, byte(1 + len(public)), byte(len(public))}, public...)
-	h.transcript = append(h.transcript, exchange...)
-	flight = appendRecord(flight, recordTypeHandshake, 0x0303, exchange)
+	plain(append([]byte{hsClientKeyExchange, 0, 0, byte(1 + len(public)), byte(len(public))}, public...))
 
+	// The extended master secret covers the transcript through the key
+	// exchange, and not the CertificateVerify that follows it.
 	f := h.suite.hash
 	if h.ems {
 		h.master = prf12(f, premaster, "extended master secret", h.transcriptHash(), 48)
 	} else {
 		seed := append(append([]byte(nil), h.random[:]...), h.serverRandom[:]...)
 		h.master = prf12(f, premaster, "master secret", seed, 48)
+	}
+	if h.certReq {
+		cv, herr := h.certificateVerify12()
+		if herr != nil {
+			return herr
+		}
+		if cv != nil {
+			plain(cv)
+		}
 	}
 	h.keyLog("CLIENT_RANDOM", h.master)
 	if h.tx, h.rx, err = newKeysFromMaster(stdtls.VersionTLS12, h.suite, h.master, h.random[:], h.serverRandom[:]); err != nil {
@@ -271,7 +289,6 @@ func (h *clientHS) serverHelloDone(msg []byte, out *[]byte) *hsError {
 	h.clientFinished = verify
 	*out = append(*out, flight...)
 	h.state = hs12ExpectCCS
-	h.flightEnd = true
 	return nil
 }
 

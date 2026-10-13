@@ -126,13 +126,14 @@ func TestTakeOverResumes(t *testing.T) {
 		version := tc.version
 		t.Run(tc.name, func(t *testing.T) {
 			serverConfig, clientConfig := tlsConfigs(t)
-			if tc.blocking {
-				forceCryptoTLS(serverConfig)
-			}
 			clientConfig.MaxVersion = version
 			clientConfig.ClientSessionCache = stdtls.NewLRUClientSessionCache(4)
 			layers := make(layerOf, 2)
-			_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, layers.handler()))
+			server := NewServer(serverConfig, layers.handler())
+			if tc.blocking {
+				forceCryptoTLS(server)
+			}
+			_, addr := startEchoServer(t, fib.DefaultConfig(), server)
 			for i := 0; i < 2; i++ {
 				conn, err := stdtls.Dial("tcp", addr, clientConfig)
 				if err != nil {
@@ -155,11 +156,12 @@ func TestTakeOverResumes(t *testing.T) {
 	}
 }
 
-// forceCryptoTLS makes a server Config one that handshakes through crypto/tls
-// and not without a worker, so that the takeover from crypto/tls is what a
-// test exercises: it asks for a client certificate if one is offered, which
-// the clients here never offer.
-func forceCryptoTLS(config *stdtls.Config) { config.ClientAuth = stdtls.VerifyClientCertIfGiven }
+// forceCryptoTLS makes a server handshake through crypto/tls and not without a
+// worker, so that the takeover from crypto/tls is what a test exercises.
+func forceCryptoTLS(h *Handler) *Handler {
+	h.Blocking = true
+	return h
+}
 
 // requestKeyUpdate has a taken-over connection update its keys and ask its
 // peer to update theirs, as crypto/tls has no call for.
@@ -461,10 +463,9 @@ func TestTakeOverReleasesConn(t *testing.T) {
 	defer func() { droppedConn = nil }()
 	for _, version := range []uint16{stdtls.VersionTLS12, stdtls.VersionTLS13} {
 		serverConfig, clientConfig := tlsConfigs(t)
-		forceCryptoTLS(serverConfig)
 		clientConfig.MaxVersion = version
 		layers := make(layerOf, 1)
-		_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, layers.handler()))
+		_, addr := startEchoServer(t, fib.DefaultConfig(), forceCryptoTLS(NewServer(serverConfig, layers.handler())))
 		conn, err := stdtls.Dial("tcp", addr, clientConfig)
 		if err != nil {
 			t.Fatal(err)

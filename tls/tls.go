@@ -67,13 +67,16 @@ func (wouldBlockError) Temporary() bool { return true }
 //
 // Handshakes can also run without a worker at all. A client whose Config
 // allows nothing below TLS 1.2 (the default) and asks for nothing beyond
-// client13.go and client12.go (client certificates, session resumption,
-// encrypted client hello), and a server whose Config holds its certificates
-// and asks for no client authentication (nativeServer), take no worker for
-// their handshake. It is a state machine that OnData drives with the bytes
-// that arrive and that never waits, so a peer that is slow to answer, or that
-// never answers, costs the connection's memory and a timer, and no goroutine;
-// thousands of handshakes can be in flight at once. A server serves TLS 1.3
+// client13.go and client12.go (crypto/tls's session resumption, encrypted
+// client hello), and a server whose Config has certificates, its own or
+// GetCertificate's, and no GetConfigForClient (nativeServer), take no worker
+// for their handshake; either side may authenticate the client by its
+// certificate. It is a state machine that OnData drives with the bytes that
+// arrive and that never waits, so a peer that is slow to answer, or that never
+// answers, costs the connection's memory and a timer, and no goroutine;
+// thousands of handshakes can be in flight at once. GetCertificate and
+// GetClientCertificate, which may block, run on a worker of the handshake pool
+// for as long as they take, and the handshake goes on from there (auth.go). A server serves TLS 1.3
 // and 1.2 that way and hands the clients it cannot serve (older versions,
 // 0-RTT, suites or groups it does not implement, a hello that does not parse)
 // to crypto/tls, before it has sent anything, so they see no difference; it
@@ -303,6 +306,7 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 				chs.offerEarly = h.EarlyData && chs.session.maxEarly > 0
 			}
 		}
+		chs.pick.async = t.async(h.inner())
 		hs, hello = chs, chs.hello()
 		if chs.earlyActive {
 			t.early = &earlyWrites{keys: chs.earlyTx, max: chs.session.maxEarly, active: true}
@@ -311,6 +315,7 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 		}
 	} else {
 		shs := newServerHS(h.Config, c, h.ticketKeys())
+		shs.pick.async = t.async(h.inner())
 		if _, ok := h.inner().(EarlyDataHandler); ok && h.EarlyData {
 			shs.tcpEarly, shs.maxEarly = true, cmpOr(h.MaxEarlyData, 16<<10)
 		}
@@ -979,6 +984,23 @@ func (t *layer) feedNative(handler fib.Handler, hs nativeHandshake, data []byte)
 		return
 	}
 	t.completeNative(handler, hs, rest)
+}
+
+// async is how a handshake that runs without a worker calls a certificate
+// callback of the Config, which may block (see auth.go): on a worker of the
+// handshake pool, which then carries the handshake on from where it stopped,
+// with whatever has arrived meanwhile, as OnData would have.
+func (t *layer) async(handler fib.Handler) func(call func()) bool {
+	return func(call func()) bool {
+		return sidepool.Handshake().Go(func() {
+			call()
+			t.readMu.Lock()
+			defer t.readMu.Unlock()
+			if box := t.native.Load(); box != nil {
+				t.feedNative(handler, box.hs, nil)
+			}
+		})
+	}
 }
 
 // serveEarly sees to a server that takes early data: from the end of its flight

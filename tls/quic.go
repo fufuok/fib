@@ -11,6 +11,8 @@ import (
 	"hash"
 	"slices"
 	"time"
+
+	"github.com/lesismal/fib/sidepool"
 )
 
 // The TLS 1.3 handshake of a QUIC connection (RFC 9001), run by the state
@@ -90,18 +92,18 @@ func (q *quicCtx) done() {
 }
 
 // finishQUIC ends a QUIC client's handshake once the server's Finished has been
-// verified: the client's certificate if one was asked for, none, and its
-// Finished go to the server at the handshake level, and both directions move
-// to the application keys.
+// verified: the client's certificate if one was asked for, and its Finished go
+// to the server at the handshake level, and both directions move to the
+// application keys.
 func (h *clientHS) finishQUIC(exporter []byte) *hsError {
 	if h.certReq {
-		// No certificate to offer; see finished.
-		cert := []byte{hsCertificate, 0, 0, byte(1 + len(h.reqCtx) + 3)}
-		cert = append(cert, byte(len(h.reqCtx)))
-		cert = append(cert, h.reqCtx...)
-		cert = append(cert, 0, 0, 0)
-		h.transcript = append(h.transcript, cert...)
-		h.quic.write(stdtls.QUICEncryptionLevelHandshake, cert)
+		msgs, herr := h.certificateMessages13()
+		if herr != nil {
+			return herr
+		}
+		for _, m := range msgs {
+			h.quic.write(stdtls.QUICEncryptionLevelHandshake, m)
+		}
 	}
 	verify, err := h.finishedMAC(h.clientHS)
 	if err != nil {
@@ -223,8 +225,7 @@ func nativeQUICClient(config *stdtls.Config) bool {
 	if config.MaxVersion != 0 && config.MaxVersion < stdtls.VersionTLS13 || config.MinVersion > stdtls.VersionTLS13 {
 		return false
 	}
-	if len(config.Certificates) != 0 || config.GetClientCertificate != nil || config.ClientSessionCache != nil ||
-		config.EncryptedClientHelloConfigList != nil {
+	if config.ClientSessionCache != nil || config.EncryptedClientHelloConfigList != nil || !signingCertificates(config) {
 		return false
 	}
 	if len(config.CurvePreferences) != 0 {
@@ -253,6 +254,10 @@ type QUICConn struct {
 	suites []uint16
 	// sessions is where a client's tickets go and come from.
 	sessions QUICSessionCache
+	// wake, if the QUIC layer set it, has the layer ask for the events of a
+	// handshake that has gone on by itself: once a certificate callback,
+	// which ran on another goroutine, has returned.
+	wake func()
 }
 
 // NewQUICClient returns the handshake of a QUIC client, or nil if config asks
@@ -305,6 +310,36 @@ func (s *QUICServer) NewConn() *QUICConn {
 	return c
 }
 
+// SetWake lets the handshake call the certificate callbacks of the Config,
+// GetCertificate and GetClientCertificate, which may block, on a goroutine of
+// their own: the handshake then waits, with no events to read, until one has
+// returned, and calls wake from that goroutine, after which the QUIC layer
+// reads the events that follow from NextEvent, as it does after HandleData,
+// under whatever lock it holds for that. Without it, the callbacks are called
+// from HandleData, as crypto/tls's QUICConn does. It is set before Start.
+func (c *QUICConn) SetWake(wake func()) {
+	c.wake = wake
+	if c.server != nil {
+		c.server.pick.async = c.async()
+	}
+}
+
+// async is how the handshake runs a certificate callback once the layer has
+// set wake: on a worker of the handshake pool, which wakes the layer once it
+// has returned.
+func (c *QUICConn) async() func(call func()) bool {
+	wake := c.wake
+	if wake == nil {
+		return nil
+	}
+	return func(call func()) bool {
+		return sidepool.Handshake().Go(func() {
+			call()
+			wake()
+		})
+	}
+}
+
 // SetTransportParameters sets the transport parameters sent to the peer. They
 // must be set before Start.
 func (c *QUICConn) SetTransportParameters(params []byte) {
@@ -332,6 +367,7 @@ func (c *QUICConn) Start(ctx context.Context) error {
 		return err
 	}
 	c.client = h
+	h.pick.async = c.async()
 	if c.suites != nil {
 		h.suites = c.suites
 	}
@@ -426,10 +462,50 @@ func (c *QUICConn) resumePending() {
 	case c.client != nil && c.client.pending != nil:
 		pending, c.client.pending = c.client.pending, nil
 	default:
+		c.resumePicked()
 		return
 	}
 	if herr := pending(); herr != nil {
 		c.err = quicError(herr)
+		c.q.events = append(c.q.events, stdtls.QUICEvent{Kind: stdtls.QUICErrorEvent, Err: c.err})
+	}
+}
+
+// waiting reports whether the handshake waits for a certificate callback.
+func (c *QUICConn) waiting() bool {
+	return c.server != nil && c.server.pick.waiting() || c.client != nil && c.client.pick.waiting()
+}
+
+// resumePicked goes on with a handshake that waited for a certificate
+// callback, once it has answered, and with the messages that arrived
+// meanwhile.
+func (c *QUICConn) resumePicked() {
+	if c.err != nil || !c.waiting() {
+		return
+	}
+	var pick *certCall
+	if c.server != nil {
+		pick = &c.server.pick
+	} else {
+		pick = &c.client.pick
+	}
+	waiting, herr := pick.proceed(nil)
+	if waiting {
+		return
+	}
+	if herr != nil {
+		c.err = quicError(herr)
+	} else {
+		for at := range c.in {
+			if len(c.in[at]) > 0 {
+				if err := c.drain(at); err != nil && c.err == nil {
+					c.err = err
+				}
+				break
+			}
+		}
+	}
+	if c.err != nil {
 		c.q.events = append(c.q.events, stdtls.QUICEvent{Kind: stdtls.QUICErrorEvent, Err: c.err})
 	}
 }
@@ -470,7 +546,14 @@ func (c *QUICConn) HandleData(level stdtls.QUICEncryptionLevel, data []byte) err
 		}
 	}
 	c.in[at] = append(c.in[at], data...)
-	for {
+	return c.drain(at)
+}
+
+// drain handles the messages that are whole in what has arrived at level at
+// (0 initial, 1 handshake, 2 application), until the handshake waits for a
+// certificate callback, which leaves the rest for when it has answered.
+func (c *QUICConn) drain(at int) error {
+	for !c.waiting() {
 		buf := c.in[at]
 		if len(buf) < 4 {
 			return nil
@@ -497,6 +580,7 @@ func (c *QUICConn) HandleData(level stdtls.QUICEncryptionLevel, data []byte) err
 			c.in[at] = nil
 		}
 	}
+	return nil
 }
 
 // quicError is the error QUIC turns into a connection error carrying alert.
@@ -557,10 +641,10 @@ func (c *QUICConn) message(level int, msg []byte) *hsError {
 	}
 	h := c.server
 	var want int
-	switch h.state {
-	case srvAwaitHello, srvAwaitHello2:
+	switch {
+	case h.state == srvAwaitHello || h.state == srvAwaitHello2:
 		want = 0
-	case srvAwaitFinished:
+	case h.awaitsClientFlight():
 		want = 1
 	default:
 		want = 2
@@ -586,11 +670,12 @@ func (c *QUICConn) message(level int, msg []byte) *hsError {
 		if len(c.in[level]) != len(msg) {
 			return fail(alertUnexpectedMessage, "handshake data after the ClientHello")
 		}
-	case h.state == srvAwaitFinished && msg[0] == hsFinished:
-		if herr := h.finished(msg, nil); herr != nil {
+	case h.awaitsClientFlight():
+		// The client's certificate if it was asked for one, and its Finished.
+		if herr := h.message(msg, nil); herr != nil {
 			return herr
 		}
-		if len(c.in[level]) != len(msg) {
+		if h.state == srvDone && len(c.in[level]) != len(msg) {
 			return fail(alertUnexpectedMessage, "handshake data after the Finished")
 		}
 	default:

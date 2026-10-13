@@ -120,6 +120,9 @@ type quicRunOptions struct {
 	ticket         stdtls.QUICSessionTicketOptions
 	serverDeclines bool
 	clientDeclines bool
+	// wakes are where the ends that SetWake was given are woken, for the
+	// run to wait on when neither has anything to say.
+	wakes []chan struct{}
 }
 
 func quicRunWith(t *testing.T, client, server quicEnd, chunk int, opts quicRunOptions) (*quicSide, *quicSide, error) {
@@ -173,9 +176,35 @@ func quicRunWith(t *testing.T, client, server quicEnd, chunk int, opts quicRunOp
 		if !moved {
 			cli.events(t)
 			srv.events(t)
+			if !cli.pending() && !srv.pending() && !(cli.done && srv.done) && len(opts.wakes) > 0 {
+				// An end waits for a certificate callback on another
+				// goroutine.
+				var a, b chan struct{}
+				a = opts.wakes[0]
+				if len(opts.wakes) > 1 {
+					b = opts.wakes[1]
+				}
+				select {
+				case <-a:
+				case <-b:
+				case <-time.After(5 * time.Second):
+					return cli, srv, errors.New("neither end was woken")
+				}
+			}
 		}
 	}
 	return cli, srv, errors.New("the handshake never finished")
+}
+
+// pending reports whether the side has written what its peer has not been
+// given.
+func (s *quicSide) pending() bool {
+	for _, out := range s.out {
+		if len(out) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // quicCheck checks that two ends that finished agree.
@@ -442,8 +471,11 @@ func TestQUICQualification(t *testing.T) {
 	if NewQUICClient(&stdtls.Config{ClientSessionCache: stdtls.NewLRUClientSessionCache(1)}) != nil {
 		t.Error("a client with a session cache qualifies")
 	}
-	if NewQUICClient(&stdtls.Config{Certificates: []stdtls.Certificate{cert}}) != nil {
-		t.Error("a client with certificates qualifies")
+	if NewQUICClient(&stdtls.Config{ServerName: "a", Certificates: []stdtls.Certificate{cert}}) == nil {
+		t.Error("a client with certificates does not qualify")
+	}
+	if NewQUICClient(&stdtls.Config{ServerName: "a", Certificates: []stdtls.Certificate{{Certificate: [][]byte{{1}}, PrivateKey: "no"}}}) != nil {
+		t.Error("a client with a key that cannot sign qualifies")
 	}
 	if NewQUICClient(&stdtls.Config{ServerName: "a"}) == nil {
 		t.Error("an ordinary client does not qualify")
@@ -451,8 +483,14 @@ func TestQUICQualification(t *testing.T) {
 	if NewQUICServer(&stdtls.Config{}) != nil {
 		t.Error("a server without certificates qualifies")
 	}
-	if NewQUICServer(&stdtls.Config{Certificates: []stdtls.Certificate{cert}, GetCertificate: func(*stdtls.ClientHelloInfo) (*stdtls.Certificate, error) { return nil, nil }}) != nil {
-		t.Error("a server with GetCertificate qualifies")
+	if NewQUICServer(&stdtls.Config{GetCertificate: func(*stdtls.ClientHelloInfo) (*stdtls.Certificate, error) { return nil, nil }}) == nil {
+		t.Error("a server with GetCertificate does not qualify")
+	}
+	if NewQUICServer(&stdtls.Config{Certificates: []stdtls.Certificate{cert}, ClientAuth: stdtls.RequireAndVerifyClientCert}) == nil {
+		t.Error("a server that authenticates clients does not qualify")
+	}
+	if NewQUICServer(&stdtls.Config{Certificates: []stdtls.Certificate{cert}, GetConfigForClient: func(*stdtls.ClientHelloInfo) (*stdtls.Config, error) { return nil, nil }}) != nil {
+		t.Error("a server with GetConfigForClient qualifies")
 	}
 	if NewQUICServer(&stdtls.Config{Certificates: []stdtls.Certificate{cert}}) == nil {
 		t.Error("an ordinary server does not qualify")

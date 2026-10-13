@@ -499,10 +499,15 @@ func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isC
 	return c
 }
 
-// newTLS makes the connection's TLS handshake.
+// newTLS makes the connection's TLS handshake. One that can go on by itself,
+// once a certificate callback it ran on another goroutine has returned, is
+// given wakeTLS to say so.
 func (c *Conn) newTLS() TLSConn {
 	if c.config.NewTLS != nil {
 		if t := c.config.NewTLS(c.isClient, c.config.TLSConfig); t != nil {
+			if w, ok := t.(interface{ SetWake(func()) }); ok {
+				w.SetWake(c.wakeTLS)
+			}
 			return t
 		}
 	}
@@ -1372,6 +1377,23 @@ func (c *Conn) feedCrypto(space int, off uint64, data []byte) error {
 			return nil
 		}
 	}
+}
+
+// wakeTLS takes the events of a handshake that has gone on by itself, and sends
+// what they have to send. It is called from the goroutine that ran the
+// certificate callback the handshake waited for.
+func (c *Conn) wakeTLS() {
+	c.mu.Lock()
+	if !c.closed && c.tls != nil {
+		if err := c.processTLSEvents(); err != nil {
+			c.closeLocked(err)
+		}
+		c.wantFlush = true
+	}
+	givenUp := c.takeGivenUpLocked()
+	c.mu.Unlock()
+	closePaths(givenUp)
+	c.dispatch()
 }
 
 // tlsError turns a TLS failure into the transport error that carries its

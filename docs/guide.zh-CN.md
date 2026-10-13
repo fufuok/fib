@@ -427,18 +427,23 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
 - **握手也可以完全不占协程**（客户端和服务端都是）。这时握手是一个状态机：由 `OnData` 把收到的字节喂给它，它返回要回的
   字节和是否完成，**从不等待**。对端迟迟不回应、或者根本不回应的握手只占连接的内存和一个定时器，没有 goroutine，几千个
   握手同时在途也不增加协程数；超时由 `HandshakeTimeout`（默认 10 秒）关闭连接。
-  - **客户端**（`tls/client13.go`、`tls/client12.go`）：`tls.Config` 的最低版本不低于 TLS 1.2（`MinVersion` 为 0 就是）且不用客户端证书、
-    会话恢复（`ClientSessionCache`）、ECH 时默认走这条路径。同一个 ClientHello 同时提供 TLS 1.3 和 1.2，由服务端选；
+  - **客户端**（`tls/client13.go`、`tls/client12.go`）：`tls.Config` 的最低版本不低于 TLS 1.2（`MinVersion` 为 0 就是）且不用
+    `crypto/tls` 的会话恢复（`ClientSessionCache`）、ECH 时默认走这条路径。同一个 ClientHello 同时提供 TLS 1.3 和 1.2，由服务端选；
     支持 TLS 1.3 的 AES-GCM 套件和 TLS 1.2 的 ECDHE + AES-GCM / AES-CBC 套件、X25519 / P-256 / P-384、HelloRetryRequest、
     ALPN、SNI、扩展主密钥、降级检测、按 `RootCAs` / `InsecureSkipVerify` 校验服务端证书并验证签名（ECDSA、RSA-PSS、
-    RSA PKCS#1、Ed25519）、`VerifyPeerCertificate` / `VerifyConnection`、`KeyLogWriter`、`Config.CipherSuites`，服务端要求
-    客户端证书时回一个空 Certificate。`MinVersion` 设成 TLS 1.0 / 1.1 的配置仍走 `crypto/tls`。
-  - **服务端**（`tls/server13.go`、`tls/server12.go`）：`Config` 自带 `Certificates`、不要求客户端认证、没有 `GetCertificate` /
-    `GetConfigForClient`（它们要的 `ClientHelloInfo` 只有 `crypto/tls` 能构造）时，TLS 1.3 和 TLS 1.2 的握手都走状态机。
+    RSA PKCS#1、Ed25519）、`VerifyPeerCertificate` / `VerifyConnection`、`KeyLogWriter`、`Config.CipherSuites`。服务端要求
+    客户端证书时，和 `crypto/tls` 一样出示 `GetClientCertificate` 返回的证书，或 `Certificates` 里第一张符合服务端 CA 列表和签名方案的证书
+    （都没有就回空 Certificate），并用 CertificateVerify 证明持有私钥。`MinVersion` 设成 TLS 1.0 / 1.1 的配置仍走 `crypto/tls`。
+  - **服务端**（`tls/server13.go`、`tls/server12.go`）：`Config` 有证书（`Certificates` 或 `GetCertificate`）、没有
+    `GetConfigForClient` 时，TLS 1.3 和 TLS 1.2 的握手都走状态机；客户端认证（`ClientAuth` 的各个模式、`ClientCAs`、
+    `VerifyPeerCertificate`）也在状态机里做，结果和 `crypto/tls` 一致，`ConnectionState` 带 `PeerCertificates` / `VerifiedChains`，
+    客户端证书随会话票据保存，恢复的会话同样带上。
     服务端先读完 ClientHello 再决定：客户端不提供 `Config` 范围内的 TLS 1.3 / 1.2（比如只有 TLS 1.0 / 1.1，而 `MinVersion` 允许）、
     没有 AES-GCM 套件（TLS 1.3）或没有 ECDHE 套件 / 证书能签的签名方案 / 共同曲线（TLS 1.2）的、ClientHello
-    解析不了的，**在服务端什么都还没发之前**把已收到的字节原样交给 `crypto/tls`，客户端看不出区别。证书按 `ServerName`
-    在 `Certificates` 里选（`SupportsCertificate`），ALPN 的选择和 `crypto/tls` 一致（包括 HTTP/1.1 客户端连 h2 服务端的特例），
+    解析不了的，**在服务端什么都还没发之前**把已收到的字节原样交给 `crypto/tls`，客户端看不出区别。证书按 `crypto/tls` 的规则选：有 `GetCertificate`
+    时先问它，否则按 `ServerName` 在 `Certificates` 里选（`SupportsCertificate`）。`GetCertificate` / `GetClientCertificate`
+    可能阻塞（autocert 第一次签发要访问 ACME），所以不在驱动握手的协程（engine 的 loop / worker、QUIC 连接的数据处理）上调用，而是交给
+    握手池的一个 worker，回调返回后由这个 worker 接着推进状态机；worker 只在回调期间被占用，不像 `crypto/tls` 那样占满整个握手。ALPN 的选择和 `crypto/tls` 一致（包括 HTTP/1.1 客户端连 h2 服务端的特例），
     支持 HelloRetryRequest（1.3）、扩展主密钥、安全重协商标记、降级标记（服务端也支持 1.3 时，1.2 的 ServerHello 随机数结尾带
     `DOWNGRD\x01`）、OCSP / SCT、`CipherSuites`（1.2）、`VerifyConnection`、`KeyLogWriter`。TLS 1.2 只用 ECDHE（AES-GCM、
     AES-CBC），不支持 RSA 密钥交换（`crypto/tls` 默认也不再提供）。

@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	stdtls "crypto/tls"
 	"encoding/binary"
+	"slices"
 	"sync"
 	"time"
 )
@@ -162,6 +163,10 @@ type ticketState struct {
 	earlyData bool
 	alpn      string
 	extra     [][]byte
+	// certs are the certificates the client authenticated with, if it did,
+	// and chains those they were verified with.
+	certs  [][]byte
+	chains [][][]byte
 }
 
 // sealRaw seals plain under the current key.
@@ -203,9 +208,10 @@ func (t *ticketKeys) seal(s ticketState, now time.Time) ([]byte, bool) {
 	plain = append(plain, s.psk...)
 	plain = binary.BigEndian.AppendUint16(plain, uint16(len(s.server)))
 	plain = append(plain, s.server...)
-	if s.earlyData || len(s.extra) != 0 {
+	if s.earlyData || len(s.extra) != 0 || len(s.certs) != 0 {
 		// After the server name: whether early data is allowed, the protocol,
-		// and the extra data of the QUIC layer.
+		// and the extra data of the QUIC layer; then the client's
+		// certificates, if it sent any.
 		early := byte(0)
 		if s.earlyData {
 			early = 1
@@ -217,18 +223,83 @@ func (t *ticketKeys) seal(s ticketState, now time.Time) ([]byte, bool) {
 			plain = binary.BigEndian.AppendUint16(plain, uint16(len(e)))
 			plain = append(plain, e...)
 		}
+		var ok bool
+		if plain, ok = appendPeer(plain, s.certs, s.chains); !ok {
+			return nil, false
+		}
 	}
 	return t.sealRaw(plain, now)
 }
 
+// appendPeer appends the client's certificates and their verified chains, if
+// it sent any: a count and the certificates, each with its length, then a
+// count of chains and each chain the same way. It reports false if they do
+// not fit a ticket, which is then not issued: a session resumed without them
+// would lose who the client is.
+func appendPeer(plain []byte, certs [][]byte, chains [][][]byte) ([]byte, bool) {
+	if len(certs) == 0 {
+		return plain, true
+	}
+	if len(certs) > 255 || len(chains) > 255 || slices.ContainsFunc(chains, func(c [][]byte) bool { return len(c) > 255 }) {
+		return plain, false
+	}
+	appendList := func(plain []byte, list [][]byte) []byte {
+		plain = append(plain, byte(len(list)))
+		for _, der := range list {
+			plain = append(plain, byte(len(der)>>16), byte(len(der)>>8), byte(len(der)))
+			plain = append(plain, der...)
+		}
+		return plain
+	}
+	plain = appendList(plain, certs)
+	plain = append(plain, byte(len(chains)))
+	for _, chain := range chains {
+		plain = appendList(plain, chain)
+	}
+	// The ticket goes in a field of up to 64 KiB, with its key name, nonce
+	// and tag.
+	return plain, len(plain) <= maxTicketPlain
+}
+
+const maxTicketPlain = 0xffff - ticketNameLen - 64
+
+// readPeer reads back what appendPeer wrote, which is all that is left of
+// plain, or nothing.
+func readPeer(plain []byte) (certs [][]byte, chains [][][]byte, ok bool) {
+	if len(plain) == 0 {
+		return nil, nil, true
+	}
+	r := newReader(plain)
+	readList := func() [][]byte {
+		n := int(r.u8())
+		list := make([][]byte, 0, n)
+		for i := 0; i < n && r.ok; i++ {
+			list = append(list, bytes.Clone(r.vec24()))
+		}
+		return list
+	}
+	certs = readList()
+	n := int(r.u8())
+	for i := 0; i < n && r.ok; i++ {
+		chains = append(chains, readList())
+	}
+	if !r.empty() || len(certs) == 0 {
+		return nil, nil, false
+	}
+	return certs, chains, true
+}
+
 // ticketState12 is what a TLS 1.2 ticket holds (RFC 5077): the session's
-// master secret, and what must match for it to be used again.
+// master secret, what must match for it to be used again, and the client's
+// certificates, as ticketState has them.
 type ticketState12 struct {
 	suite   uint16
 	created time.Time
 	master  []byte
 	ems     bool
 	server  string
+	certs   [][]byte
+	chains  [][][]byte
 }
 
 func (t *ticketKeys) seal12(s ticketState12, now time.Time) ([]byte, bool) {
@@ -243,6 +314,10 @@ func (t *ticketKeys) seal12(s ticketState12, now time.Time) ([]byte, bool) {
 	plain = append(plain, s.master...)
 	plain = binary.BigEndian.AppendUint16(plain, uint16(len(s.server)))
 	plain = append(plain, s.server...)
+	plain, ok := appendPeer(plain, s.certs, s.chains)
+	if !ok {
+		return nil, false
+	}
 	return t.sealRaw(plain, now)
 }
 
@@ -262,10 +337,13 @@ func (t *ticketKeys) open12(ticket []byte, now time.Time) (ticketState12, bool) 
 	}
 	s.master, plain = plain[:n], plain[n:]
 	m := int(binary.BigEndian.Uint16(plain))
-	if len(plain) != 2+m {
+	if len(plain) < 2+m {
 		return ticketState12{}, false
 	}
-	s.server = string(plain[2:])
+	s.server = string(plain[2 : 2+m])
+	if s.certs, s.chains, ok = readPeer(plain[2+m:]); !ok {
+		return ticketState12{}, false
+	}
 	if age := now.Sub(s.created); age < -time.Minute || age > ticketLifetime {
 		return ticketState12{}, false
 	}
@@ -320,7 +398,7 @@ func (t *ticketKeys) open(ticket []byte, now time.Time) (ticketState, bool) {
 			s.extra = append(s.extra, bytes.Clone(plain[2:2+l]))
 			plain = plain[2+l:]
 		}
-		if len(plain) != 0 {
+		if s.certs, s.chains, ok = readPeer(plain); !ok {
 			return ticketState{}, false
 		}
 	}
