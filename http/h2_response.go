@@ -64,7 +64,7 @@ func (st *h2ServerStream) beginResponse(req *stdhttp.Request, status int, header
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	if sc.closed || st.reset {
-		return errH2StreamClosed
+		return st.closedErrLocked()
 	}
 	if st.responded {
 		return ErrResponseWritten
@@ -100,7 +100,7 @@ func (st *h2ServerStream) writeBody(p []byte, wait bool) error {
 	defer sc.mu.Unlock()
 	for {
 		if sc.closed || st.reset || st.out == nil || st.out.ending {
-			return errH2StreamClosed
+			return st.closedErrLocked()
 		}
 		if len(p) == 0 {
 			break
@@ -162,7 +162,7 @@ func (st *h2ServerStream) endResponse(trailer stdhttp.Header, complete bool) err
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	if sc.closed || st.reset || st.out == nil || st.out.ending {
-		return errH2StreamClosed
+		return st.closedErrLocked()
 	}
 	if !complete {
 		if feed := st.feed; feed != nil && !st.remoteDone {

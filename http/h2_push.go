@@ -126,6 +126,7 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 	sc.pushedStreams++
 	sc.sendLocked(h2AppendPushPromise(nil, st.id, id, block, sc.peerMaxFrame))
 	sc.mu.Unlock()
+	sc.armWriteTimeout(promised)
 
 	// Its handler runs here, on the goroutine of the one pushing it, which
 	// may be the one reading the connection.

@@ -118,14 +118,19 @@ type Config struct {
 	// IdleTimeout bounds how long a kept-alive connection may sit between
 	// requests. Zero means ReadTimeout; both zero means no limit.
 	IdleTimeout time.Duration
-	// WriteTimeout bounds how long an HTTP/1 response may take to be written,
-	// measured from when its request has all arrived, as net/http.Server's
-	// does. A handler that streams its response to a client that stops
-	// reading waits for the client to take what is queued (see Context.Write);
-	// once the timeout has passed with output still queued, the connection is
-	// closed and the handler's Write reports it, and a Write made after it has
-	// passed fails, closing the connection too. Zero means no limit. HTTP/2
-	// and HTTP/3 responses are not bounded by it.
+	// WriteTimeout bounds how long a response may take to be written,
+	// measured from when its handler is called, as net/http.Server's does. A
+	// handler that streams its response to a client that stops reading waits
+	// for the client to take what it wrote (see Context.Write), which this
+	// bounds. On HTTP/1, once it has passed with output still queued, the
+	// connection is closed and the handler's Write reports it, and a Write
+	// made after it has passed fails, closing the connection too. On HTTP/2 it
+	// applies to each stream on its own, as net/http's does: a stream whose
+	// response has not all gone by then is reset with INTERNAL_ERROR, which
+	// ends that request, not the connection its client shares with others;
+	// a handler waiting to write is let go, its Context is cancelled, and a
+	// Write made after it has passed fails with os.ErrDeadlineExceeded. Zero
+	// means no limit. HTTP/3 has http3.Config.WriteTimeout.
 	WriteTimeout time.Duration
 	// StreamRequestBodyBuffer is how many bytes of a streamed HTTP/1 body may
 	// wait unread before the connection stops reading its socket, so that a

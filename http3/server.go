@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"net"
 	stdhttp "net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +102,15 @@ type Config struct {
 	// Keep it below the engine's UDPIdleTimeout, or the engine closes a
 	// quiet peer first.
 	MaxIdleTimeout time.Duration
+	// WriteTimeout bounds how long a response may take to be written,
+	// measured from when its handler is called, for each request on its own,
+	// as http.Config.WriteTimeout does on HTTP/2. A stream whose handler has
+	// not finished writing its response by then is reset with
+	// H3_INTERNAL_ERROR, which ends that request and leaves the rest of the
+	// connection serving: a handler waiting for a client that stopped taking
+	// its body is let go, its Context is cancelled, and a Write made after it
+	// has passed fails with os.ErrDeadlineExceeded. Zero means no limit.
+	WriteTimeout time.Duration
 	// MaxDatagramSize is the largest UDP payload the server sends once a
 	// connection's handshake is over, if the client allows it. Zero means
 	// 1200 bytes, which every path carries; a network known to carry more
@@ -724,7 +734,11 @@ func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
 		rs.cancel(net.ErrClosed)
 		rs.mu.Lock()
 		rs.closed = true
+		stopped := rs.stopWriteTimerLocked()
 		rs.mu.Unlock()
+		if stopped {
+			rs.unref()
+		}
 		rs.failBody(net.ErrClosed)
 	}
 }
@@ -809,6 +823,12 @@ type requestStream struct {
 	// expected is set while the connection expects the response, and holds
 	// what it has to send for it; see quic.Conn.ExpectWrite.
 	expected bool
+	// timedOut marks a stream reset because its response outlasted
+	// Config.WriteTimeout, which writing to it then reports.
+	timedOut bool
+	// writeTimer resets the stream once Config.WriteTimeout has passed, or
+	// is nil; see armWriteTimeout.
+	writeTimer *time.Timer
 
 	// block is the request, its URL and the Context it is answered through,
 	// allocated with the stream, and values holds its header's values.
@@ -894,7 +914,7 @@ func (rs *requestStream) recycle() {
 	rs.declared, rs.trailers, rs.done = 0, false, false
 	rs.streamed, rs.tunnel = nil, nil
 	rs.remoteDone, rs.responded, rs.closed, rs.upgraded, rs.expected = false, false, false, false, false
-	rs.streaming = false
+	rs.streaming, rs.timedOut, rs.writeTimer = false, false, nil
 	rs.values = [requestValues]string{}
 	rs.pooled, rs.nextDead, rs.headerFromPool = false, nil, nil
 	rs.refs.Store(0)
@@ -903,7 +923,7 @@ func (rs *requestStream) recycle() {
 // requestValues is how many of a request's header values its stream has
 // room for when the stream is not recycled; a recycled one keeps them in the
 // header it takes from the pool. It is also what keeps a requestStream
-// within 896 bytes, one of the allocator's size classes; one more value
+// at 896 bytes, one of the allocator's size classes; one more value
 // would put it in the class of 1024.
 const requestValues = 2
 
@@ -1190,6 +1210,7 @@ func (rs *requestStream) startStream(buffered []byte) {
 	b.addSkip(len(buffered))
 	_ = b.feed.Write(buffered)
 	bufferpool.Put(buffered)
+	rs.armWriteTimeout()
 	sc.h.streams.Queue(&sc.batch, &sc.gate, sc.conn, sc.h.handler, &rs.block)
 }
 
@@ -1227,6 +1248,7 @@ func (rs *requestStream) finish() {
 	rs.expected = true
 	rs.mu.Unlock()
 	sc.qc.ExpectWrite()
+	rs.armWriteTimeout()
 	// Served through fibhttp rather than by calling the handler, so that a
 	// handler which retains the request, or reads its body through OnBody,
 	// works here too. The pool runs it away from this goroutine, which reads
@@ -1246,7 +1268,11 @@ func (rs *requestStream) abort(code ErrorCode) {
 	rs.cancel(err)
 	rs.mu.Lock()
 	rs.closed = true
+	stopped := rs.stopWriteTimerLocked()
 	rs.mu.Unlock()
+	if stopped {
+		rs.unref()
+	}
 	abortStream(rs.s, code)
 	if rs.req != nil {
 		rs.sc.untrack(rs)
@@ -1292,7 +1318,11 @@ func (rs *requestStream) peerReset() {
 	rs.mu.Lock()
 	wasOpen := !rs.closed && (!rs.responded || rs.upgraded || rs.streaming)
 	rs.closed = true
+	stopped := rs.stopWriteTimerLocked()
 	rs.mu.Unlock()
+	if stopped {
+		rs.unref()
+	}
 	if wasOpen {
 		rs.s.Reset(uint64(ErrCodeRequestCancelled))
 		if rs.req != nil {
@@ -1320,14 +1350,20 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 		rs.mu.Unlock()
 		return errors.New("http: response already written")
 	case rs.closed:
+		err := rs.closedErrLocked()
 		rs.mu.Unlock()
-		return errStreamClosed
+		return err
 	}
 	rs.responded = true
 	// The write the connection was told to expect ends that as it is made.
 	expected := rs.expected
 	rs.expected = false
+	// The response is the stream's to send from here; the clock stops.
+	stopped := rs.stopWriteTimerLocked()
 	rs.mu.Unlock()
+	if stopped {
+		rs.unref()
+	}
 
 	// The field sections go back to the pool once the frames are built from
 	// them; the frames' own buffer the stream takes over.
@@ -1409,6 +1445,75 @@ func appendTrailer(out []byte, trailer stdhttp.Header) []byte {
 	return out
 }
 
+// armWriteTimeout starts the clock Config.WriteTimeout puts on the response,
+// as the handler is about to run: once it has run out, a stream whose
+// response its handler has not finished writing is reset, as net/http's
+// HTTP/2 server resets a stream, ending the stream rather than the
+// connection its client shares with others. A handler waiting for the client
+// to take what it wrote is let go, its Context is cancelled, and what it
+// writes from then on fails with os.ErrDeadlineExceeded. The timer holds a
+// reference to the stream until it is stopped or has run. Without a
+// WriteTimeout there is no timer.
+func (rs *requestStream) armWriteTimeout() {
+	d := rs.sc.h.config.WriteTimeout
+	if d <= 0 {
+		return
+	}
+	rs.refs.Add(1)
+	rs.mu.Lock()
+	rs.writeTimer = time.AfterFunc(d, rs.writeTimedOut)
+	rs.mu.Unlock()
+}
+
+// stopWriteTimerLocked stops the write timer, if there is one, and reports
+// whether the caller is to give up the reference it held, which it is to do
+// once it has let go of rs.mu; a timer that has fired gives it up itself.
+func (rs *requestStream) stopWriteTimerLocked() bool {
+	t := rs.writeTimer
+	rs.writeTimer = nil
+	return t != nil && t.Stop()
+}
+
+// writeTimedOut resets a stream whose response outlasted Config.WriteTimeout;
+// see armWriteTimeout.
+func (rs *requestStream) writeTimedOut() {
+	defer rs.unref()
+	rs.mu.Lock()
+	open := rs.writeTimer != nil && !rs.closed && (!rs.responded || rs.streaming)
+	rs.writeTimer = nil
+	if open {
+		rs.closed, rs.timedOut = true, true
+	}
+	rs.mu.Unlock()
+	if !open {
+		return
+	}
+	rs.block.Cancel(os.ErrDeadlineExceeded)
+	rs.failBody(os.ErrDeadlineExceeded)
+	// Resetting the stream lets a writer waiting in WaitSendable go.
+	abortStream(rs.s, ErrCodeInternalError)
+	// A handler that has written nothing yet would otherwise keep the
+	// connection holding what it sends for the write it expects.
+	rs.writeDone()
+	rs.sc.untrack(rs)
+}
+
+// closedErrLocked is what writing to rs reports once it has been closed.
+// Callers hold rs.mu.
+func (rs *requestStream) closedErrLocked() error {
+	if rs.timedOut {
+		return os.ErrDeadlineExceeded
+	}
+	return errStreamClosed
+}
+
+// closedErr is closedErrLocked for a caller without rs.mu.
+func (rs *requestStream) closedErr() error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.closedErrLocked()
+}
+
 // writeDone tells the connection, once, that the response finish told it to
 // expect has been written.
 func (rs *requestStream) writeDone() {
@@ -1432,8 +1537,9 @@ func (rs *requestStream) WriteInterim(status int, header stdhttp.Header) error {
 		rs.mu.Unlock()
 		return errors.New("http: interim response after the final one")
 	case rs.closed:
+		err := rs.closedErrLocked()
 		rs.mu.Unlock()
-		return errStreamClosed
+		return err
 	}
 	rs.mu.Unlock()
 	block := append([]byte(nil), qpack.Prefix...)

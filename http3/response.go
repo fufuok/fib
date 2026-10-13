@@ -41,8 +41,9 @@ func (rs *requestStream) BeginResponse(req *stdhttp.Request, status int, header 
 		rs.mu.Unlock()
 		return fibhttp.ErrResponseWritten
 	case rs.closed:
+		err := rs.closedErrLocked()
 		rs.mu.Unlock()
-		return errStreamClosed
+		return err
 	}
 	rs.responded, rs.streaming = true, true
 	rs.mu.Unlock()
@@ -58,7 +59,7 @@ func (rs *requestStream) BeginResponse(req *stdhttp.Request, status int, header 
 	out := appendHeadersFrame(bufferpool.Get(len(block) + 16)[:0], block)
 	bufferpool.Put(block)
 	if err := rs.s.WriteOwned(out, false); err != nil {
-		return errStreamClosed
+		return rs.closedErr()
 	}
 	return nil
 }
@@ -73,7 +74,7 @@ func (rs *requestStream) WriteBody(p []byte, wait bool) error {
 	for len(p) > 0 {
 		if wait {
 			if err := rs.s.WaitSendable(maxUnsentOutput); err != nil {
-				return errStreamClosed
+				return rs.closedErr()
 			}
 		}
 		n := len(p)
@@ -84,7 +85,7 @@ func (rs *requestStream) WriteBody(p []byte, wait bool) error {
 		out = appendFrameHeader(out, frameData, n)
 		out = append(out, p[:n]...)
 		if err := rs.s.WriteOwned(out, false); err != nil {
-			return errStreamClosed
+			return rs.closedErr()
 		}
 		p = p[n:]
 	}
@@ -98,15 +99,20 @@ func (rs *requestStream) WriteBody(p []byte, wait bool) error {
 func (rs *requestStream) EndResponse(trailer stdhttp.Header, complete bool) error {
 	rs.mu.Lock()
 	if rs.closed || !rs.streaming {
+		err := rs.closedErrLocked()
 		rs.mu.Unlock()
-		return errStreamClosed
+		return err
 	}
 	rs.streaming = false
 	remoteDone := rs.remoteDone
 	if !complete {
 		rs.closed = true
 	}
+	stopped := rs.stopWriteTimerLocked()
 	rs.mu.Unlock()
+	if stopped {
+		rs.unref()
+	}
 	var err error
 	if complete {
 		var out []byte

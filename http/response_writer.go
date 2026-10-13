@@ -184,8 +184,8 @@ func (c *Context) WriteHeader(status int) {
 // taken them, Write waits for the client to take some, or for the connection
 // to end, which it then reports. On HTTP/2 and HTTP/3 Write waits the same
 // way once 64 kilobytes are held back by flow control, for the client to take
-// some or for the stream to end. Config.WriteTimeout bounds the wait on
-// HTTP/1. A handler its multiplexed connection runs on its own reader, which
+// some or for the stream to end. Config.WriteTimeout, and HTTP/3's, bound the
+// wait. A handler its multiplexed connection runs on its own reader, which
 // StreamPoolConfig describes, is the exception, since the client's go-ahead
 // would arrive on the goroutine that is waiting: what it writes is held
 // until it can go.

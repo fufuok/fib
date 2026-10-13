@@ -78,6 +78,7 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 	sc.streams[1] = st
 	sc.lastStreamID = 1
 	sc.mu.Unlock()
+	sc.armWriteTimeout(st)
 	// The server preface has gone out, so the response to this request may
 	// now be framed from wherever it is served.
 	sc.serve(&Context{Conn: c, Request: request, stream: st})

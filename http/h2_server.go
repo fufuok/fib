@@ -12,6 +12,7 @@ import (
 	stdhttp "net/http"
 	"net/textproto"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -187,11 +188,17 @@ type h2ServerStream struct {
 	responded  bool
 	// trailer is what the response sends after its body, once the body is
 	// out. Guarded by the connection's mu.
-	trailer    stdhttp.Header
-	localDone  bool
-	reset      bool
+	trailer   stdhttp.Header
+	localDone bool
+	reset     bool
+	// timedOut marks a stream reset because its response outlasted
+	// Config.WriteTimeout, which writing to it then reports.
+	timedOut   bool
 	sendWindow int64
 	pending    []byte
+	// writeTimer resets the stream once Config.WriteTimeout has passed, or
+	// is nil; see armWriteTimeout. Guarded by the connection's mu.
+	writeTimer *time.Timer
 	// out is what the stream keeps while its response streams, or nil; see
 	// h2Output. It is set as the response begins and never changes after.
 	out *h2Output
@@ -219,7 +226,7 @@ type h2ServerStream struct {
 
 // h2RequestValues is how many of a request's header values its stream has
 // room for, which is about what a browser's request carries. It is also what
-// keeps an h2ServerStream at 1016 bytes on a 64-bit platform, just inside the
+// keeps an h2ServerStream at 1024 bytes on a 64-bit platform, which fills the
 // allocator's size class of 1024; one more would put it in the next.
 const h2RequestValues = 8
 
@@ -1017,6 +1024,7 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 	st.body = nil
 	// The Context holds the stream from here until it ends.
 	st.refs.Add(1)
+	sc.armWriteTimeout(st)
 	sc.handler.streams.Serve(&sc.gate, sc.conn, sc.handler.handler, &st.block)
 	return nil
 }
@@ -1057,6 +1065,7 @@ func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered []byte) {
 	sc.mu.Unlock()
 	_ = st.feed.Write(buffered)
 	bufferpool.Put(buffered)
+	sc.armWriteTimeout(st)
 	sc.handler.streams.Serve(&sc.gate, sc.conn, sc.handler.handler, &st.block)
 }
 
@@ -1145,7 +1154,68 @@ func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
 func (sc *h2ServerConn) failBodiesLocked(err error) {
 	for _, st := range sc.streams {
 		sc.failBodyLocked(st, err)
+		sc.stopWriteTimerLocked(st)
 	}
+}
+
+// armWriteTimeout starts the clock Config.WriteTimeout puts on st's
+// response, as its handler is about to run: once it has run out, a stream
+// whose response has not all gone is reset with INTERNAL_ERROR, as
+// net/http's HTTP/2 server does, ending the stream rather than the
+// connection its client shares with others. A handler waiting for the
+// client to take what it wrote is let go, its Context is cancelled, and what
+// it writes from then on fails with os.ErrDeadlineExceeded. The timer holds a
+// reference to the stream until it is stopped or has run. Without a
+// WriteTimeout there is no timer.
+func (sc *h2ServerConn) armWriteTimeout(st *h2ServerStream) {
+	d := sc.handler.config.WriteTimeout
+	if d <= 0 {
+		return
+	}
+	sc.mu.Lock()
+	if !sc.closed && sc.streams[st.id] == st {
+		st.refs.Add(1)
+		st.writeTimer = time.AfterFunc(d, st.writeTimedOut)
+	}
+	sc.mu.Unlock()
+}
+
+// stopWriteTimerLocked stops st's write timer, if it has one, and gives up
+// the reference it held, unless it has fired: the reference is then the
+// firing's to give up.
+func (sc *h2ServerConn) stopWriteTimerLocked(st *h2ServerStream) {
+	if t := st.writeTimer; t != nil {
+		st.writeTimer = nil
+		if t.Stop() {
+			st.unref()
+		}
+	}
+}
+
+// writeTimedOut resets a stream whose response outlasted Config.WriteTimeout;
+// see armWriteTimeout.
+func (st *h2ServerStream) writeTimedOut() {
+	sc := st.sc
+	sc.mu.Lock()
+	if !sc.closed && sc.streams[st.id] == st {
+		st.writeTimer = nil
+		st.timedOut = true
+		sc.failBodyLocked(st, os.ErrDeadlineExceeded)
+		sc.sendLocked(h2AppendRSTStream(nil, st.id, H2InternalError))
+		sc.forgetLocked(st)
+		sc.closeFinishedLocked()
+	}
+	sc.mu.Unlock()
+	st.unref()
+}
+
+// closedErrLocked is what writing to st reports once it has been reset, or
+// its connection has ended.
+func (st *h2ServerStream) closedErrLocked() error {
+	if st.timedOut {
+		return os.ErrDeadlineExceeded
+	}
+	return errH2StreamClosed
 }
 
 // serve runs the handler for a request that has been framed, on the stream
@@ -1240,7 +1310,7 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	if sc.closed || st.reset {
-		return errH2StreamClosed
+		return st.closedErrLocked()
 	}
 	if st.responded {
 		return errors.New("http: response already written")
@@ -1379,7 +1449,7 @@ func (st *h2ServerStream) writeInterim(status int, header stdhttp.Header) error 
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	if sc.closed || st.reset {
-		return errH2StreamClosed
+		return st.closedErrLocked()
 	}
 	if st.responded {
 		return errors.New("http: interim response after the final one")
@@ -1394,6 +1464,7 @@ func (st *h2ServerStream) writeInterim(status int, header stdhttp.Header) error 
 // forgetLocked drops a stream that is finished or reset.
 func (sc *h2ServerConn) forgetLocked(st *h2ServerStream) {
 	st.reset = st.reset || !st.localDone
+	sc.stopWriteTimerLocked(st)
 	st.pending = nil
 	if o := st.out; o != nil {
 		bufferpool.Put(o.buf)
@@ -1477,6 +1548,7 @@ func (st *h2ServerStream) recycle() {
 	st.body, st.declared, st.recvWindow, st.recvUnacked = nil, 0, 0, 0
 	st.feed, st.creditSkip = nil, 0
 	st.remoteDone, st.responded, st.trailer, st.localDone, st.reset = false, false, nil, false, false
+	st.timedOut, st.writeTimer = false, nil
 	st.sendWindow, st.pending, st.out, st.tunnel = 0, nil, nil, nil
 	st.pooled, st.nextDead, st.headerFromPool = false, nil, nil
 	st.refs.Store(0)
