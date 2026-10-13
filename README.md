@@ -616,3 +616,7 @@ go test ./...
 
 CI also runs HTTP/1.x conformance tests against net/http and curl, h2spec, HTTP/3 interop with
 quic-go, the Autobahn WebSocket suite and the fuzzers.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

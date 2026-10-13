@@ -575,3 +575,7 @@ go test ./...
 
 CI 还会运行：针对 net/http 和 curl 的 HTTP/1.x 一致性测试、h2spec、与 quic-go 的 HTTP/3 互通测试、
 Autobahn WebSocket 测试套件和 fuzz 测试。
+
+## 许可证
+
+MIT，详见 [LICENSE](LICENSE)。
