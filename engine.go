@@ -114,6 +114,11 @@ type Engine struct {
 	sendBufferSize     int
 	handler            Handler
 	stopping           atomic.Bool
+	// outputWaiters are the connections a writer waits in waitOutput on, which
+	// Stop lets go: no write edge reaches them once the loop has stopped.
+	// Guarded by outputWaitMu.
+	outputWaitMu  sync.Mutex
+	outputWaiters map[*Connection]struct{}
 	// pendingTotal is the outbound total MaxPendingBytes bounds, which an
 	// engine's pollers share with it.
 	pendingTotal *atomic.Int64
@@ -499,8 +504,26 @@ func (e *Engine) submitReady(pool TaskPool, ready []*Connection, tasks []taskpoo
 func (e *Engine) Stop() {
 	e.stopping.Store(true)
 	e.notify()
+	e.releaseOutputWaiters()
 	for _, p := range e.pollers {
 		p.Stop()
+	}
+}
+
+// releaseOutputWaiters wakes every writer waiting in waitOutput on one of the
+// engine's connections, once the engine is stopping, so that each gives up
+// rather than wait for a write edge the stopped loop will never see.
+func (e *Engine) releaseOutputWaiters() {
+	e.outputWaitMu.Lock()
+	waiting := make([]*Connection, 0, len(e.outputWaiters))
+	for c := range e.outputWaiters {
+		waiting = append(waiting, c)
+	}
+	e.outputWaitMu.Unlock()
+	for _, c := range waiting {
+		c.mu.Lock()
+		c.wakeOutputWaitLocked()
+		c.mu.Unlock()
 	}
 }
 
@@ -625,6 +648,11 @@ func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
 	if c.closing || c.closed {
 		c.mu.Unlock()
 		return nil
+	}
+	if events&(evOut|evErr|evHup) != 0 {
+		// A writer waiting for the queue to drain flushes it itself, and
+		// learns from that flush when the socket has failed; see waitOutput.
+		c.noteWritableLocked()
 	}
 	if events == evOut && c.sendHead == len(c.sends) && c.pendingEvents == 0 {
 		// Write interest is armed for the connection's whole life, so the
@@ -776,6 +804,7 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	}
 	c.closed = true
 	c.closing = true
+	c.wakeOutputWaitLocked()
 	// Record why, so a Read or Write that comes back to the connection is
 	// told what happened rather than only that it is closed, and drop the
 	// deadline timers, which have nothing left to close.

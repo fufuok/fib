@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	stdhttp "net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/outputwait"
 )
 
 // ErrResponseWritten is what writing to a response returns once the response
@@ -43,6 +45,12 @@ const (
 	// sendfile through, taken from the pool rather than made by io.Copy for
 	// every response.
 	copyBufferSize = 32 << 10
+	// h1MaxPendingOutput is how much of a streaming HTTP/1 response's body
+	// may wait in its connection's queue for a client that is not taking it,
+	// before the handler writing it waits for the client to take some. A
+	// handler that waits is let go once half of it has gone, as on HTTP/2;
+	// see h2MaxPendingOutput.
+	h1MaxPendingOutput = 64 << 10
 )
 
 // responseWriter is a response written through Context's ResponseWriter
@@ -171,12 +179,16 @@ func (c *Context) WriteHeader(status int) {
 // the header first if it has not gone yet. A response to HEAD counts what is
 // written but sends none of it.
 //
-// On HTTP/2 and HTTP/3 a response that streams is paced by the client: once
-// 64 kilobytes of it are held back by flow control, Write waits for the
-// client to take some, or for the stream to end, which it then reports. A
-// handler its connection runs on its own reader, which StreamPoolConfig
-// describes, is the exception, since the client's go-ahead would arrive on
-// the goroutine that is waiting: what it writes is held until it can go.
+// A response that streams is paced by the client. On HTTP/1, once 64
+// kilobytes of it are queued on the connection because the client has not
+// taken them, Write waits for the client to take some, or for the connection
+// to end, which it then reports. On HTTP/2 and HTTP/3 Write waits the same
+// way once 64 kilobytes are held back by flow control, for the client to take
+// some or for the stream to end. Config.WriteTimeout bounds the wait on
+// HTTP/1. A handler its multiplexed connection runs on its own reader, which
+// StreamPoolConfig describes, is the exception, since the client's go-ahead
+// would arrive on the goroutine that is waiting: what it writes is held
+// until it can go.
 func (c *Context) Write(p []byte) (int, error) {
 	if c.wrote {
 		return 0, ErrResponseWritten
@@ -498,17 +510,45 @@ func (c *Context) commitStream() error {
 }
 
 // sendBody sends part of a committed body.
+//
+// On HTTP/1 what the client has not taken yet stays queued on the connection,
+// and a handler that writes faster than the client reads waits here once
+// h1MaxPendingOutput of it is queued, until half of that has gone, or the
+// connection has ended, which it is then told. So a handler that copies a
+// large body to a slow client holds no more than that of it in memory, as on
+// HTTP/2 and HTTP/3, rather than all of it. A long p is sent in parts of that
+// size, waiting between them. Only a body that streams gets here: one held
+// back and sent whole, and the replies a round answers pipelined requests
+// with, never wait. Config.WriteTimeout bounds the wait: the connection closes
+// once it has passed with output still queued, and a part sent after it has
+// passed is refused.
 func (c *Context) sendBody(p []byte) error {
 	if !c.isHTTP1() {
 		return c.streamer().WriteBody(p, !c.onReader())
 	}
-	if !c.w.chunked {
-		return c.Conn.Send(p)
+	for len(p) > 0 {
+		if c.parser != nil && !c.parser.writeDeadline.IsZero() && time.Now().After(c.parser.writeDeadline) {
+			c.Conn.CloseWithError(os.ErrDeadlineExceeded)
+			return os.ErrDeadlineExceeded
+		}
+		part := p[:min(len(p), h1MaxPendingOutput)]
+		p = p[len(part):]
+		var err error
+		if !c.w.chunked {
+			err = c.Conn.Send(part)
+		} else {
+			out := appendChunk(bufferpool.Get(len(part) + 20)[:0], part)
+			err = c.Conn.Send(out)
+			bufferpool.Put(out)
+		}
+		if err == nil {
+			err = outputwait.Wait(c.Conn, h1MaxPendingOutput)
+		}
+		if err != nil {
+			return err
+		}
 	}
-	out := appendChunk(bufferpool.Get(len(p) + 20)[:0], p)
-	err := c.Conn.Send(out)
-	bufferpool.Put(out)
-	return err
+	return nil
 }
 
 func appendChunk(out, p []byte) []byte {

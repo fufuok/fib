@@ -19,6 +19,7 @@ import (
 
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/internal/netaddr"
+	"github.com/lesismal/fib/internal/outputwait"
 	"github.com/lesismal/fib/internal/sys"
 )
 
@@ -79,7 +80,9 @@ type Connection struct {
 	// cleared when it completes or fails. Event-loop ownership.
 	dialing *dialRequest
 	// deadlines close the connection when they pass. They are allocated when
-	// the first is set, which most connections never do. Guarded by mu.
+	// the first is set, which most connections never do, and also hold the
+	// other things few connections need: an unusual close reason, and the
+	// writers waiting in waitOutput. Guarded by mu.
 	deadlines *connectionDeadlines
 	// flags holds the connFlag bits, which are read without the mutex.
 	flags connFlags
@@ -344,6 +347,7 @@ func (c *Connection) closeWithError(err error) {
 	c.mu.Lock()
 	request := !c.closing && !c.closed
 	c.closing = true
+	c.wakeOutputWaitLocked()
 	c.mu.Unlock()
 	if request {
 		c.engine.request(command{kind: commandClose, connection: c, err: err})
@@ -649,6 +653,9 @@ func (c *Connection) subPending(n int64) {
 	if pending < 0 {
 		c.pendingBytes.Store(0)
 		pending = 0
+	}
+	if w := c.outputWaitLocked(); w != nil && pending <= w.release {
+		w.cond.Broadcast()
 	}
 	if c.charged > pending {
 		released := c.charged - pending
@@ -1114,6 +1121,147 @@ func (c *Connection) Flush() error {
 		return nil
 	}
 	return c.uncork()
+}
+
+// outputWait is what the goroutines waiting in waitOutput for a connection's
+// queued output to drain share. It exists while any of them waits, and is
+// guarded by the connection's mu, which cond waits with. waiters counts them,
+// release is the largest backlog any of them waits for, and edges counts the
+// write edges the event loop has seen for the connection since the first of
+// them came, which tells one that flushed whether another edge has come since.
+type outputWait struct {
+	cond    sync.Cond
+	waiters int
+	release int64
+	edges   uint64
+}
+
+// outputWaitLocked returns the connection's waiting writers, or nil when
+// none waits. Callers hold c.mu.
+func (c *Connection) outputWaitLocked() *outputWait {
+	if d := c.deadlines; d != nil {
+		return d.drain
+	}
+	return nil
+}
+
+// wakeOutputWaitLocked wakes the writers waiting in waitOutput, if any, to
+// look at the connection again. Callers hold c.mu.
+func (c *Connection) wakeOutputWaitLocked() {
+	if w := c.outputWaitLocked(); w != nil {
+		w.cond.Broadcast()
+	}
+}
+
+// noteWritableLocked tells the writers waiting in waitOutput, if any, that the
+// socket has room again, or has failed, which their next flush finds out.
+// Callers hold c.mu.
+func (c *Connection) noteWritableLocked() {
+	if w := c.outputWaitLocked(); w != nil {
+		w.edges++
+		w.cond.Broadcast()
+	}
+}
+
+func init() {
+	outputwait.Wait = func(c any, limit int64) error { return c.(*Connection).waitOutput(limit) }
+}
+
+// waitOutput waits while more than limit bytes of what Send accepted are
+// still queued for the socket, until no more than half of limit are, so that
+// a writer producing faster than its peer takes holds no more than about
+// limit of it in memory. It reports syscall.EPIPE, as Send does, once the
+// connection is closing, and the error a write failed with.
+//
+// The goroutine that waits flushes the queue itself, at each write edge the
+// event loop sees, or error, rather than leaving that to the connection's
+// round: it
+// may be the handler running in that round, as an HTTP/1 handler streaming a
+// response is, and the round only flushes on a write edge once its handler
+// has returned. So the event loop wakes it for every write edge, and a flush
+// by anyone that leaves no more than it waits for wakes it too. Output held
+// by a cork is let go, as Flush lets it go, since the wait would otherwise
+// be for output nothing is going to write.
+func (c *Connection) waitOutput(limit int64) error {
+	if c.pendingBytes.Load() <= limit || c.udp != nil {
+		return nil
+	}
+	release := limit / 2
+	c.mu.Lock()
+	d := c.deadlines
+	if d == nil {
+		d = &connectionDeadlines{}
+		c.deadlines = d
+	}
+	w := d.drain
+	if w == nil {
+		w = &outputWait{}
+		w.cond.L = &c.mu
+		d.drain = w
+		c.engine.trackOutputWait(c, true)
+	}
+	w.waiters++
+	w.release = max(w.release, release)
+	var err error
+	for {
+		if c.closing || c.closed || c.engine.stopping.Load() {
+			// A stopped engine's loop sees no more write edges; see
+			// Engine.releaseOutputWaiters.
+			err = syscall.EPIPE
+			break
+		}
+		c.foldCorkedLocked()
+		if c.pendingBytes.Load() <= release {
+			break
+		}
+		edges := w.edges
+		if c.corked || c.sendHead != len(c.sends) && !c.flushing && !c.writeBusyLocked() {
+			c.corked = false
+			// flushLocked releases mu. A write edge that comes before it is
+			// taken again counts in edges, which says to flush once more
+			// rather than wait for an edge that has already come.
+			err = c.flushLocked()
+			if err != nil && err != syscall.EPIPE {
+				c.closeWithError(err)
+			}
+			c.mu.Lock()
+			if err != nil {
+				break
+			}
+			if w.edges != edges {
+				continue
+			}
+			if c.closing || c.closed || c.pendingBytes.Load() <= release {
+				continue
+			}
+		}
+		// Whatever writes next, this flush at the next edge or another
+		// goroutine's that drains the queue, wakes the wait.
+		w.cond.Wait()
+	}
+	if w.waiters--; w.waiters == 0 {
+		d.drain = nil
+		c.engine.trackOutputWait(c, false)
+	}
+	c.mu.Unlock()
+	return err
+}
+
+// trackOutputWait records that a writer has begun waiting in waitOutput on c,
+// with waiting set, or that the last one waiting has stopped, so that Stop
+// can let them go. Callers hold c.mu, which Stop takes only after
+// outputWaitMu is released.
+func (e *Engine) trackOutputWait(c *Connection, waiting bool) {
+	e.outputWaitMu.Lock()
+	if waiting {
+		if e.outputWaiters == nil {
+			e.outputWaiters = make(map[*Connection]struct{})
+		}
+		e.outputWaiters[c] = struct{}{}
+	} else {
+		delete(e.outputWaiters, c)
+	}
+	e.outputWaitMu.Unlock()
 }
 
 // stallRead ends a read round with bytes possibly still in the socket and asks
@@ -1633,6 +1781,8 @@ type connectionDeadlines struct {
 	// closeReason is why the connection closed, when it is none of the
 	// reasons closeKind tells apart.
 	closeReason error
+	// drain is what writers waiting in waitOutput share, while any waits.
+	drain *outputWait
 }
 
 // The values of closeCode: none, the end of input, a deadline, a reason kept

@@ -547,6 +547,10 @@ func (h *ServerHandler) releaseTimeouts(c *fib.Connection, parser *Parser) {
 	if h.timed {
 		_ = c.SetReadDeadline(time.Time{})
 	}
+	if h.config.WriteTimeout > 0 {
+		parser.writeDeadline = time.Time{}
+		_ = c.SetWriteDeadline(time.Time{})
+	}
 }
 
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
@@ -711,6 +715,13 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			// whatever comes next is set when this round ends. A request
 			// whose body is still coming keeps the deadline that bounds it.
 			_ = c.SetReadDeadline(time.Time{})
+		}
+		if d := h.config.WriteTimeout; d > 0 {
+			// The response has until then to be written: the connection
+			// closes if output is still queued for the client by then, and
+			// sendBody refuses to stream more of it afterwards.
+			parser.writeDeadline = time.Now().Add(d)
+			_ = c.SetWriteDeadline(parser.writeDeadline)
 		}
 		// The handler runs here, on the connection's worker, whether or not
 		// its body has all arrived: reading a streamed body never waits, so

@@ -9,16 +9,25 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // serverState is what a Parser keeps for the server driving it: the request
 // being served, reachable without the parser's lock so that a close can
-// cancel a request whose handler is still working on it.
+// cancel a request whose handler is still working on it, and when its
+// response has to be written by.
 type serverState struct {
 	liveContext atomic.Pointer[Context]
+	// writeDeadline is when the response being written stops being allowed
+	// to, under Config.WriteTimeout, or zero. It is set before the handler
+	// runs and read by whatever writes the response.
+	writeDeadline time.Time
 }
 
-func (p *Parser) resetServerState() { p.liveContext.Store(nil) }
+func (p *Parser) resetServerState() {
+	p.liveContext.Store(nil)
+	p.writeDeadline = time.Time{}
+}
 
 // blockServerState is the part of a requestBlock a server serves the request
 // with: the Context it is answered through.
