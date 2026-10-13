@@ -1282,7 +1282,13 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 		resp.TLS = st.cc.tlsState
 		st.cc.mu.Unlock()
 		r := st.r
-		st.stream = fibhttp.NewResponseStream(resp, r.req, fibhttp.StreamOptions{Threshold: config.StreamResponseBodyThreshold}, fibhttp.StreamHooks{
+		st.stream = fibhttp.NewResponseStream(resp, r.req, fibhttp.StreamOptions{
+			Threshold: config.StreamResponseBodyThreshold,
+			// The callback must not hold up the goroutine that hands the
+			// connection its datagrams, or nothing that arrives meanwhile is
+			// acknowledged and the socket's buffer overflows.
+			Detached: true,
+		}, fibhttp.StreamHooks{
 			Begin:    r.begin,
 			Callback: func(cr *fibhttp.ClientResponse) { r.callback(cr, nil) },
 			Whole:    func(resp *stdhttp.Response) { r.finish(resp, nil) },

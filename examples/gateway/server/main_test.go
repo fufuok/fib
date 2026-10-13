@@ -16,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -608,7 +609,8 @@ func TestSlowClient(t *testing.T) {
 		for _, upstream := range []string{"h1", "h2", "h3"} {
 			t.Run(client.name+"/"+upstream, func(t *testing.T) {
 				req := request(t, "GET", fmt.Sprintf("%s/download?size=%d", l.url("/"+upstream), size), nil)
-				var got int64
+				// got is read on timeout, while OnBody may still be running.
+				var got atomic.Int64
 				var bad error
 				done := make(chan error, 1)
 				client.doer.Do(req, func(resp *fibhttp.ClientResponse, err error) {
@@ -621,12 +623,13 @@ func TestSlowClient(t *testing.T) {
 							done <- err
 							return
 						}
+						n := got.Load()
 						for i, b := range data {
-							if b != byte('a'+(got+int64(i))%26) && bad == nil {
-								bad = fmt.Errorf("byte %d is %q", got+int64(i), b)
+							if b != byte('a'+(n+int64(i))%26) && bad == nil {
+								bad = fmt.Errorf("byte %d is %q", n+int64(i), b)
 							}
 						}
-						got += int64(len(data))
+						got.Add(int64(len(data)))
 						time.Sleep(200 * time.Microsecond)
 						if fin {
 							done <- bad
@@ -635,11 +638,11 @@ func TestSlowClient(t *testing.T) {
 				})
 				select {
 				case err := <-done:
-					if err != nil || got != size {
-						t.Fatalf("err %v, %d of %d bytes", err, got, size)
+					if n := got.Load(); err != nil || n != size {
+						t.Fatalf("err %v, %d of %d bytes", err, n, size)
 					}
 				case <-time.After(30 * time.Second):
-					t.Fatalf("stalled at %d of %d bytes", got, size)
+					t.Fatalf("stalled at %d of %d bytes", got.Load(), size)
 				}
 			})
 		}

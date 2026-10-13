@@ -242,6 +242,12 @@ type StreamOptions struct {
 	// Buffer is how many bytes may wait for a reader before Hold stops
 	// reads; zero means DefaultStreamResponseBodyBuffer.
 	Buffer int
+	// Detached keeps OnBody's function off the goroutine that delivers the
+	// body: it runs on one of its own, and the transport's goroutine only
+	// queues the data. It is for transports that must go on reading while
+	// the callback takes its time, as QUIC must, to acknowledge what
+	// arrives: they pace the sender with Credit, which bounds what waits.
+	Detached bool
 }
 
 // ResponseStream carries the body of a response that streams, from the worker that
@@ -260,6 +266,7 @@ type ResponseStream struct {
 	// highWater how much may wait unread, after that, before reads stop.
 	threshold int64
 	highWater int
+	detached  bool
 
 	mu sync.Mutex
 	// buf holds body that has arrived and not been taken.
@@ -306,7 +313,7 @@ func (s *ResponseStream) give(n int64) {
 // NewResponseStream returns the stream for a response, head, whose body is
 // still arriving, to the request req. head.Body is replaced.
 func NewResponseStream(head *stdhttp.Response, req *stdhttp.Request, options StreamOptions, hooks StreamHooks) *ResponseStream {
-	s := &ResponseStream{hooks: hooks, req: req, threshold: options.Threshold, highWater: options.Buffer}
+	s := &ResponseStream{hooks: hooks, req: req, threshold: options.Threshold, highWater: options.Buffer, detached: options.Detached}
 	if s.highWater <= 0 {
 		s.highWater = DefaultStreamResponseBodyBuffer
 	}
@@ -349,6 +356,10 @@ func (s *ResponseStream) afterCallback() {
 		return
 	}
 	s.mu.Unlock()
+	if s.detached {
+		s.kick()
+		return
+	}
 	s.drain()
 	s.mu.Lock()
 	s.holdLocked()
@@ -372,7 +383,7 @@ func (s *ResponseStream) Data(b []byte) {
 		}
 		return
 	}
-	if s.fn != nil && s.fired && !s.inCallback && !s.delivering && len(s.buf) == 0 {
+	if s.fn != nil && s.fired && !s.inCallback && !s.delivering && len(s.buf) == 0 && !s.detached {
 		// Nobody is behind: hand it over from where it was read.
 		fn := s.fn
 		s.delivering = true
@@ -403,6 +414,8 @@ func (s *ResponseStream) Data(b []byte) {
 	s.give(early)
 	if fire {
 		s.fire()
+	} else if s.detached {
+		s.kick()
 	}
 }
 
@@ -432,7 +445,7 @@ func (s *ResponseStream) End() {
 	}
 	s.mu.Unlock()
 	if s.hooks.Done() {
-		s.drain()
+		s.deliver()
 	}
 }
 
@@ -445,7 +458,7 @@ func (s *ResponseStream) Fail(err error) {
 	s.buf = nil
 	s.unholdLocked()
 	s.mu.Unlock()
-	s.drain()
+	s.deliver()
 }
 
 func (s *ResponseStream) setFn(fn BodyFunc) {
@@ -458,9 +471,40 @@ func (s *ResponseStream) setFn(fn BodyFunc) {
 	s.fn, s.touched = fn, true
 	late := !s.inCallback
 	s.mu.Unlock()
-	if late {
+	switch {
+	case late && s.detached:
+		s.kick()
+	case late:
 		sidepool.Go(s.drain)
 	}
+}
+
+// deliver hands fn what has arrived: on this goroutine, or, for a stream
+// that is detached, on one of its own.
+func (s *ResponseStream) deliver() {
+	if s.detached {
+		s.kick()
+	} else {
+		s.drain()
+	}
+}
+
+// kick starts a goroutine to drain the stream, unless one is in fn already,
+// or the callback is still running, which carries on with it when it
+// returns.
+func (s *ResponseStream) kick() {
+	s.mu.Lock()
+	if s.delivering || s.inCallback || s.fn == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.delivering = true
+	s.mu.Unlock()
+	// Not a pool's goroutine: fn may take as long as it likes.
+	go func() {
+		s.mu.Lock()
+		s.drainLocked()
+	}()
 }
 
 // drain hands fn what has arrived, then the end, one call at a time. Whoever
@@ -473,6 +517,12 @@ func (s *ResponseStream) drain() {
 		return
 	}
 	s.delivering = true
+	s.drainLocked()
+}
+
+// drainLocked is drain's loop, entered with s.mu held and delivering set,
+// and left with s.mu released.
+func (s *ResponseStream) drainLocked() {
 	for {
 		fn := s.fn
 		switch {
