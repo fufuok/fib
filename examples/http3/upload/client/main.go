@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command client sends a file to the HTTP/3 upload server; see package
 // uploadclient for what -mode does. It uses fib's HTTP/3 client, which holds

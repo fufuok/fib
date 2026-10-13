@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command server is an arpc server: an echo method, a typed service, and a
 // stream that answers each message in upper case.

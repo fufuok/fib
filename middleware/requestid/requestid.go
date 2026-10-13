@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package requestid gives every request an identifier: the one the client
 // sent in the request's X-Request-ID header, or else a new one. It is set on

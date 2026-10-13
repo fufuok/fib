@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command client calls the arpc server: a call, an asynchronous call, a call
 // of a typed service, and a stream.

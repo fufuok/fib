@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command rpc measures fib/arpc and fib/grpc under load, to compare settings
 // such as Config.CoalesceWrites: handlers run on the engine's pool, and N

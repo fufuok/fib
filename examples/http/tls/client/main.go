@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command client posts messages to the HTTPS echo server and prints the
 // replies. It speaks HTTP/2 when the server offers it; -http1 keeps it on

@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package greeter is a gRPC service written the way protoc-gen-go-grpc
 // generates one, with JSON messages so that the example needs no protoc: a

@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package http3 serves and sends HTTP/3 (RFC 9114) over the fib engine's UDP
 // sockets, with QUIC (RFC 9000) and QPACK (RFC 9204) implemented here and

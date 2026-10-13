@@ -1,4 +1,4 @@
-//go:build !linux && !darwin && !windows
+//go:build !linux && !darwin && !dragonfly && !freebsd && !netbsd && !openbsd && !windows
 
 package fib
 
@@ -428,13 +428,13 @@ type Config struct {
 	// TaskPool, when set, runs the engine's connections instead of a pool the
 	// engine builds from the fields above. See SetTaskPool.
 	TaskPool TaskPool
-	// IOPollers and IOPollerCount split a Linux or macOS engine across
+	// IOPollers and IOPollerCount split an epoll or kqueue engine across
 	// several event loops. This backend has one goroutine per connection
 	// already, so both are ignored here, though DefaultConfig sets IOPollers
 	// as it does on the other backends: on more than four CPUs.
 	IOPollers     bool
 	IOPollerCount int
-	// ReusePort binds a Linux or macOS engine's listeners with SO_REUSEPORT.
+	// ReusePort binds an epoll or kqueue engine's listeners with SO_REUSEPORT.
 	// This backend listens through the net package, and ignores it.
 	ReusePort bool
 	// UDPIdleTimeout closes a silent UDP peer's connection. Zero means

@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package proxy is the core of the gateway example: a reverse proxy that
 // takes HTTP/1.1, HTTP/2, HTTP/3 and WebSocket requests and forwards them to

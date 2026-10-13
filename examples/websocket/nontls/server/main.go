@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command server is a WebSocket echo server. CI runs the Autobahn test suite
 // against it.

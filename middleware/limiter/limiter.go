@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package limiter bounds how many requests each client may make in a window
 // of time, and answers the ones past the bound with 429 Too Many Requests.

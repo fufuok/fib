@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package etag gives a 200 response to GET or HEAD an ETag made from its
 // body, and answers a request whose If-None-Match names the ETag it would

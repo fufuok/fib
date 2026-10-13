@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command router serves a small REST API through fibhttp.Router: routes with
 // parameters, a Route with middleware of its own, and a mounted router.

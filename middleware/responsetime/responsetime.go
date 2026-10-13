@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package responsetime reports how long the handler took to settle its
 // response, in the response's X-Response-Time header.

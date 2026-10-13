@@ -32,7 +32,7 @@ type Handler interface {
 // that answers what it receives - with acknowledgements, say - can then
 // answer the whole burst at once, in fewer datagrams than it would one
 // arrival at a time. The portable backend, on platforms other than Linux,
-// macOS and Windows, keeps calling OnData.
+// macOS, the BSDs and Windows, keeps calling OnData.
 //
 // Each datagram belongs to the handler, as a UDP connection's OnData data
 // does; the slice holding them does not, and must not be kept once

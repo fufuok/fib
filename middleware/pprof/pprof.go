@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package pprof serves the runtime profiles of net/http/pprof under
 // /debug/pprof/, for go tool pprof and a browser to read:

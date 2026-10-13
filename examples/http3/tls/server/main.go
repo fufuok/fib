@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command server is an HTTP/3 echo server: it answers each request with its
 // protocol, method, path and body.

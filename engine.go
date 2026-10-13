@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 package fib
 
@@ -87,7 +87,7 @@ type commandBatch struct{ items []command }
 
 // Engine owns the listeners, the event loop, its command queue, and the worker
 // pool. The loop itself is platform code: epoll on Linux, kqueue on macOS and
-// an I/O completion port on Windows, each embedded here as enginePlatform.
+// the BSDs, and an I/O completion port on Windows, each embedded here as enginePlatform.
 //
 // With Config.IOPollers, the engine also owns the pollers its connections are
 // served on. Each poller is an Engine of its own with no listeners, whose
@@ -942,8 +942,8 @@ type Config struct {
 	// Cork and Flush work either way, and so does the drain that writes what a
 	// full socket left queued.
 	//
-	// DefaultConfig sets it. Only the native engines, on Linux, macOS and
-	// Windows, have read rounds; the portable backend ignores it.
+	// DefaultConfig sets it. Only the native engines, on Linux, macOS, the
+	// BSDs and Windows, have read rounds; the portable backend ignores it.
 	CoalesceWrites bool
 	// SocketSyscalls has connections read and write their sockets with
 	// recvfrom, sendto and sendmsg rather than read, write and writev. Both
@@ -1006,7 +1006,7 @@ type Config struct {
 	// one loop. Setting it explicitly gives an engine pollers on any number
 	// of CPUs.
 	//
-	// Only the Linux and macOS backends have pollers; on Windows the engine
+	// Only the epoll and kqueue backends have pollers; on Windows the engine
 	// keeps its single loop, as if this were unset.
 	IOPollers bool
 	// IOPollerCount is how many loops IOPollers creates. Zero or less means
@@ -1284,7 +1284,8 @@ func (c *Connection) sendDatagram(data []byte) error {
 
 // SendBatch sends each of datagrams as a datagram of its own, in order, as
 // that many Sends would, but on Linux and macOS with one system call for as
-// many of them as it can: sendmmsg, or sendmsg_x. A datagram the socket has
+// many of them as it can: sendmmsg, or sendmsg_x; the other BSDs send them
+// one call each. A datagram the socket has
 // no room for is dropped, with those after it, and SendBatch reports why;
 // those before it were sent. On a connection that is not UDP it Sends each
 // in turn.

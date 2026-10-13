@@ -47,8 +47,8 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
 
 ### 引擎
 
-- **原生后端**：Linux 用边沿触发的 epoll，macOS 用 kqueue，Windows 用 IOCP。FreeBSD 等其他系统
-  回退到标准库 `net`。
+- **原生后端**：Linux 用边沿触发的 epoll，macOS、FreeBSD、NetBSD、OpenBSD、DragonFly 用 kqueue，
+  Windows 用 IOCP。其他系统回退到标准库 `net`。
 - **按连接调度**：同一连接的事件按顺序、一次一个地在任意空闲 worker 上执行。连接不绑定线程，
   负载按实际工作量分摊，而不是按 fd 数量。
 - **背压**：每连接有写水位线（64 KiB），满了就暂停读取；全服务待发字节预算（`MaxPendingBytes`）
@@ -64,7 +64,7 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
   responsetime。
 - **Prefork**：Linux 上 `prefork` 包把一个程序拆到每 CPU 一个进程上运行，各自有自己的堆和 GC，
   通过 `SO_REUSEPORT` 共享程序的端口。
-- **平台**：Linux、macOS、Windows，支持 amd64、arm64、386、arm、riscv64、loong64，需要 Go 1.27
+- **平台**：Linux、macOS、BSD、Windows，支持 amd64、arm64、386、arm、riscv64、loong64，需要 Go 1.27
   或更新版本。
 
 ## 快速开始

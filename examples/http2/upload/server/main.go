@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command server takes large request bodies over HTTP/2 without holding them
 // in memory: the upload example's /upload, /resume and /echo (see package

@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin || dragonfly || freebsd || netbsd || openbsd
 
 package fib
 
@@ -8,24 +8,12 @@ import (
 	"github.com/lesismal/fib/taskpool"
 )
 
-// wakeIdent names the EVFILT_USER event other goroutines trigger to wake the
-// loop. User events live in their own namespace, so it cannot collide with a
-// descriptor.
-const wakeIdent = 0
-
-// EVFILT_EXCEPT with NOTE_OOB reports urgent data, which the read filter does
-// not. The syscall package does not export either; the values are from
-// <sys/event.h>.
-const (
-	evfiltExcept = -15
-	noteOOB      = 0x2
-)
-
 // backend is a kqueue instance. Every descriptor is registered with EV_CLEAR,
 // which gives kqueue the same edge-triggered behaviour the epoll backend gets
 // from EPOLLET.
 type backend struct {
 	kq int
+	wakeBackend
 	// acceptable collects the listeners that became readable during one wait.
 	// Event-loop ownership.
 	acceptable []int
@@ -47,8 +35,7 @@ func (e *Engine) openBackend() error {
 			// Its pollers accept for it; see Config.ReusePort.
 			break
 		}
-		changes = append(changes, syscall.Kevent_t{Ident: uint64(fd), Filter: syscall.EVFILT_READ,
-			Flags: syscall.EV_ADD | syscall.EV_CLEAR})
+		changes = append(changes, newKevent(fd, syscall.EVFILT_READ, syscall.EV_ADD|syscall.EV_CLEAR))
 	}
 	// UDP sockets are level-triggered, so the loop can stop reading one after
 	// its share of a round and still hear about the rest. Those of an engine
@@ -57,12 +44,14 @@ func (e *Engine) openBackend() error {
 		if e.pollersListen {
 			break
 		}
-		changes = append(changes, syscall.Kevent_t{Ident: uint64(l.fd), Filter: syscall.EVFILT_READ,
-			Flags: syscall.EV_ADD})
+		changes = append(changes, newKevent(l.fd, syscall.EVFILT_READ, syscall.EV_ADD))
 	}
-	changes = append(changes, syscall.Kevent_t{Ident: wakeIdent, Filter: syscall.EVFILT_USER,
-		Flags: syscall.EV_ADD | syscall.EV_CLEAR})
+	if changes, err = e.openWake(changes); err != nil {
+		syscall.Close(kq)
+		return err
+	}
 	if _, err = syscall.Kevent(kq, changes, nil, nil); err != nil {
+		e.closeWake()
 		syscall.Close(kq)
 		return err
 	}
@@ -70,7 +59,18 @@ func (e *Engine) openBackend() error {
 	return nil
 }
 
-func (e *Engine) closeBackend() error { return syscall.Close(e.kq) }
+// newKevent describes a change to fd's filter. The fields' types differ
+// between systems and word sizes, which SetKevent converts to.
+func newKevent(fd, filter, flags int) syscall.Kevent_t {
+	var ev syscall.Kevent_t
+	syscall.SetKevent(&ev, fd, filter, flags)
+	return ev
+}
+
+func (e *Engine) closeBackend() error {
+	e.closeWake()
+	return syscall.Close(e.kq)
+}
 
 // runLoop runs the engine's event loop until Stop.
 func (e *Engine) runLoop() error {
@@ -95,7 +95,7 @@ func (e *Engine) runLoop() error {
 		woken := false
 		for i := 0; i < n; i++ {
 			ev := &events[i]
-			if ev.Filter == syscall.EVFILT_USER {
+			if e.isWake(ev) {
 				woken = true
 				continue
 			}
@@ -145,6 +145,7 @@ func (e *Engine) runLoop() error {
 		// into connections. Closing a descriptor removes its pending events
 		// from the kqueue, so the next wait cannot see a stale one either.
 		if woken {
+			e.ackWake()
 			e.drainCommands()
 		}
 		for _, fd := range e.acceptable {
@@ -173,7 +174,10 @@ func kqueueEvents(ev *syscall.Kevent_t) uint32 {
 		}
 	case syscall.EVFILT_WRITE:
 		events = evOut
-	case evfiltExcept:
+	default:
+		if !hasExceptFilter || int(ev.Filter) != evfiltExcept {
+			return 0
+		}
 		// XNU evaluates the except filter with the read filter's code, which
 		// falls through to the ordinary readable test when no urgent data is
 		// marked, so it fires with every read event. Only NOTE_OOB in fflags
@@ -192,27 +196,17 @@ func kqueueEvents(ev *syscall.Kevent_t) uint32 {
 	return events
 }
 
-func (e *Engine) wake() {
-	changes := [1]syscall.Kevent_t{{Ident: wakeIdent, Filter: syscall.EVFILT_USER, Fflags: syscall.NOTE_TRIGGER}}
-	for {
-		if _, err := syscall.Kevent(e.kq, changes[:], nil, nil); err != syscall.EINTR {
-			return
-		}
-	}
-}
-
-// ackWake does nothing: the user event is registered with EV_CLEAR, so
-// delivering it has already reset it.
-func (e *Engine) ackWake() {}
-
 func (e *Engine) registerConnection(fd int, _ uint64) error {
 	changes := [3]syscall.Kevent_t{
-		{Ident: uint64(fd), Filter: syscall.EVFILT_READ, Flags: syscall.EV_ADD | syscall.EV_CLEAR},
-		{Ident: uint64(fd), Filter: syscall.EVFILT_WRITE, Flags: syscall.EV_ADD | syscall.EV_CLEAR},
-		{Ident: uint64(fd), Filter: evfiltExcept, Flags: syscall.EV_ADD | syscall.EV_CLEAR, Fflags: noteOOB},
+		newKevent(fd, syscall.EVFILT_READ, syscall.EV_ADD|syscall.EV_CLEAR),
+		newKevent(fd, syscall.EVFILT_WRITE, syscall.EV_ADD|syscall.EV_CLEAR),
+		newKevent(fd, evfiltExcept, syscall.EV_ADD|syscall.EV_CLEAR),
 	}
+	changes[2].Fflags = noteOOB
 	n := len(changes)
-	if sa, err := syscall.Getsockname(fd); err == nil {
+	if !hasExceptFilter {
+		n--
+	} else if sa, err := syscall.Getsockname(fd); err == nil {
 		if _, unix := sa.(*syscall.SockaddrUnix); unix {
 			// A Unix socket has no urgent data, yet EVFILT_EXCEPT still fires
 			// on it, which would only add an event to every read.
@@ -226,7 +220,7 @@ func (e *Engine) registerConnection(fd int, _ uint64) error {
 // registerDatagram registers a dialed UDP socket for reads alone, since sends
 // never wait, and level-triggered like a UDP listener.
 func (e *Engine) registerDatagram(fd int, _ uint64) error {
-	change := [1]syscall.Kevent_t{{Ident: uint64(fd), Filter: syscall.EVFILT_READ, Flags: syscall.EV_ADD}}
+	change := [1]syscall.Kevent_t{newKevent(fd, syscall.EVFILT_READ, syscall.EV_ADD)}
 	_, err := syscall.Kevent(e.kq, change[:], nil, nil)
 	return err
 }
@@ -240,15 +234,3 @@ const pausesInPlace = true
 
 // setReadPaused does nothing; see pausesInPlace.
 func (e *Engine) setReadPaused(*Connection, bool) error { return nil }
-
-// Darwin names the idle time TCP_KEEPALIVE, and the syscall package leaves
-// the other two out on amd64.
-const (
-	tcpKeepIdle     = syscall.TCP_KEEPALIVE
-	tcpKeepInterval = 0x101
-	tcpKeepCount    = 0x102
-)
-
-// usingMultipathTCP is false: Darwin offers Multipath TCP only through its
-// own frameworks, never on a socket opened as this package opens them.
-func usingMultipathTCP(int) bool { return false }

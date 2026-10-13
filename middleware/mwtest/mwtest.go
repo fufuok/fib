@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package mwtest serves a handler for the middleware's tests, and gives them
 // clients that reach it over HTTP/1.1 and over HTTP/2.

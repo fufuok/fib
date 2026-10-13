@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package routerbench compares fibhttp.Router with chi and net/http's
 // ServeMux on the routes of GitHub's API. It is a module of its own so that

@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package cors lets pages from other origins call the server, as the Fetch
 // standard's Cross-Origin Resource Sharing describes: it answers preflight

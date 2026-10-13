@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package compress compresses response bodies with gzip or deflate, as the
 // request's Accept-Encoding allows.

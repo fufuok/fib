@@ -48,8 +48,8 @@ uSockets, workflow, axum, h2, quiche and rustls.
 
 ### Engine
 
-- **Native backends**: edge-triggered epoll on Linux, kqueue on macOS and IOCP on Windows. Other
-  systems such as FreeBSD fall back to the standard `net` package.
+- **Native backends**: edge-triggered epoll on Linux, kqueue on macOS, FreeBSD, NetBSD, OpenBSD
+  and DragonFly, and IOCP on Windows. Other systems fall back to the standard `net` package.
 - **Per-connection scheduling**: each connection's events run in order, one at a time, on any idle
   worker. No connection is tied to a thread, so load spreads by real work rather than by fd count.
 - **Backpressure**: a per-connection write watermark (64 KiB) pauses reads when it fills, and an
@@ -67,8 +67,8 @@ uSockets, workflow, axum, h2, quiche and rustls.
   responsetime.
 - **Prefork**: on Linux, package `prefork` serves a program from one process per CPU, each with its
   own heap and collector, sharing the program's ports through `SO_REUSEPORT`.
-- **Platforms**: Linux, macOS and Windows, on amd64, arm64, 386, arm, riscv64 and loong64. Needs
-  Go 1.27 or later.
+- **Platforms**: Linux, macOS, the BSDs and Windows, on amd64, arm64, 386, arm, riscv64 and
+  loong64. Needs Go 1.27 or later.
 
 ## Quick start
 

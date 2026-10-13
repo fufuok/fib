@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 package fib
 
@@ -2019,10 +2019,10 @@ func (c *Connection) stopDeadlinesLocked() {
 }
 
 // SendFile sends count bytes of f, starting at offset, after whatever was
-// sent before it and ahead of whatever is sent after. On Linux and macOS the
-// bytes go from the file to the socket by sendfile(2), without passing
-// through user space; on Windows they are read a chunk at a time as the
-// socket takes them. Either way the file is read only as the peer keeps up,
+// sent before it and ahead of whatever is sent after. On Linux, macOS,
+// FreeBSD and DragonFly the bytes go from the file to the socket by
+// sendfile(2), without passing through user space; on Windows, NetBSD and
+// OpenBSD they are read a chunk at a time as the socket takes them. Either way the file is read only as the peer keeps up,
 // so a large file costs no more memory than a small one.
 //
 // The connection sends from its own duplicate of f's descriptor, so the

@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package netaddr turns the network and address strings of Listen and Dial into
 // socket addresses, and socket addresses back into net.Addr values, the way

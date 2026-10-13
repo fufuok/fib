@@ -349,9 +349,10 @@ const pausesInPlace = true
 func (e *Engine) setReadPaused(*Connection, bool) error { return nil }
 
 const (
-	tcpKeepIdle     = syscall.TCP_KEEPIDLE
-	tcpKeepInterval = syscall.TCP_KEEPINTVL
-	tcpKeepCount    = syscall.TCP_KEEPCNT
+	keepAliveTunable = true
+	tcpKeepIdle      = syscall.TCP_KEEPIDLE
+	tcpKeepInterval  = syscall.TCP_KEEPINTVL
+	tcpKeepCount     = syscall.TCP_KEEPCNT
 )
 
 const (

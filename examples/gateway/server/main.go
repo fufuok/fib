@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command server is a reverse proxy and gateway. It accepts HTTP/1.1, HTTP/2,
 // HTTP/3 and WebSocket requests and forwards them to upstream servers by path

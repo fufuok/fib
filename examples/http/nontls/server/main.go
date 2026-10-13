@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command server is an HTTP echo server: it answers each request with its
 // method, path and body. With -dir it also serves that directory's files

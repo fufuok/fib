@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command client sends a file to the upload server over HTTP/1.1, streaming it
 // from disk so that neither end holds it in memory; see package uploadclient

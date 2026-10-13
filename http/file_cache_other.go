@@ -1,4 +1,4 @@
-//go:build darwin || windows
+//go:build darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 package http
 

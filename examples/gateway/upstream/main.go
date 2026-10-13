@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command upstream is the backend the gateway example forwards to. It speaks
 // HTTP/1.1 on a cleartext port, and HTTP/2 and HTTP/3 on a TLS one, so that

@@ -1,4 +1,4 @@
-//go:build darwin || (linux && !386)
+//go:build darwin || dragonfly || freebsd || netbsd || (linux && !386)
 
 package sys
 

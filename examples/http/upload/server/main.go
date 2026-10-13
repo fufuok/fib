@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command server takes large HTTP/1 request bodies without holding them in
 // memory. With Config.StreamRequestBody on, a handler runs as soon as the

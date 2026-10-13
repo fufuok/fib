@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package service is the upload example's request handler, shared by its
 // HTTP/1, HTTP/2 and HTTP/3 servers: the same handler takes large bodies over

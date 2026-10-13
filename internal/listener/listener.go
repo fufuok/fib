@@ -1,4 +1,4 @@
-//go:build linux || darwin
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd
 
 // Package listener opens the listening sockets of the readiness-based
 // backends: TCP, Unix and UDP, bound where the engine's Config says.

@@ -1,4 +1,4 @@
-//go:build linux || darwin
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd
 
 package fib
 
@@ -940,7 +940,8 @@ func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFi
 				continue
 			}
 			if n > 0 && err != nil {
-				// macOS reports what it sent along with EAGAIN or EINTR. A
+				// macOS and FreeBSD report what they sent along with
+				// EAGAIN or EINTR. A
 				// partial count stands, and a full socket raises the write
 				// edge that resumes the rest; an interrupted call is short
 				// only because it was interrupted, so it must not wait for an
@@ -955,8 +956,10 @@ func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFi
 		switch {
 		case err == nil && n == 0:
 			return 0, attempted, true, io.ErrUnexpectedEOF
-		case err == syscall.EINVAL || err == syscall.ENOTSUP || err == syscall.EOPNOTSUPP || err == syscall.ENOTSOCK:
-			// This kind of socket or file cannot be spliced; copy it.
+		case err == syscall.EINVAL || err == syscall.ENOTSUP || err == syscall.EOPNOTSUPP || err == syscall.ENOTSOCK ||
+			err == syscall.ENOSYS:
+			// This kind of socket or file cannot be spliced, or, on NetBSD
+			// and OpenBSD, there is no sendfile at all; copy it.
 			s.copyBuf = bufferpool.Get(sendFileChunk)
 		default:
 			return n, attempted, true, err
@@ -989,6 +992,14 @@ func (c *Connection) shutdownReadLocked() error {
 // setKeepAliveTimes sets the idle time before the first keep-alive probe and
 // the interval between probes; see Connection.SetKeepAliveConfig.
 func setKeepAliveTimes(s int, idle, interval time.Duration) error {
+	if !keepAliveTunable {
+		// The system's own times stand in for the defaults; only one asked
+		// for in so many words is refused, as package net refuses it.
+		if idle > 0 || interval > 0 {
+			return syscall.ENOPROTOOPT
+		}
+		return nil
+	}
 	if idle >= 0 {
 		if err := syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, tcpKeepIdle, keepAliveSeconds(idle)); err != nil {
 			return err
@@ -1002,8 +1013,11 @@ func setKeepAliveTimes(s int, idle, interval time.Duration) error {
 
 // setKeepAliveCount sets how many unanswered probes end the connection.
 func setKeepAliveCount(s int, count int) error {
-	if count < 0 {
+	if count < 0 || count == 0 && !keepAliveTunable {
 		return nil
+	}
+	if !keepAliveTunable {
+		return syscall.ENOPROTOOPT
 	}
 	if count == 0 {
 		count = defaultKeepAliveCount

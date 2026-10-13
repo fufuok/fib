@@ -1,11 +1,12 @@
-//go:build darwin || (linux && (386 || race || msan || asan))
+//go:build darwin || dragonfly || freebsd || netbsd || openbsd || (linux && (386 || race || msan || asan))
 
 package sys
 
 import "syscall"
 
-// Darwin makes system calls through libc, linux/386 reaches the socket calls
-// only through socketcall, and a sanitizer build wants the syscall package's
+// Darwin and OpenBSD make system calls through libc, the other BSDs have no
+// raw socket path of their own, linux/386 reaches the socket calls only
+// through socketcall, and a sanitizer build wants the syscall package's
 // annotations, so these go through the syscall package, and always make the
 // VFS calls whatever Config.SocketSyscalls says. sockio_linux.go says why
 // Linux otherwise makes them raw.

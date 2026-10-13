@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Package recover turns a handler's panic into a 500 response, rather than
 // into the loss of the connection it was serving and of every request on it.

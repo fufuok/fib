@@ -1,4 +1,4 @@
-//go:build linux || darwin || windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 // Command client sends a file to the HTTP/2 upload server, streaming it from
 // disk over one multiplexed connection so that neither end holds it in
