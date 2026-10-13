@@ -94,6 +94,14 @@ func(c *fibhttp.Context) {
 连接的一轮里，所以 handler 的清理逻辑拖不住服务端。想主动查的话 `Context.Err()` 给出同样的
 原因。
 
+这对原地阻塞的 handler（等数据库、等上游服务）同样成立，不只限于 `Retain` 了请求的
+handler。这样的 handler 占着连接的这一轮，而读到对端断开本该由这一轮来做，所以 engine 的
+事件循环一看到对端断开，就通过 `fib.HangupHandler` 提前告知服务端：请求在 handler 还在
+等待时就被取消，连接随之关闭，因为排在它后面的流水线请求不能顶替它被回复。发完请求就
+半关闭写端的客户端被视为已经离开，与 nginx 的处理一致，`net/http` 也会因此取消请求的
+context：如果 FIN 到达时 handler 还在处理，它就收不到响应。这是 epoll 和 kqueue 后端才有的能力；Windows 只在两轮
+之间才挂读，原地阻塞的 handler 要等到返回才会知道，而那时响应已经发出去了。
+
 从这里开始一切都是幂等的：已经结束的请求上再调 `Retain`、`Release`、`Finish` 都是空操作，
 清理代码可以放心调用而不必先判断；往上面写数据会返回那个原因，而不会把连接写坏。
 
@@ -298,7 +306,8 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
   的请求挡住后面的流水线请求、嵌套持有、`OnBody` 对缓存 body 和流式 body、`OnBody` 只登记
   不回调、`BodyComplete`、handler 返回后才调用 `OnBody`、最后一次 body 回调之后自动释放、
   带 trailer 的 chunked、提前回复并关闭 body、客户端上传到一半跑掉时 `OnBody` 和
-  `OnCancel` 各只收到一次、读超时触发 `OnCancel`、body 超限、响应写完之后再 Retain、同一
+  `OnCancel` 各只收到一次、原地阻塞的 handler 在等待期间就能通过 `OnCancel` 和 `Err`
+  得知客户端已断开且其后流水线的请求不会被回复、读超时触发 `OnCancel`、body 超限、响应写完之后再 Retain、同一
   个 handler 跑在 HTTP/2 上，以及把以上全部并发跑一遍并检查没有残留的压力测试。
 - **读超时**（`http/timeout_test.go`）：header 和 body 收到一半就不来了、流式 body
   收到一半就不来了、比 `ReadTimeout` 慢的 handler 仍然能回复、空闲连接被关闭、每个请求

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1429,5 +1430,124 @@ func TestDialedConnectionProtocol(t *testing.T) {
 		c.Close()
 		checkProtocol(t, c, d.want)
 		checkDialed(t, c, true)
+	}
+}
+
+// hangupHandler is a HangupHandler whose OnData waits, as a handler waiting
+// on a database or another server does, until OnHangup tells it the peer has
+// gone or a while has passed.
+type hangupHandler struct {
+	HandlerFuncs
+	waiting chan struct{}
+	hangups atomic.Int32
+	hangup  chan struct{}
+	waited  chan bool
+	closed  chan error
+}
+
+func newHangupHandler() *hangupHandler {
+	h := &hangupHandler{
+		waiting: make(chan struct{}, 1),
+		hangup:  make(chan struct{}),
+		waited:  make(chan bool, 1),
+		closed:  make(chan error, 1),
+	}
+	h.Data = func(*Connection, []byte) {
+		h.waiting <- struct{}{}
+		select {
+		case <-h.hangup:
+			h.waited <- true
+		case <-time.After(5 * time.Second):
+			h.waited <- false
+		}
+	}
+	h.Close = func(_ *Connection, err error) { h.closed <- err }
+	return h
+}
+
+func (h *hangupHandler) OnHangup(*Connection) {
+	if h.hangups.Add(1) == 1 {
+		close(h.hangup)
+	}
+}
+
+// TestOnHangupReachesARunningRound checks that a peer that goes while its
+// connection's round is running is reported to the handler then, rather than
+// once the round reads it, and once; that the connection still closes, with
+// OnClose, once the round is done; and that a peer going while no round is
+// running is left to the round it starts.
+func TestOnHangupReachesARunningRound(t *testing.T) {
+	for _, pollers := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pollers=%v", pollers), func(t *testing.T) {
+			serve := func(h Handler) string {
+				config := DefaultConfig()
+				config.Addr = "127.0.0.1:0"
+				config.IOPollers = pollers
+				server, err := Bind(config, h)
+				if err != nil {
+					t.Fatal(err)
+				}
+				addr, err := server.LocalAddr()
+				if err != nil {
+					t.Fatal(err)
+				}
+				runDone := make(chan error, 1)
+				go func() { runDone <- server.Run() }()
+				t.Cleanup(func() {
+					server.Stop()
+					<-runDone
+					_ = server.Close()
+				})
+				return addr.String()
+			}
+
+			h := newHangupHandler()
+			conn, err := net.DialTimeout("tcp", serve(h), 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = conn.Write([]byte("wait")); err != nil {
+				t.Fatal(err)
+			}
+			<-h.waiting
+			conn.Close()
+			select {
+			case waited := <-h.waited:
+				if !waited {
+					t.Fatal("OnData was never told its peer had gone")
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("OnData never returned")
+			}
+			select {
+			case err := <-h.closed:
+				if err != io.EOF {
+					t.Fatalf("OnClose was given %v, want io.EOF", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the connection never closed")
+			}
+			if n := h.hangups.Load(); n != 1 {
+				t.Fatalf("OnHangup ran %d times", n)
+			}
+
+			// A peer that goes while its connection is idle is read by the
+			// round its hangup starts.
+			idle := newHangupHandler()
+			idle.Data = nil
+			conn, err = net.DialTimeout("tcp", serve(idle), 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn.Close()
+			select {
+			case <-idle.closed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the idle connection never closed")
+			}
+			if n := idle.hangups.Load(); n != 0 {
+				t.Fatalf("OnHangup ran %d times for an idle connection", n)
+			}
+		})
 	}
 }

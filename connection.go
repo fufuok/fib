@@ -106,7 +106,10 @@ type Connection struct {
 	// closePending records that the loop has closed the connection and left
 	// OnClose, and the release of the descriptor, to its last round; see
 	// Engine.closeConnection. Guarded by mu.
-	closePending   bool
+	closePending bool
+	// hangupNoted records that a hangup has been reported while a round was
+	// running, which happens once; see noteEvent. Guarded by mu.
+	hangupNoted    bool
 	flushing       bool
 	corked         bool
 	closeAfterSend bool

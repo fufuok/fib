@@ -119,6 +119,20 @@ on the engine's handler pool rather than in the connection's round, so a handler
 cleanup cannot hold the server up. `Context.Err()` reports the same reason to a handler that
 would rather ask than be told.
 
+That holds for a handler that waits where it is, on a database or another
+server, as well as for one that retained the request. Such a handler holds up
+the connection's round, which is what would read the hangup, so the engine
+tells the server as soon as its event loop sees the peer go, through
+`fib.HangupHandler`. The request is cancelled while the handler still waits,
+and the connection closes, since nothing pipelined behind the request can be
+answered in its place. A client that half-closes its side after sending a
+request is taken to have gone, as nginx takes it, and as `net/http` takes
+it when it cancels the request's context: it gets no response if its handler
+is still working when the FIN arrives. This is the
+epoll and kqueue backends' doing. On Windows, which arms a read only between
+rounds, a handler that waits in place hears nothing until it returns, by which
+time its response has gone out.
+
 From there everything is idempotent: `Retain`, `Release` and `Finish` on a
 request that has ended do nothing, so cleanup code may call them without
 checking, and writing to it fails with the reason rather than corrupting the
@@ -421,7 +435,9 @@ are not fib:
   after the handler returned, the release after a body's last callback,
   chunked with trailers, answering early and closing the body, a client that
   walks away mid-upload reaching `OnBody` and
-  `OnCancel` exactly once, a read timeout reaching `OnCancel`, an oversized
+  `OnCancel` exactly once, a client that hangs up on a handler waiting in
+  place reaching `OnCancel` and `Err` while it waits, with nothing pipelined
+  behind it answered, a read timeout reaching `OnCancel`, an oversized
   body, holds taken after the response was written, the same handler over
   HTTP/2, and a stress test running all of it at once and checking that
   nothing is left behind.

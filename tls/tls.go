@@ -363,6 +363,16 @@ func (h *Handler) OnPriorityData(c *fib.Connection, data []byte) {
 	h.inner().OnPriorityData(c, data)
 }
 
+// OnHangup passes word of a peer that has gone on to the wrapped handler,
+// when it takes it: its handler may be waiting in OnData for the round the
+// hangup is read in, which runs under this handler's own; see
+// fib.HangupHandler.
+func (h *Handler) OnHangup(c *fib.Connection) {
+	if inner, ok := h.inner().(fib.HangupHandler); ok {
+		inner.OnHangup(c)
+	}
+}
+
 func (h *Handler) OnClose(c *fib.Connection, err error) {
 	if t, ok := c.Layer().(*layer); ok {
 		if t.abortNative() {

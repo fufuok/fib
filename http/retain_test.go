@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -454,6 +455,95 @@ func TestOnCancelReportsAClosedConnection(t *testing.T) {
 	case <-cancelled:
 		t.Fatal("OnCancel ran twice")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestOnCancelReportsAHangupToABlockingHandler covers a handler that waits in
+// place rather than retaining, which holds up the round that would read its
+// peer's hangup: it still hears of it while it waits, through OnCancel and
+// Err, rather than never, and the request pipelined behind it is not answered
+// in its place. The client half-closes, so it can see that nothing came back.
+func TestOnCancelReportsAHangupToABlockingHandler(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows arms a connection's read only between its rounds; see fib.HangupHandler")
+	}
+	for _, secure := range []bool{false, true} {
+		name := "cleartext"
+		if secure {
+			name = "tls"
+		}
+		t.Run(name, func(t *testing.T) {
+			started := make(chan struct{}, 2)
+			cancelled := make(chan error, 2)
+			finished := make(chan error, 2)
+			handler := HandlerFunc(func(c *Context) {
+				started <- struct{}{}
+				gone := make(chan struct{})
+				c.OnCancel(func(err error) {
+					cancelled <- err
+					close(gone)
+				})
+				select {
+				case <-gone:
+				case <-time.After(5 * time.Second):
+				}
+				finished <- c.Err()
+				_ = c.Respond(200, "text/plain", []byte("too late"))
+			})
+			var conn net.Conn
+			var tcp *net.TCPConn
+			if secure {
+				serverTLS, clientTLS, err := tlstest.Configs()
+				if err != nil {
+					t.Fatal(err)
+				}
+				addr := serve(t, fibtls.NewServer(ConfigureTLS(serverTLS), NewHandler(handler)))
+				raw, err := net.DialTimeout("tcp", addr, 5*time.Second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tcp = raw.(*net.TCPConn)
+				clientTLS = clientTLS.Clone()
+				clientTLS.NextProtos = []string{"http/1.1"}
+				conn = tls.Client(raw, clientTLS)
+			} else {
+				raw := dialRaw(t, serve(t, NewHandler(handler)))
+				conn, tcp = raw.Conn, raw.Conn.(*net.TCPConn)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.WriteString(conn, "GET /wait HTTP/1.1\r\nHost: test\r\n\r\n"+
+				"GET /behind HTTP/1.1\r\nHost: test\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			<-started
+			start := time.Now()
+			if err := tcp.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-cancelled:
+				if err != io.EOF {
+					t.Fatalf("OnCancel was given %v, want io.EOF", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("OnCancel never ran while the handler waited")
+			}
+			if waited := time.Since(start); waited > 2*time.Second {
+				t.Fatalf("OnCancel ran %v after the hangup", waited)
+			}
+			if err := <-finished; err != io.EOF {
+				t.Fatalf("Err() was %v once the handler was done, want io.EOF", err)
+			}
+			if got, _ := io.ReadAll(conn); len(got) != 0 {
+				t.Fatalf("the client was sent %q after it hung up", got)
+			}
+			select {
+			case <-started:
+				t.Fatal("the request pipelined behind the cancelled one was served")
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
 	}
 }
 

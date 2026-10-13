@@ -6,6 +6,7 @@ import (
 	stdtls "crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	stdhttp "net/http"
 	"net/textproto"
 	"net/url"
@@ -793,7 +794,11 @@ func (h *ServerHandler) endRequestLocked(context *Context) bool {
 	if stream := context.RequestBody(); stream != nil {
 		tooMuchLeft, unread = stream.abandon()
 	}
-	closing := tooMuchLeft || context.closing || context.Request.Close
+	// A request cancelled while its handler ran, by a hangup heard before the
+	// round could read it, has no response for the client to read, and
+	// answering what follows it would answer the wrong request.
+	cancelled := ctxState(context.word.Load()) == ctxCancelled
+	closing := tooMuchLeft || cancelled || context.closing || context.Request.Close
 	if closing {
 		parser.lingers = unread
 		parser.spent = true
@@ -1061,6 +1066,44 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 		}
 	}
 	c.SetAttachment(nil)
+}
+
+// OnHangup cancels the HTTP/1 request whose handler is holding up the round
+// that would read its peer's hangup. A handler that waits in place, on a
+// database or another server, rather than retaining the request, would
+// otherwise hear nothing: by the time the round read the hangup, the handler
+// would have returned and its response been written, leaving nothing to
+// cancel. It hears it through OnCancel, OnBody and Err instead, as one that
+// retained its request hears a close, and the connection closes, since the
+// response is lost and answering what is pipelined behind the request would
+// answer the wrong one. A request whose body is still arriving is left to the
+// round, which reads what the peer sent before it went and then fails the
+// body.
+//
+// It runs on the event loop, so the cancellation runs on the handler pool, as
+// OnClose's does; see fib.HangupHandler.
+func (h *ServerHandler) OnHangup(c *fib.Connection) {
+	state, ok := c.Attachment().(*Parser)
+	if !ok || state.live.Load() != nil {
+		return
+	}
+	context := state.liveContext.Load()
+	if context == nil {
+		return
+	}
+	// As in OnClose: the generation is read while the Context is still this
+	// connection's, which the second load confirms.
+	gen := context.generation()
+	if state.liveContext.Load() != context || ctxState(context.word.Load()) != ctxOpen {
+		return
+	}
+	// The connection closes here rather than when the round reads the
+	// hangup, so that what the handler writes from here on is refused, as it
+	// is on a request whose connection closed under it, rather than sent to a
+	// peer that has gone. OnClose still comes after the round, and whichever
+	// of the two cancellations gets there first is the one that counts.
+	c.CloseWithError(io.EOF)
+	cancelElsewhere(c, func() { context.cancelWith(io.EOF, gen) })
 }
 
 // sendResponse writes a whole HTTP/1 response to the connection.

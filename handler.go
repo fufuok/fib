@@ -45,6 +45,33 @@ type DatagramsHandler interface {
 	OnDatagrams(c *Connection, datagrams [][]byte)
 }
 
+// HangupHandler is a Handler that is told the peer has gone while one of the
+// connection's rounds is still running. A round reads the end of input, or
+// the socket's error, only once its handler returns from OnData, and then
+// closes the connection; a handler that waits in OnData, on a database or on
+// another server, would hear nothing until it was done. OnHangup lets the
+// protocol tell whatever that handler is serving that its peer has gone, so
+// the work can stop early. The connection is still open when OnHangup runs.
+// It closes, and OnClose runs, when the round reads the end of input as
+// usual.
+//
+// OnHangup runs on the event loop, at most once per connection, when the
+// loop sees the peer end its side of the connection, or the socket fail,
+// while a round of the connection is running or waiting to run. It must
+// not block, nor take a lock that a handler in OnData may hold; work that
+// would do either goes to a goroutine or a pool. A hangup that arrives
+// while no round is running needs no early word: the round it starts
+// reads it and closes the connection.
+//
+// The epoll and kqueue backends call it. Windows arms a connection's read
+// only between its rounds, and the portable backend reports the end of input
+// as a close, so there the hangup is heard when the round ends, as it would
+// be without OnHangup.
+type HangupHandler interface {
+	Handler
+	OnHangup(*Connection)
+}
+
 // HandlerFuncs allows callers to implement only the callbacks they need.
 type HandlerFuncs struct {
 	Open         func(*Connection)

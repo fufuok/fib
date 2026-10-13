@@ -251,8 +251,12 @@ func (c *Context) Err() error {
 // OnCancel registers fn to run if the request ends before its response does:
 // the connection closing under it, a read timeout, or a body that failed. It
 // is for a handler that retained the request and is working on it elsewhere,
-// so it can stop and give back what it holds; a handler that takes the body
-// through OnBody hears the same thing there and needs no second callback.
+// so it can stop and give back what it holds, and for one that waits in place,
+// on a database or another server, so it can stop waiting: a peer that hangs
+// up on it is heard while it waits, rather than once it returns, where the
+// engine's backend can tell (see fib.HangupHandler). A handler that takes the
+// body through OnBody hears the same thing there and needs no second
+// callback.
 //
 // fn runs once, on the engine's handler pool rather than in the connection's
 // round, and

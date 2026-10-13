@@ -688,7 +688,21 @@ func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
 	c.pendingEvents |= uint16(events)
 	submit := !c.scheduled
 	c.scheduled = true
+	// A round already running reads the hangup only once its handler is
+	// done, which may be a long while for one that waits in OnData; see
+	// HangupHandler. The end of input a CloseRead raises, or a lingering
+	// close is waiting for, is not the peer going.
+	hangup := !submit && !c.hangupNoted && events&(evErr|evHup|evRdHup) != 0 &&
+		!c.flags.has(flagReadShut) && !c.flags.has(flagLingering)
+	if hangup {
+		c.hangupNoted = true
+	}
 	c.mu.Unlock()
+	if hangup {
+		if h, ok := c.handler.(HangupHandler); ok {
+			h.OnHangup(c)
+		}
+	}
 	if !submit {
 		return nil
 	}
