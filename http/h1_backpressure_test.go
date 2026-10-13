@@ -5,8 +5,8 @@ package http
 import (
 	"bufio"
 	"bytes"
-	"io"
 	"errors"
+	"io"
 	"net"
 	stdhttp "net/http"
 	"os"

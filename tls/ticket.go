@@ -100,8 +100,13 @@ func newTicketKeys(config *stdtls.Config) *ticketKeys {
 		return nil
 	}
 	t := &ticketKeys{}
-	if config.SessionTicketKey != ([32]byte{}) {
-		if k, err := newTicketKey(config.SessionTicketKey[:], time.Time{}); err == nil {
+	// crypto/tls fills an unset SessionTicketKey, under its own lock, the first
+	// time a server it runs on the Config needs a ticket key; Clone reads it
+	// under that lock. A key it made starts with "DEPRECATED" and is never
+	// used to seal tickets, so it is not the user's.
+	key := config.Clone().SessionTicketKey
+	if key != ([32]byte{}) && !bytes.HasPrefix(key[:], []byte("DEPRECATED")) {
+		if k, err := newTicketKey(key[:], time.Time{}); err == nil {
 			t.static = k
 		}
 	}
