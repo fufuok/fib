@@ -24,6 +24,7 @@ import (
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/http3/quic"
+	"github.com/lesismal/fib/internal/reqbody"
 	fibtls "github.com/lesismal/fib/tls"
 )
 
@@ -205,8 +206,20 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 }
 
 // Do sends req and calls callback exactly once with its response or the
-// reason there is none. It does not wait for the network, though it does
-// read req.Body, which must therefore not block for long.
+// reason there is none. It does not wait for the network.
+//
+// A body with a ContentLength of up to 1MB, which is what net/http.NewRequest
+// sets for a bytes.Reader, bytes.Buffer or strings.Reader that small, is read
+// whole by Do, so it must not block for long. Any other body is sent as it is
+// read, by a goroutine of its own that reads it a piece at a time and waits
+// whenever the stream has 64KB of it unsent, so that the server's flow
+// control paces it rather than memory here. It is closed once it has been
+// sent, or once the request is over, which may be while a Read on it waits.
+// A response that arrives before the body has all been sent ends the
+// sending. A body that fails to read, or is not as long as its ContentLength,
+// fails the request. Such a body is never sent as 0-RTT data, and a request
+// that has to go again, after the server turned it away unprocessed, can
+// only send it again through req.GetBody; without it the request fails.
 //
 // callback may run on any goroutine: an engine worker, a timer, or the
 // caller's own for a request Do rejects outright. It must not block for
@@ -231,7 +244,12 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 		return
 	}
 	var body []byte
-	if req.Body != nil && req.Body != stdhttp.NoBody {
+	var upload *reqbody.Source
+	length := int64(0)
+	if reqbody.Streams(req) {
+		upload = reqbody.NewSource(req)
+		length = reqbody.Declared(req)
+	} else if req.Body != nil && req.Body != stdhttp.NoBody {
 		var err error
 		body, err = io.ReadAll(req.Body)
 		_ = req.Body.Close()
@@ -241,8 +259,11 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 		}
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	r := &clientRequest{req: req, body: body, callback: callback, whole: whole}
-	fields, trailer, err := requestFields(req, len(body))
+	if upload == nil {
+		length = int64(len(body))
+	}
+	r := &clientRequest{req: req, body: body, upload: upload, declared: length, callback: callback, whole: whole}
+	fields, trailer, err := requestFields(req, length)
 	if err != nil {
 		callback(nil, err)
 		return
@@ -368,9 +389,13 @@ func (c *Client) forget(cc *clientConn) {
 
 // clientRequest is one request from Do until its callback.
 type clientRequest struct {
-	req    *stdhttp.Request
-	body   []byte
-	fields []qpack.HeaderField
+	req  *stdhttp.Request
+	body []byte
+	// upload is the body of a request whose body streams, sent after the
+	// header, and declared its length, or -1 when it has none.
+	upload   *reqbody.Source
+	declared int64
+	fields   []qpack.HeaderField
 	// trailer is the trailer section that ends the request, if it has one.
 	trailer  []qpack.HeaderField
 	callback func(*fibhttp.ClientResponse, error)
@@ -400,7 +425,7 @@ type clientRequest struct {
 func (r *clientRequest) canGoEarly() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.noEarly || len(r.body) > 0 || len(r.trailer) > 0 {
+	if r.noEarly || len(r.body) > 0 || r.upload != nil || len(r.trailer) > 0 {
 		return false
 	}
 	switch r.req.Method {
@@ -450,6 +475,11 @@ func (r *clientRequest) markDone() bool {
 		r.stopContext()
 	}
 	r.stream = nil
+	if r.upload != nil {
+		// Whatever of the body is still being sent is not wanted now, and
+		// closing it ends a Read on it that waits.
+		r.upload.Close()
+	}
 	return true
 }
 
@@ -507,8 +537,9 @@ func (r *clientRequest) retry(c *Client, err error) {
 }
 
 // requestFields lists a request's fields, pseudo-headers first, and its
-// trailer fields, checking them all before any is encoded.
-func requestFields(req *stdhttp.Request, bodyLen int) (fields, trailer []qpack.HeaderField, err error) {
+// trailer fields, checking them all before any is encoded. bodyLen is the
+// length of the body, or -1 for one that streams without a length.
+func requestFields(req *stdhttp.Request, bodyLen int64) (fields, trailer []qpack.HeaderField, err error) {
 	host := req.Host
 	if host == "" {
 		host = req.URL.Host
@@ -551,7 +582,8 @@ func requestFields(req *stdhttp.Request, bodyLen int) (fields, trailer []qpack.H
 	}
 	switch {
 	case bodyLen > 0:
-		fields = append(fields, qpack.HeaderField{Name: "content-length", Value: strconv.Itoa(bodyLen)})
+		fields = append(fields, qpack.HeaderField{Name: "content-length", Value: strconv.FormatInt(bodyLen, 10)})
+	case bodyLen < 0:
 	case method == stdhttp.MethodPost || method == stdhttp.MethodPut || method == stdhttp.MethodPatch:
 		fields = append(fields, qpack.HeaderField{Name: "content-length", Value: "0"})
 	}
@@ -1013,12 +1045,34 @@ type clientStream struct {
 	stream  *fibhttp.ResponseStream
 	passed  int64
 	fedBody int
+	// uploading says the request's body, which streams, is still being sent.
+	uploading atomic.Bool
 }
 
 // send writes the request: HEADERS, the body in one DATA frame, and the
-// end of the stream.
+// end of the stream, or, for a body that streams, HEADERS alone, with the
+// rest left to sendBody.
 func (st *clientStream) send() {
 	r := st.r
+	if r.upload != nil {
+		block := bufferpool.Append(nil, qpack.Prefix)
+		for _, f := range r.fields {
+			block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))
+		}
+		out := appendHeadersFrame(bufferpool.Get(len(block) + 16)[:0], block)
+		bufferpool.Put(block)
+		if err := st.s.WriteOwned(out, false); err != nil {
+			st.fail(err)
+			return
+		}
+		st.uploading.Store(true)
+		// The body is read by a goroutine of its own, since a Read may wait
+		// as long as the body's producer likes, and so may the sending, for
+		// the server; neither may hold up a worker, a pool, or the goroutine
+		// that hands the connection its datagrams.
+		go st.sendBody()
+		return
+	}
 	// The stream copies what it is written, so every buffer built here goes
 	// back to the pool once the frames are on it.
 	block := bufferpool.Append(nil, qpack.Prefix)
@@ -1044,6 +1098,57 @@ func (st *clientStream) send() {
 		st.fail(err)
 	}
 	bufferpool.Put(out)
+}
+
+// sendBody sends the body of the stream's request, which streams, a piece at
+// a time, each once the stream has no more than reqbody.MaxQueued of the
+// ones before it unsent, then the trailers, if any, and the end of the
+// stream. It ends early when the stream's sending side does, which a
+// response that arrives first ends (see complete), and so does a server that
+// asks for no more with STOP_SENDING.
+func (st *clientStream) sendBody() {
+	r := st.r
+	rc, err := r.upload.Take()
+	if err == nil {
+		err = reqbody.Pump(rc, r.declared, func(p []byte) error {
+			if err := st.s.WaitSendable(reqbody.MaxQueued); err != nil {
+				return err
+			}
+			out := bufferpool.Get(len(p) + 16)[:0]
+			out = appendFrameHeader(out, frameData, len(p))
+			out = append(out, p...)
+			return st.s.WriteOwned(out, false)
+		})
+	}
+	if err == nil {
+		var out []byte
+		// The trailer's values are those of when the body has been read.
+		if _, trailer, terr := requestFields(r.req, -1); terr == nil && len(trailer) > 0 {
+			block := bufferpool.Append(nil, qpack.Prefix)
+			for _, f := range trailer {
+				block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))
+			}
+			out = appendHeadersFrame(bufferpool.Get(len(block) + 16)[:0], block)
+			bufferpool.Put(block)
+		}
+		if out != nil {
+			err = st.s.WriteOwned(out, true)
+		} else {
+			err = st.s.Write(nil, true)
+		}
+	}
+	st.uploading.Store(false)
+	if err == nil {
+		return
+	}
+	var bodyErr *reqbody.BodyError
+	if errors.As(err, &bodyErr) {
+		err = bodyErr.Err
+	} else if !errors.Is(err, reqbody.ErrNotReplayable) {
+		// The stream or connection ended, which is reported where it did.
+		return
+	}
+	r.abort(err)
 }
 
 func (st *clientStream) feed(data []byte, fin bool) {
@@ -1205,6 +1310,11 @@ func (st *clientStream) tooEarly() {
 // complete hands a finished response to its request.
 func (st *clientStream) complete() {
 	st.done = true
+	if st.uploading.Load() {
+		// The server answered before the body had all gone, so it does not
+		// want the rest: the sending stops (RFC 9114 section 4.1).
+		st.s.Reset(uint64(ErrCodeRequestCancelled))
+	}
 	resp := st.resp
 	if resp == nil {
 		st.fail(errors.New("http3: response ended before its header"))

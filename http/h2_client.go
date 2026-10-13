@@ -15,8 +15,14 @@ import (
 
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/hpack"
+	"github.com/lesismal/fib/internal/outputwait"
+	"github.com/lesismal/fib/internal/reqbody"
 	"github.com/lesismal/fib/sidepool"
 )
+
+// errStreamGone is what sending a streamed request body gets once its stream
+// or connection has ended, which whoever ended it reports.
+var errStreamGone = errors.New("http2: stream closed")
 
 // HTTP/2 on the client side: a clientConn whose TLS handshake chose "h2", or
 // that was dialed for h2c, hands its traffic to an h2ClientConn, which runs
@@ -51,6 +57,9 @@ type h2ClientConn struct {
 	sendWindow   int64
 	goAway       bool
 	closed       bool
+	// room wakes the senders of streamed request bodies waiting for their
+	// stream's body to leave, or for the stream to end. Its lock is mu.
+	room sync.Cond
 	// failed is the error this side ended the connection with, which the
 	// requests still on it then report.
 	failed error
@@ -76,6 +85,9 @@ type h2ClientStream struct {
 	sendWindow int64
 	pending    []byte
 	localDone  bool
+	// streaming says more of the request body is to come than pending
+	// holds: it streams, and has not ended.
+	streaming bool
 	// trailer holds the request's trailer fields, as name and value pairs,
 	// which go out in a HEADERS frame once the body has.
 	trailer []string
@@ -99,6 +111,7 @@ func (cc *clientConn) startH2() {
 		peerWindow:   h2DefaultWindow,
 		sendWindow:   h2DefaultWindow,
 	}
+	hc.room.L = &hc.mu
 	cc.maxStreams = h2InitialMaxStreams
 	cc.h2 = hc
 	out := append([]byte(nil), h2Preface...)
@@ -152,8 +165,10 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 	}
 	st.trailer = trailer
 	// The stream ends with the body, or with the trailers when there are any.
-	out := h2AppendHeaderBlock(nil, id, block, len(r.body) == 0 && len(trailer) == 0, hc.peerMaxFrame)
+	out := h2AppendHeaderBlock(nil, id, block, len(r.body) == 0 && len(trailer) == 0 && r.upload == nil, hc.peerMaxFrame)
 	switch {
+	case r.upload != nil:
+		st.streaming = true
 	case len(r.body) > 0:
 		st.pending = r.body
 		out = hc.flushStreamLocked(out, st)
@@ -164,6 +179,95 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 	}
 	hc.sendLocked(out)
 	hc.mu.Unlock()
+	if r.upload != nil {
+		// See clientConn.send for why a goroutine of its own.
+		go hc.sendBody(st)
+	}
+}
+
+// liveLocked reports whether st is still open on the connection.
+func (hc *h2ClientConn) liveLocked(st *h2ClientStream) bool {
+	return !hc.closed && hc.streams[st.id] == st
+}
+
+// sendBody sends the body of st's request, which streams, a piece at a time:
+// each waits until the windows have let it all go, and then for the
+// connection's queue to drain to reqbody.MaxQueued, so that neither a stream
+// the server reads slowly nor a slow socket has more of it in memory. It ends
+// early when the stream does, which a response that arrives before the body
+// has gone does (see complete).
+func (hc *h2ClientConn) sendBody(st *h2ClientStream) {
+	r := st.r
+	rc, err := r.upload.Take()
+	if err == nil {
+		err = reqbody.Pump(rc, r.declared, func(p []byte) error {
+			hc.mu.Lock()
+			if !hc.liveLocked(st) {
+				hc.mu.Unlock()
+				return errStreamGone
+			}
+			st.pending = p
+			hc.sendLocked(hc.flushStreamLocked(nil, st))
+			for len(st.pending) > 0 && hc.liveLocked(st) {
+				hc.room.Wait()
+			}
+			live := hc.liveLocked(st)
+			// p is the caller's again: nothing may send from it now.
+			st.pending = nil
+			hc.mu.Unlock()
+			if !live {
+				return errStreamGone
+			}
+			if outputwait.Wait != nil {
+				return outputwait.Wait(hc.cc.conn, reqbody.MaxQueued)
+			}
+			return nil
+		})
+	}
+	if err == nil {
+		hc.mu.Lock()
+		if hc.liveLocked(st) {
+			st.streaming = false
+			// The trailer's values are those of when the body has been read.
+			st.trailer = h2TrailerFields(r.req)
+			var out []byte
+			if len(st.trailer) > 0 {
+				out = hc.appendTrailerLocked(nil, st)
+			} else {
+				out = h2AppendFrameHeader(nil, h2FrameData, h2FlagEndStream, st.id, 0)
+				st.localDone = true
+			}
+			hc.sendLocked(out)
+		}
+		hc.mu.Unlock()
+		return
+	}
+	var bodyErr *reqbody.BodyError
+	if errors.As(err, &bodyErr) {
+		err = bodyErr.Err
+	} else if !errors.Is(err, reqbody.ErrNotReplayable) {
+		// The stream or connection ended, which is reported where it did.
+		return
+	}
+	r.abort(err)
+}
+
+// h2TrailerFields lists the request's trailer fields as name and value pairs,
+// leaving out any that h2RequestFields refused to announce.
+func h2TrailerFields(req *stdhttp.Request) []string {
+	var trailer []string
+	for key, values := range req.Trailer {
+		name := strings.ToLower(key)
+		if !h2ValidHeaderName(name) || strings.HasPrefix(name, ":") || h2ConnectionHeaders[name] {
+			continue
+		}
+		for _, value := range values {
+			if validHeaderValue(value) {
+				trailer = append(trailer, name, value)
+			}
+		}
+	}
+	return trailer
 }
 
 // h2RequestFields lists a request's header fields, pseudo-headers first, and
@@ -214,6 +318,10 @@ func h2RequestFields(r *clientRequest, secure bool) (fields, trailer []string, e
 	switch {
 	case len(r.body) > 0:
 		fields = append(fields, "content-length", strconv.Itoa(len(r.body)))
+	case r.upload != nil:
+		if r.declared >= 0 {
+			fields = append(fields, "content-length", strconv.FormatInt(r.declared, 10))
+		}
 	case method == stdhttp.MethodPost || method == stdhttp.MethodPut || method == stdhttp.MethodPatch:
 		fields = append(fields, "content-length", "0")
 	}
@@ -252,6 +360,7 @@ func (hc *h2ClientConn) cancel(r *clientRequest) {
 	delete(hc.streams, st.id)
 	hc.sendLocked(h2AppendRSTStream(nil, st.id, H2Cancel))
 	hc.closeIfDoneLocked()
+	hc.room.Broadcast()
 	hc.mu.Unlock()
 	hc.client.streamDone(hc.cc)
 }
@@ -269,6 +378,7 @@ func (hc *h2ClientConn) shutdown(err error) {
 		streams = append(streams, st)
 	}
 	clear(hc.streams)
+	hc.room.Broadcast()
 	hc.mu.Unlock()
 	if err == nil || err == io.EOF {
 		err = io.ErrUnexpectedEOF
@@ -544,6 +654,7 @@ func (hc *h2ClientConn) handleGoAway(lastID uint32) {
 		}
 	}
 	hc.closeIfDoneLocked()
+	hc.room.Broadcast()
 	hc.mu.Unlock()
 	hc.client.retire(hc.cc)
 	for _, st := range unprocessed {
@@ -807,6 +918,7 @@ func (hc *h2ClientConn) complete(st *h2ClientStream) {
 		hc.sendLocked(h2AppendRSTStream(nil, st.id, H2Cancel))
 	}
 	hc.closeIfDoneLocked()
+	hc.room.Broadcast()
 	hc.mu.Unlock()
 	if st.stream != nil {
 		st.r.detach()
@@ -845,6 +957,7 @@ func (hc *h2ClientConn) endStream(id uint32, retry bool, err error) {
 		st.pending = nil
 	}
 	hc.closeIfDoneLocked()
+	hc.room.Broadcast()
 	hc.mu.Unlock()
 	if st == nil {
 		return
@@ -868,6 +981,8 @@ func (hc *h2ClientConn) flushLocked(out []byte) []byte {
 			out = hc.flushStreamLocked(out, st)
 		}
 	}
+	// A streamed body waiting for its piece to leave looks again.
+	hc.room.Broadcast()
 	return out
 }
 
@@ -883,6 +998,11 @@ func (hc *h2ClientConn) flushStreamLocked(out []byte, st *h2ClientStream) []byte
 		last := len(st.pending) == 0
 		if last {
 			st.pending = nil
+		}
+		// A body that streams ends once it has been read, not when what of
+		// it has been read so far has gone.
+		last = last && !st.streaming
+		if last {
 			if len(st.trailer) == 0 {
 				flags = h2FlagEndStream
 				st.localDone = true

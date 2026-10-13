@@ -11,13 +11,19 @@ import (
 	"io"
 	"net"
 	stdhttp "net/http"
+	"net/textproto"
 	"os"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	fib "github.com/lesismal/fib"
+	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/outputwait"
+	"github.com/lesismal/fib/internal/reqbody"
 	"github.com/lesismal/fib/sidepool"
 	fibtls "github.com/lesismal/fib/tls"
 )
@@ -176,8 +182,23 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 }
 
 // Do sends req and calls callback exactly once with its response or the
-// reason there is none. It does not wait for the network, though it does read
-// req.Body, which must therefore not block for long.
+// reason there is none. It does not wait for the network.
+//
+// A body with a ContentLength of up to 1MB, which is what net/http.NewRequest
+// sets for a bytes.Reader, bytes.Buffer or strings.Reader that small, is read
+// whole by Do, so it must not block for long, and goes out with the header.
+// Any other body is sent as it is read, by a goroutine of its own that reads
+// it a piece at a time and waits whenever the connection has 64KB of it
+// unsent, so that a large or slow body is paced by the server rather than
+// held in memory: by TCP on HTTP/1, which frames it with Content-Length when
+// ContentLength is set and chunked otherwise, and by the stream's flow control
+// on HTTP/2. The body is closed once it has been sent, or once the request
+// is over, which may be while a Read on it is waiting. A response that
+// arrives before the body has all been sent ends the sending: the server has
+// answered without it. A body that fails to read, or is not as long as its
+// ContentLength, fails the request. A body that has been sent, wholly or in
+// part, can only be sent again, as a request that a closed connection or the
+// server turned away is, through req.GetBody; without it such a request fails.
 //
 // The response body is buffered whole and may be read after the callback
 // returns; closing it is optional. With ClientConfig.StreamResponseBody it
@@ -205,10 +226,14 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 		callback(nil, err)
 		return
 	}
-	// The body is read once and kept, since whether it travels in HTTP/1.1 or
-	// HTTP/2 framing is only known once a connection has been chosen.
+	// A small body is read once and kept, since whether it travels in
+	// HTTP/1.1 or HTTP/2 framing is only known once a connection has been
+	// chosen. Others are read as they are sent.
 	var body []byte
-	if req.Body != nil && req.Body != stdhttp.NoBody {
+	var upload *reqbody.Source
+	if reqbody.Streams(req) {
+		upload = reqbody.NewSource(req)
+	} else if req.Body != nil && req.Body != stdhttp.NoBody {
 		body, err = io.ReadAll(req.Body)
 		_ = req.Body.Close()
 		if err != nil {
@@ -217,12 +242,21 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 		}
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	data, err := marshalRequest(req, body)
+	var data []byte
+	declared, chunked := int64(-1), false
+	if upload != nil {
+		declared = reqbody.Declared(req)
+		chunked = declared < 0 || len(req.Trailer) > 0
+		data, err = marshalStreamedHead(req, declared, chunked)
+	} else {
+		data, err = marshalRequest(req, body)
+	}
 	if err != nil {
 		callback(nil, err)
 		return
 	}
-	r := &clientRequest{req: req, data: data, body: body, callback: callback, whole: whole}
+	r := &clientRequest{req: req, data: data, body: body, upload: upload, declared: declared, chunked: chunked,
+		callback: callback, whole: whole}
 	// Either hook can fire before it has been stored, so both are stored under
 	// the lock finish reads them under.
 	r.mu.Lock()
@@ -267,6 +301,56 @@ func marshalRequest(req *stdhttp.Request, body []byte) ([]byte, error) {
 		data[lineEnd-1] = '0'
 	}
 	return data, nil
+}
+
+// marshalStreamedHead frames the header of req, whose body streams, for an
+// HTTP/1 connection: with a Content-Length of declared, or as chunked, with
+// the names of its trailers.
+func marshalStreamedHead(req *stdhttp.Request, declared int64, chunked bool) ([]byte, error) {
+	clone := *req
+	clone.Body, clone.GetBody = nil, nil
+	clone.ContentLength = 0
+	clone.TransferEncoding = nil
+	clone.Trailer = nil
+	var buf bytes.Buffer
+	if err := clone.Write(&buf); err != nil {
+		return nil, err
+	}
+	data := buf.Bytes()
+	// net/http declares an empty body for a POST, PUT or PATCH without one.
+	if i := bytes.Index(data, []byte("\r\nContent-Length: 0\r\n")); i >= 0 {
+		data = append(data[:i+2], data[i+len("\r\nContent-Length: 0\r\n"):]...)
+	}
+	end := data[len(data)-2:]
+	head := append([]byte(nil), data[:len(data)-2]...)
+	if !chunked {
+		head = append(head, "Content-Length: "...)
+		head = strconv.AppendInt(head, declared, 10)
+		head = append(head, "\r\n"...)
+		return append(head, end...), nil
+	}
+	head = append(head, "Transfer-Encoding: chunked\r\n"...)
+	if len(req.Trailer) > 0 {
+		names := make([]string, 0, len(req.Trailer))
+		for name := range req.Trailer {
+			names = append(names, textproto.CanonicalMIMEHeaderKey(name))
+		}
+		slices.Sort(names)
+		head = append(head, "Trailer: "...)
+		head = append(head, strings.Join(names, ",")...)
+		head = append(head, "\r\n"...)
+	}
+	return append(head, end...), nil
+}
+
+// lastChunk ends a chunked body, with the trailer fields as they are now
+// that the body has been read, which is when net/http reads them too.
+func lastChunk(trailer stdhttp.Header) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("0\r\n")
+	_ = trailer.Write(&buf)
+	buf.WriteString("\r\n")
+	return buf.Bytes()
 }
 
 // Future is a request in flight, for callers that would rather wait on it than
@@ -695,8 +779,14 @@ type clientRequest struct {
 	req *stdhttp.Request
 	// data is the request in HTTP/1.1 framing, and body its body alone, which
 	// is what HTTP/2 sends after the header block.
-	data     []byte
-	body     []byte
+	data []byte
+	body []byte
+	// upload is the body of a request whose body streams, sent after data,
+	// which then holds only the header, declared its length or -1, and
+	// chunked whether HTTP/1 frames it in chunks.
+	upload   *reqbody.Source
+	declared int64
+	chunked  bool
 	callback func(*ClientResponse, error)
 	// whole asks for the response to arrive whole even when the client would
 	// stream it.
@@ -762,6 +852,11 @@ func (r *clientRequest) markDone() bool {
 	if stopContext != nil {
 		stopContext()
 	}
+	if r.upload != nil {
+		// Whatever of the body is still being sent is not wanted now, and
+		// closing it ends a Read on it that waits.
+		r.upload.Close()
+	}
 	return true
 }
 
@@ -819,6 +914,10 @@ func (r *clientRequest) detach() {
 // retryable reports whether a request that may have reached the server can be
 // sent again without the server acting on it twice.
 func (r *clientRequest) retryable() bool {
+	if r.upload != nil && r.req.GetBody == nil {
+		// Its body has gone, at least in part.
+		return false
+	}
 	switch r.req.Method {
 	case "", stdhttp.MethodGet, stdhttp.MethodHead, stdhttp.MethodOptions, stdhttp.MethodTrace:
 		return !r.retried
@@ -841,12 +940,15 @@ type clientConn struct {
 	mu       sync.Mutex
 	// current is the request in flight, if any. sent records that the
 	// connection has carried a request before this one, and received that the
-	// server has answered this one with at least a byte.
-	current  *clientRequest
-	sent     bool
-	reused   bool
-	received bool
-	closed   bool
+	// server has answered this one with at least a byte. uploading is the
+	// request whose body is still being sent, which leaves the connection
+	// unfit to carry another.
+	current   *clientRequest
+	uploading *clientRequest
+	sent      bool
+	reused    bool
+	received  bool
+	closed    bool
 	// idleTimer is armed while the connection is idle. Guarded by Client.mu.
 	idleTimer *time.Timer
 	// settled records that the dial has been reported to the client, which
@@ -899,8 +1001,61 @@ func (cc *clientConn) send(r *clientRequest) {
 		cc.client.release(cc)
 		return
 	}
+	if r.upload != nil {
+		cc.mu.Lock()
+		cc.uploading = r
+		cc.mu.Unlock()
+	}
 	// A failed send closes the connection, and OnClose then settles r.
-	_ = cc.conn.Send(r.data)
+	if cc.conn.Send(r.data) == nil && r.upload != nil {
+		// The body is read by a goroutine of its own, since a Read may wait
+		// as long as the body's producer likes, and so may the sending, for
+		// the server; neither may hold up a worker or a pool.
+		go cc.sendBody(r)
+	}
+}
+
+// sendBody sends the body of r, which streams, and waits whenever
+// reqbody.MaxQueued of it is queued for the socket, so that the server's pace
+// is the body's. It ends early when the connection closes, which a response
+// that arrives before the body has gone does (see OnData).
+func (cc *clientConn) sendBody(r *clientRequest) {
+	rc, err := r.upload.Take()
+	if err == nil {
+		err = reqbody.Pump(rc, r.declared, func(p []byte) error {
+			var err error
+			if r.chunked {
+				out := appendChunk(bufferpool.Get(len(p) + 20)[:0], p)
+				err = cc.conn.Send(out)
+				bufferpool.Put(out)
+			} else {
+				err = cc.conn.Send(p)
+			}
+			if err == nil && outputwait.Wait != nil {
+				err = outputwait.Wait(cc.conn, reqbody.MaxQueued)
+			}
+			return err
+		})
+		if err == nil && r.chunked {
+			err = cc.conn.Send(lastChunk(r.req.Trailer))
+		}
+	}
+	cc.mu.Lock()
+	if cc.uploading == r {
+		cc.uploading = nil
+	}
+	cc.mu.Unlock()
+	if err == nil {
+		return
+	}
+	var bodyErr *reqbody.BodyError
+	if errors.As(err, &bodyErr) {
+		err = bodyErr.Err
+	} else if !errors.Is(err, reqbody.ErrNotReplayable) {
+		// The connection failed, which OnClose reports.
+		return
+	}
+	r.abort(err)
 }
 
 // discard closes the connection without handing it back.
@@ -908,6 +1063,7 @@ func (cc *clientConn) discard() {
 	cc.mu.Lock()
 	cc.closed = true
 	cc.current = nil
+	cc.uploading = nil
 	cc.mu.Unlock()
 	cc.conn.Close()
 }
@@ -967,6 +1123,13 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 		(r.req.ProtoAtLeast(1, 1) || headerHasToken(r.req.Header, "Connection", "keep-alive"))
 	cc.mu.Lock()
 	cc.current = nil
+	if cc.uploading == r {
+		// The server answered before the body had all gone: it does not want
+		// the rest, and the connection, part way through the body, cannot
+		// carry another request. Closing it ends the sending.
+		cc.uploading = nil
+		reusable = false
+	}
 	cc.mu.Unlock()
 	r.detach()
 	// Read before the connection is released: its next request resets it.
