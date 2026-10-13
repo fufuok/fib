@@ -78,7 +78,7 @@ func issueCertFor(t *testing.T, key crypto.Signer, host string) (stdtls.Certific
 	return stdtls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, cert
 }
 
-func keyOf(t *testing.T, kind string) crypto.Signer {
+func keyOf(t testing.TB, kind string) crypto.Signer {
 	t.Helper()
 	switch kind {
 	case "ecdsa-p256":

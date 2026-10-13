@@ -31,7 +31,7 @@ type testCA struct {
 
 var serial atomic.Int64
 
-func newTestCA(t *testing.T, name string) *testCA {
+func newTestCA(t testing.TB, name string) *testCA {
 	t.Helper()
 	key := keyOf(t, "ecdsa-p256")
 	template := &x509.Certificate{
@@ -55,7 +55,7 @@ func newTestCA(t *testing.T, name string) *testCA {
 
 // issue makes a certificate with a key of kind for name, for a client or a
 // server.
-func (ca *testCA) issue(t *testing.T, kind, name string, client bool) stdtls.Certificate {
+func (ca *testCA) issue(t testing.TB, kind, name string, client bool) stdtls.Certificate {
 	t.Helper()
 	key := keyOf(t, kind)
 	usage := x509.ExtKeyUsageServerAuth

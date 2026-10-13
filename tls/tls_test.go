@@ -401,7 +401,7 @@ func TestReadStopsAtRecordEnds(t *testing.T) {
 
 // startEchoServer runs an engine listening on a loopback port, or, with a nil
 // handler, one that only dials, and returns it with its address.
-func startEchoServer(t *testing.T, config fib.Config, handler fib.Handler) (*fib.Engine, string) {
+func startEchoServer(t testing.TB, config fib.Config, handler fib.Handler) (*fib.Engine, string) {
 	t.Helper()
 	config.Addr = "127.0.0.1:0"
 	engine, err := fib.Bind(config, handler)
