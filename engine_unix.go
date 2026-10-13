@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -61,6 +62,13 @@ type enginePlatform struct {
 	// TCP_NODELAY as they are accepted.
 	tcpListeners   bool
 	nextGeneration atomic.Uint64
+	// listenMu guards stopping the listeners, which Stop does from whatever
+	// goroutine calls it, and listenAddrs, the addresses they were bound to
+	// when they stopped: on Darwin and the BSDs a stopped listener's
+	// descriptor holds an unbound socket, so its address is kept from before.
+	listenMu      sync.Mutex
+	listenStopped bool
+	listenAddrs   []syscall.Sockaddr
 	// connections is a paged table indexed by file descriptor: a descriptor is
 	// a small dense integer the kernel already allocates, so the lookup on
 	// every event is two bounds checks rather than a hash.
@@ -216,15 +224,36 @@ func (e *Engine) openUDPBeside(config Config, parent *Engine) error {
 	return nil
 }
 
-// stopListening stops the engine's TCP listeners taking connections without
-// giving up their descriptors; see stopListeningFD.
+// stopListening stops the engine's listeners taking connections without
+// giving up their descriptors; see stopListeningFD. Stop calls it, so that a
+// client connecting to an engine that is stopping is refused rather than left
+// in a backlog nothing accepts from, and it is safe to call again or from any
+// goroutine.
 func (e *Engine) stopListening() {
-	if !e.tcpListeners {
+	e.listenMu.Lock()
+	defer e.listenMu.Unlock()
+	if e.listenStopped {
 		return
 	}
-	for _, fd := range e.listenFDs {
+	e.listenStopped = true
+	e.listenAddrs = make([]syscall.Sockaddr, len(e.listenFDs))
+	for i, fd := range e.listenFDs {
+		e.listenAddrs[i], _ = syscall.Getsockname(fd)
 		stopListeningFD(fd)
 	}
+}
+
+// listenSockname returns the address of the i-th listener, fd, which is the
+// one it had before it stopped listening if it has.
+func (e *Engine) listenSockname(i, fd int) (syscall.Sockaddr, error) {
+	e.listenMu.Lock()
+	defer e.listenMu.Unlock()
+	if e.listenStopped && i < len(e.listenAddrs) {
+		if sa := e.listenAddrs[i]; sa != nil {
+			return sa, nil
+		}
+	}
+	return syscall.Getsockname(fd)
 }
 
 func (e *Engine) closeListeners() {
@@ -432,8 +461,8 @@ func (e *Engine) isListener(fd int) bool {
 // left at zero report the port the kernel chose.
 func (e *Engine) ListenAddrs() ([]net.Addr, error) {
 	addrs := make([]net.Addr, 0, len(e.listenFDs)+len(e.udpListeners))
-	for _, fd := range e.listenFDs {
-		sa, err := syscall.Getsockname(fd)
+	for i, fd := range e.listenFDs {
+		sa, err := e.listenSockname(i, fd)
 		if err != nil {
 			return nil, err
 		}
@@ -454,8 +483,8 @@ func (e *Engine) ListenAddrs() ([]net.Addr, error) {
 // listening on Unix sockets; ListenAddrs reports those.
 func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 	addrs := make([]*net.TCPAddr, 0, len(e.listenFDs))
-	for _, fd := range e.listenFDs {
-		sa, err := syscall.Getsockname(fd)
+	for i, fd := range e.listenFDs {
+		sa, err := e.listenSockname(i, fd)
 		if err != nil {
 			return nil, err
 		}

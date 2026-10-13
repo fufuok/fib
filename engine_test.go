@@ -81,6 +81,48 @@ func TestConcurrentBackpressuredEcho(t *testing.T) {
 	}
 }
 
+// TestStopRefusesNewConnections checks that a client connecting to an engine
+// that has stopped is refused at once, as it is by a net/http server that
+// has shut down, rather than accepted into a backlog nothing serves until
+// Close, and that the engine still reports the address it listened on.
+func TestStopRefusesNewConnections(t *testing.T) {
+	for _, pollers := range []int{0, 2} {
+		config := DefaultConfig()
+		config.Addr = "127.0.0.1:0"
+		config.IOPollers = pollers > 0
+		config.IOPollerCount = pollers
+		engine, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) { _, _ = c.Write(b) }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr, err := engine.LocalAddr()
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- engine.Run() }()
+		if c, err := net.DialTimeout("tcp", addr.String(), time.Second); err != nil {
+			t.Fatalf("pollers %d: before Stop: %v", pollers, err)
+		} else {
+			_ = c.Close()
+		}
+		engine.Stop()
+		if err := <-done; err != nil {
+			t.Fatalf("pollers %d: Run: %v", pollers, err)
+		}
+		if after, err := engine.LocalAddr(); err != nil || after.String() != addr.String() {
+			t.Errorf("pollers %d: LocalAddr after Stop = %v, %v; want %v", pollers, after, err, addr)
+		}
+		if c, err := net.DialTimeout("tcp", addr.String(), time.Second); err == nil {
+			_ = c.Close()
+			t.Errorf("pollers %d: a connection was taken after Stop", pollers)
+		}
+		if err := engine.Close(); err != nil {
+			t.Errorf("pollers %d: Close: %v", pollers, err)
+		}
+	}
+}
+
 func TestOnCloseReportsPeerEOF(t *testing.T) {
 	closed := make(chan error, 1)
 	config := DefaultConfig()

@@ -105,6 +105,9 @@ const acceptAddrLen = int(unsafe.Sizeof(syscall.RawSockaddrAny{})) + 16
 type winListener struct {
 	fd     syscall.Handle
 	family int
+	// addr is the address the listener is bound to, kept for once Run has
+	// closed it.
+	addr   syscall.Sockaddr
 	closed bool
 	// accepts holds the listener's AcceptEx operations. The kernel keeps only
 	// their addresses, which the garbage collector does not see, so without
@@ -429,11 +432,15 @@ func createListener(config Config, addr string) (*winListener, error) {
 	if err = syscall.Bind(fd, bound); err == nil {
 		err = syscall.Listen(fd, sys.ListenBacklog(config.Backlog))
 	}
+	var sa syscall.Sockaddr
+	if err == nil {
+		sa, err = syscall.Getsockname(fd)
+	}
 	if err != nil {
 		syscall.Closesocket(fd)
 		return nil, err
 	}
-	return &winListener{fd: fd, family: family}, nil
+	return &winListener{fd: fd, family: family, addr: sa}, nil
 }
 
 // postAccept starts one AcceptEx on a fresh socket.
@@ -461,10 +468,7 @@ func (e *Engine) postAccept(op *acceptOp) error {
 func (e *Engine) ListenAddrs() ([]net.Addr, error) {
 	addrs := make([]net.Addr, 0, len(e.listeners)+len(e.udpListeners))
 	for _, l := range e.listeners {
-		sa, err := syscall.Getsockname(l.fd)
-		if err != nil {
-			return nil, err
-		}
+		sa := l.addr
 		addrs = append(addrs, netaddr.ToAddr(sa))
 	}
 	udpAddrs, err := e.LocalUDPAddrs()
@@ -483,10 +487,7 @@ func (e *Engine) ListenAddrs() ([]net.Addr, error) {
 func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 	addrs := make([]*net.TCPAddr, 0, len(e.listeners))
 	for _, l := range e.listeners {
-		sa, err := syscall.Getsockname(l.fd)
-		if err != nil {
-			return nil, err
-		}
+		sa := l.addr
 		addr, err := netaddr.ToTCPAddr(sa)
 		if err != nil {
 			return nil, err
@@ -496,8 +497,32 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 	return addrs, nil
 }
 
+// stopListening is the loop's to do on Windows, as Run returns: closing a
+// listener is what stops it, and the loop may be posting an AcceptEx on it.
+func (e *Engine) stopListening() {}
+
+// closeListeners closes the TCP listeners, which stops them taking
+// connections, and the AcceptEx calls still pending on them complete with
+// errors that Close collects. Callers run on the event loop, or after it.
+func (e *Engine) closeListeners() error {
+	var closeErr error
+	for _, l := range e.listeners {
+		if l.closed {
+			continue
+		}
+		l.closed = true
+		if err := syscall.Closesocket(l.fd); err != nil && closeErr == nil {
+			closeErr = err
+		}
+	}
+	return closeErr
+}
+
 func (e *Engine) Run() error {
 	e.logRun()
+	// A client connecting once the engine stops is refused rather than left
+	// in a backlog nothing accepts from.
+	defer e.closeListeners()
 	batch := e.maxEvents
 	if batch > maxWaitBatch {
 		batch = maxWaitBatch
@@ -779,11 +804,8 @@ func (e *Engine) Close() error {
 		}
 		e.closeUDPPeers()
 		e.budgetPaused = nil
-		for _, l := range e.listeners {
-			l.closed = true
-			if err := syscall.Closesocket(l.fd); err != nil && closeErr == nil {
-				closeErr = err
-			}
+		if err := e.closeListeners(); err != nil && closeErr == nil {
+			closeErr = err
 		}
 		for _, l := range e.udpListeners {
 			l.closed = true

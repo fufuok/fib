@@ -501,9 +501,13 @@ func (e *Engine) submitReady(pool TaskPool, ready []*Connection, tasks []taskpoo
 	return tasks
 }
 
-// Stop makes Run return, once it has stopped the engine's pollers too.
+// Stop makes Run return, once it has stopped the engine's pollers too. Its
+// listeners stop taking connections at once, so a client connecting from then
+// on is refused rather than accepted into a backlog nothing serves; the
+// connections already open are left to Close.
 func (e *Engine) Stop() {
 	e.stopping.Store(true)
+	e.stopListening()
 	e.notify()
 	e.releaseOutputWaiters()
 	for _, p := range e.pollers {
