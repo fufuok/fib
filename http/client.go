@@ -1029,9 +1029,21 @@ func (cc *clientConn) send(r *clientRequest) {
 	}
 }
 
+// uploadQueued is how much of a streamed body a client connection may hold
+// unsent before the next piece waits for some of it to go. With the piece
+// that follows, at most reqbody.ChunkSize, the backlog stays under fib's
+// default write watermark (64KB), at which a connection stops reading until
+// its queue drains: a server that answers before it has read the body, and
+// then reads no more of it, may never let the queue drain, and its answer
+// would then go unread. On Windows, where an overlapped send holds what it
+// carries until it completes and the pump keeps queueing behind it, a body
+// allowed up to the watermark left that answer unread until the server reset
+// the connection.
+const uploadQueued = 16 << 10
+
 // sendBody sends the body of r, which streams, and waits whenever
-// reqbody.MaxQueued of it is queued for the socket, so that the server's pace
-// is the body's. It ends early when the connection closes, which a response
+// uploadQueued of it is queued for the socket, so that the server's pace is
+// the body's. It ends early when the connection closes, which a response
 // that arrives before the body has gone does (see OnData).
 func (cc *clientConn) sendBody(r *clientRequest) {
 	rc, err := r.upload.Take()
@@ -1046,7 +1058,7 @@ func (cc *clientConn) sendBody(r *clientRequest) {
 				err = cc.conn.Send(p)
 			}
 			if err == nil && outputwait.Wait != nil {
-				err = outputwait.Wait(cc.conn, reqbody.MaxQueued)
+				err = outputwait.Wait(cc.conn, uploadQueued)
 			}
 			return err
 		})

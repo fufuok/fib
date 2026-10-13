@@ -192,7 +192,7 @@ func (hc *h2ClientConn) liveLocked(st *h2ClientStream) bool {
 
 // sendBody sends the body of st's request, which streams, a piece at a time:
 // each waits until the windows have let it all go, and then for the
-// connection's queue to drain to reqbody.MaxQueued, so that neither a stream
+// connection's queue to drain to uploadQueued, so that neither a stream
 // the server reads slowly nor a slow socket has more of it in memory. It ends
 // early when the stream does, which a response that arrives before the body
 // has gone does (see complete).
@@ -219,7 +219,7 @@ func (hc *h2ClientConn) sendBody(st *h2ClientStream) {
 				return errStreamGone
 			}
 			if outputwait.Wait != nil {
-				return outputwait.Wait(hc.cc.conn, reqbody.MaxQueued)
+				return outputwait.Wait(hc.cc.conn, uploadQueued)
 			}
 			return nil
 		})
