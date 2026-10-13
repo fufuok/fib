@@ -601,3 +601,23 @@ func TestServerEarlyAnswerLingers(t *testing.T) {
 		}
 	}
 }
+
+// A request that fails before it is sent still has its body closed, as a
+// transport closes it whatever becomes of the request: one Do turns away
+// outright, for its scheme, whether its body streams or would have been read
+// whole.
+func TestClientRejectedRequestClosesBody(t *testing.T) {
+	client := newTestClient(t, uploadClientConfig())
+	for _, size := range []int64{-1, 16} {
+		body := newGenBody(size)
+		req := mustRequest(t, stdhttp.MethodPost, "ftp://127.0.0.1:1/", nil)
+		req.Body = body
+		if size >= 0 {
+			req.ContentLength = size
+		}
+		if _, err := client.Go(req).Wait(); !errors.Is(err, ErrUnsupportedScheme) {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		body.waitClosed(t)
+	}
+}

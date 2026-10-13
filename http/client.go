@@ -223,6 +223,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 	}
 	target, err := requestTarget(req)
 	if err != nil {
+		closeRequestBody(req)
 		callback(nil, err)
 		return
 	}
@@ -252,6 +253,11 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 		data, err = marshalRequest(req, body)
 	}
 	if err != nil {
+		if upload != nil {
+			// The request goes no further, and a transport closes its body
+			// whatever becomes of it.
+			upload.Close()
+		}
 		callback(nil, err)
 		return
 	}
@@ -306,6 +312,14 @@ func marshalRequest(req *stdhttp.Request, body []byte) ([]byte, error) {
 // marshalStreamedHead frames the header of req, whose body streams, for an
 // HTTP/1 connection: with a Content-Length of declared, or as chunked, with
 // the names of its trailers.
+// closeRequestBody closes the body of a request that goes no further than
+// Do, as a transport closes it whatever becomes of the request.
+func closeRequestBody(req *stdhttp.Request) {
+	if req.Body != nil && req.Body != stdhttp.NoBody {
+		_ = req.Body.Close()
+	}
+}
+
 func marshalStreamedHead(req *stdhttp.Request, declared int64, chunked bool) ([]byte, error) {
 	clone := *req
 	clone.Body, clone.GetBody = nil, nil

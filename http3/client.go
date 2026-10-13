@@ -240,6 +240,11 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 		callback = func(*fibhttp.ClientResponse, error) {}
 	}
 	if req.URL == nil || req.URL.Scheme != "https" {
+		if req.Body != nil && req.Body != stdhttp.NoBody {
+			// The request goes no further, and a transport closes its body
+			// whatever becomes of it.
+			_ = req.Body.Close()
+		}
 		callback(nil, ErrUnsupportedScheme)
 		return
 	}
@@ -265,6 +270,11 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 	r := &clientRequest{req: req, body: body, upload: upload, declared: length, callback: callback, whole: whole}
 	fields, trailer, err := requestFields(req, length)
 	if err != nil {
+		if upload != nil {
+			// The request goes no further, and a transport closes its body
+			// whatever becomes of it.
+			upload.Close()
+		}
 		callback(nil, err)
 		return
 	}
