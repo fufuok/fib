@@ -1251,6 +1251,56 @@ func TestCloseWriteAfterQueuedOutput(t *testing.T) {
 	}
 }
 
+// CloseAfterSendLinger, with the peer still sending, gets the peer everything
+// sent and then the end of the stream, where a plain close with input unread
+// would reset the connection; the connection closes once the linger runs out,
+// with no error, though the peer never stops.
+func TestCloseAfterSendLinger(t *testing.T) {
+	payload := bytes.Repeat([]byte("0123456789abcdef"), 1<<18) // 4MB, more than the socket takes
+	closed := make(chan error, 1)
+	var once sync.Once
+	_, client := acceptOne(t, "tcp", HandlerFuncs{
+		Data: func(c *Connection, _ []byte) {
+			once.Do(func() {
+				if err := c.Send(payload); err != nil {
+					t.Error(err)
+				}
+				c.CloseAfterSendLinger(300 * time.Millisecond)
+			})
+		},
+		Close: func(_ *Connection, err error) { closed <- err },
+	})
+	go func() {
+		// The peer goes on sending until the connection is gone.
+		chunk := make([]byte, 64<<10)
+		for {
+			if _, err := client.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	got, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("client read %d bytes, want %d", len(got), len(payload))
+	}
+	start := time.Now()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("OnClose: %v", err)
+		}
+		if waited := time.Since(start); waited > 5*time.Second {
+			t.Fatalf("closed %v after the end of the stream", waited)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the lingering connection never closed")
+	}
+}
+
 // CloseRead stops OnData, and the end of input that follows, from the peer
 // half-closing, does not close the connection, which goes on sending.
 func TestCloseRead(t *testing.T) {

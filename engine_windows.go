@@ -677,6 +677,9 @@ func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
 		}
 	}
 	refresh := c.pauseStateChangedLocked()
+	if closeAfterSend && c.lingerLocked() {
+		closeAfterSend = false
+	}
 	c.mu.Unlock()
 	if closeAfterSend {
 		c.closeWithError(nil)

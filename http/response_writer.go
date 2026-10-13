@@ -621,7 +621,7 @@ func (c *Context) Finish() error {
 		// A body shorter than its Content-Length leaves the client waiting
 		// for bytes that will never come, so the connection has to end.
 		c.closing = true
-		c.Conn.CloseAfterSend()
+		c.closeAfterResponse()
 	}
 	return nil
 }

@@ -25,7 +25,7 @@ import (
 func TestContextRecycleResetsEveryField(t *testing.T) {
 	kept := map[string]bool{"mu": true, "word": true, "pooled": true, "deliverMu": true}
 	reset := []string{
-		"Conn", "Request", "wrote", "closing", "w", "stream", "external", "err",
+		"Conn", "Request", "wrote", "closing", "lingers", "w", "stream", "external", "err",
 		"body", "bodyDone", "bodyHeld", "handover", "cancel", "server", "parser", "whole", "block", "streamed",
 		"route",
 	}

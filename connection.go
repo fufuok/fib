@@ -115,6 +115,9 @@ type Connection struct {
 	// the socket before it shuts the write side. Guarded by mu.
 	writeShut        bool
 	shutWritePending bool
+	// lingerFor is how long a CloseAfterSendLinger goes on reading once its
+	// output has gone; see lingerLocked. Guarded by mu.
+	lingerFor time.Duration
 	// dialed marks a connection Dial opened, as against one a listener
 	// accepted; it never changes.
 	dialed bool
@@ -155,6 +158,10 @@ const (
 	// flagUnix marks a Unix socket, which has none of TCP's options. It is
 	// set before the connection is handed out and never changes.
 	flagUnix
+	// flagLingering marks a CloseAfterSendLinger whose output has gone and
+	// whose write side is shut: what still arrives is read and dropped, never
+	// handed to OnData, until the peer ends its side or the linger runs out.
+	flagLingering
 )
 
 // attachSeq is the unit of the sequence count kept in the upper half of
@@ -328,6 +335,26 @@ func (c *Connection) CloseAfterSend() {
 	c.closeAfterSendRaw()
 }
 
+// CloseAfterSendLinger is CloseAfterSend for a connection whose peer may
+// still be sending, such as an HTTP/1 client in the middle of an upload the
+// server answered without reading. Closing a socket with input unread makes
+// the kernel reset the connection, and a reset that reaches the peer before
+// it has read what was sent throws that away. So once everything sent has
+// gone, after the layer's closing message, the connection shuts its write
+// side instead, and goes on reading and dropping whatever arrives, never
+// handing it to OnData, until the peer ends its own side or d has passed;
+// then it closes. A d of zero or less is CloseAfterSend.
+func (c *Connection) CloseAfterSendLinger(d time.Duration) {
+	if d > 0 && c.udp == nil {
+		c.mu.Lock()
+		if !c.closeAfterSend && c.lingerFor == 0 {
+			c.lingerFor = d
+		}
+		c.mu.Unlock()
+	}
+	c.CloseAfterSend()
+}
+
 // closeAfterSendRaw is CloseAfterSend below any layer.
 func (c *Connection) closeAfterSendRaw() {
 	c.mu.Lock()
@@ -337,10 +364,37 @@ func (c *Connection) closeAfterSendRaw() {
 	}
 	c.closeAfterSend = true
 	closeNow := c.sendHead == len(c.sends) && !c.flushing
+	if closeNow && c.lingerLocked() {
+		closeNow = false
+	}
 	c.mu.Unlock()
 	if closeNow {
 		c.closeWithError(nil)
 	}
+}
+
+// lingerLocked carries out the lingering close of CloseAfterSendLinger once
+// its output has gone: it shuts the write side, arms the read deadline that
+// bounds the linger, and reports true, or reports false when the connection
+// is to close at once. Callers hold c.mu.
+func (c *Connection) lingerLocked() bool {
+	d := c.lingerFor
+	if d <= 0 || c.closing || c.closed || c.flags.has(flagReadShut) {
+		return false
+	}
+	c.lingerFor = 0
+	if !c.writeShut || c.shutWritePending {
+		c.writeShut, c.shutWritePending = true, false
+		if syscall.Shutdown(c.rawSocket(), syscall.SHUT_WR) != nil {
+			return false
+		}
+	}
+	c.flags.set(flagLingering, true)
+	at := time.Now().Add(d)
+	if dl := c.deadlinesLocked(at); dl != nil {
+		c.armDeadlineLocked(&dl.read, at, false)
+	}
+	return true
 }
 
 func (c *Connection) closeWithError(err error) {
@@ -1373,7 +1427,9 @@ func (c *Connection) readLoop() error {
 		}
 		n, err := c.sysRead(buf)
 		if n > 0 {
-			c.handler.OnData(c, buf[:n])
+			if !c.flags.has(flagLingering) {
+				c.handler.OnData(c, buf[:n])
+			}
 			if n < len(buf) {
 				// A short read means the socket buffer is empty, so the next
 				// read would only return EAGAIN. Data arriving after this
@@ -1487,6 +1543,9 @@ func (c *Connection) flushLocked() error {
 				c.readStalled = true
 			}
 			refresh := c.settlePauseLocked(owed)
+			if closeAfterSend && c.lingerLocked() {
+				closeAfterSend = false
+			}
 			c.mu.Unlock()
 			if closeAfterSend {
 				c.closeWithError(nil)
@@ -1998,6 +2057,11 @@ func (c *Connection) expireDeadline(d *deadline, gen uint64, write bool) {
 	if write && c.pendingBytes.Load() == 0 {
 		// Everything Send accepted has reached the kernel, so there is no
 		// write left for the deadline to be about.
+		return
+	}
+	if !write && c.flags.has(flagLingering) {
+		// A lingering close that ran out of time is the close it put off.
+		c.closeWithError(nil)
 		return
 	}
 	c.closeWithError(os.ErrDeadlineExceeded)

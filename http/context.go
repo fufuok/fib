@@ -155,7 +155,7 @@ func (c *Context) recycle() {
 	gen := c.generation() + 1
 	c.word.Store(withState(gen<<ctxGenShift, ctxDone))
 	c.Conn, c.Request = nil, nil
-	c.wrote, c.closing, c.streamed = true, false, false
+	c.wrote, c.closing, c.lingers, c.streamed = true, false, false, false
 	if w := c.w; w != nil {
 		// Nothing reaches the writer but through the Context, so it is as
 		// free to serve another request, once cleared, as the Context is.

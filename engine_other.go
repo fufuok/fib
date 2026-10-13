@@ -320,6 +320,11 @@ func (e *Engine) readConnection(c *Connection) {
 			return
 		}
 		if err != nil {
+			if c.isLingering() {
+				// The peer ended its side, or the linger ran out: either way
+				// this is the close the linger put off.
+				err = nil
+			}
 			c.closeWithError(err)
 			return
 		}
@@ -472,9 +477,13 @@ type Connection struct {
 	readWake *sync.Cond
 	// readShut and writeShut record CloseRead and CloseWrite. Guarded by mu.
 	readShut, writeShut bool
-	writeMu             sync.Mutex
-	attachment          atomic.Pointer[connectionAttachment]
-	layer               Layer
+	// lingerFor is what CloseAfterSendLinger asked for, and lingering marks
+	// the linger under way, which drops what arrives. Guarded by mu.
+	lingerFor  time.Duration
+	lingering  bool
+	writeMu    sync.Mutex
+	attachment atomic.Pointer[connectionAttachment]
+	layer      Layer
 	// udp marks a connection that exchanges datagrams: a peer of a UDP
 	// listener, whose conn is a udpPeerConn, or a dialed UDP socket.
 	udp bool
@@ -681,15 +690,61 @@ func (c *Connection) sendClosed() bool {
 	return closing
 }
 
-// closeAfterSendRaw closes the connection. Sends on this backend have already
-// reached the socket by the time they return, so nothing is left to wait for.
-func (c *Connection) closeAfterSendRaw() { c.closeWithError(nil) }
+// CloseAfterSendLinger is CloseAfterSend for a connection whose peer may
+// still be sending: rather than close with input unread, which makes the
+// kernel reset the connection, it shuts the write side once what was sent has
+// gone, after the layer's closing message, and goes on reading and dropping
+// whatever arrives until the peer ends its own side or d has passed; then it
+// closes. A d of zero or less is CloseAfterSend.
+func (c *Connection) CloseAfterSendLinger(d time.Duration) {
+	if d > 0 && !c.udp {
+		c.mu.Lock()
+		if c.lingerFor == 0 {
+			c.lingerFor = d
+		}
+		c.mu.Unlock()
+	}
+	if l := c.layer; l != nil {
+		l.CloseAfterSend()
+		return
+	}
+	c.closeAfterSendRaw()
+}
+
+// closeAfterSendRaw closes the connection, or begins the linger of
+// CloseAfterSendLinger. Sends on this backend have already reached the socket
+// by the time they return, so nothing is left to wait for.
+func (c *Connection) closeAfterSendRaw() {
+	c.mu.Lock()
+	d := c.lingerFor
+	linger := d > 0 && !c.closing && !c.lingering && !c.readShut
+	c.lingerFor = 0
+	if linger {
+		c.lingering = true
+	}
+	c.mu.Unlock()
+	if !linger || c.CloseWrite() != nil || c.conn.SetReadDeadline(time.Now().Add(d)) != nil {
+		c.closeWithError(nil)
+	}
+}
+
+// isLingering reports whether a lingering close is under way.
+func (c *Connection) isLingering() bool {
+	c.mu.Lock()
+	lingering := c.lingering
+	c.mu.Unlock()
+	return lingering
+}
 
 func (c *Connection) enqueueData(data []byte) bool {
 	c.mu.Lock()
 	if c.closing {
 		c.mu.Unlock()
 		return false
+	}
+	if c.lingering {
+		c.mu.Unlock()
+		return true
 	}
 	c.events = append(c.events, portableEvent{data: append([]byte(nil), data...)})
 	submit := !c.scheduled

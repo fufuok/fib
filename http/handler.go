@@ -58,8 +58,10 @@ type Context struct {
 	Request *stdhttp.Request
 	wrote   bool
 	// closing records that the response ends the HTTP/1 connection, so that
-	// no request pipelined behind it is served.
+	// no request pipelined behind it is served, and lingers that the close is
+	// to linger for input still arriving; see closeAfterResponse.
 	closing bool
+	lingers bool
 	// pooled records that the Context came from contextPool, and streamed
 	// that its request's body was still arriving when the handler ran.
 	// bodyDone records that OnBody's callback has had its last call, and
@@ -274,6 +276,13 @@ func (c *Context) RequestBody() *BodyStream {
 	return stream
 }
 
+// closeAfterResponse ends the HTTP/1 connection behind the response, with a
+// lingering close if the request's body is still arriving.
+func (c *Context) closeAfterResponse() {
+	stream := c.RequestBody()
+	closeAfterResponse(c.Conn, c.lingers || stream != nil && stream.unfinished())
+}
+
 func (c *Context) Respond(status int, contentType string, body []byte) error {
 	if contentType == "" {
 		return c.WriteResponse(Response{StatusCode: status, Body: body})
@@ -396,7 +405,7 @@ func (c *Context) writeHTTP1(response Response, contentType string) error {
 	c.wrote = true
 	if closeConnection {
 		c.closing = true
-		c.Conn.CloseAfterSend()
+		c.closeAfterResponse()
 	}
 	return nil
 }
@@ -650,7 +659,7 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 				// inside this round. It could not carry the connection on
 				// while this goroutine held the parser, so that is done here.
 				if h.endRequestLocked(context) {
-					c.CloseAfterSend()
+					closeAfterResponse(c, parser.lingers)
 					return
 				}
 				resumed = true
@@ -750,7 +759,7 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			continue
 		}
 		if h.endRequestLocked(context) {
-			c.CloseAfterSend()
+			closeAfterResponse(c, parser.lingers)
 			return
 		}
 		// A body the handler did not take is discarded by the loop, which
@@ -780,12 +789,13 @@ func (h *ServerHandler) endRequestLocked(context *Context) bool {
 	// Whatever the handler left of the body has to come off the connection
 	// before the next request on it can be parsed, and abandon says when
 	// there is too much of it left to be worth reading and dropping.
-	tooMuchLeft := false
+	tooMuchLeft, unread := false, false
 	if stream := context.RequestBody(); stream != nil {
-		tooMuchLeft = stream.abandon()
+		tooMuchLeft, unread = stream.abandon()
 	}
 	closing := tooMuchLeft || context.closing || context.Request.Close
 	if closing {
+		parser.lingers = unread
 		parser.spent = true
 		parser.stream = nil
 		parser.live.Store(nil)
@@ -849,9 +859,10 @@ func (h *ServerHandler) finishRequest(context *Context) {
 	c, parser := context.Conn, context.parser
 	parser.mu.Lock()
 	closing := h.endRequestLocked(context)
+	lingers := parser.lingers
 	parser.mu.Unlock()
 	if closing {
-		c.CloseAfterSend()
+		closeAfterResponse(c, lingers)
 		return
 	}
 	h.drive(c, parser, nil)
@@ -887,7 +898,10 @@ func (h *ServerHandler) refuse(c *fib.Connection, err error) {
 		status = stdhttp.StatusNotImplemented
 	}
 	request := &stdhttp.Request{ProtoMajor: 1, ProtoMinor: 1, Header: make(stdhttp.Header)}
-	context := &Context{Conn: c, Request: request}
+	// Whatever the client sent past what was refused, the rest of a body too
+	// large or a malformed request, is still arriving, and the close lingers
+	// for it, as net/http's does, so that the client reads the refusal.
+	context := &Context{Conn: c, Request: request, lingers: true}
 	_ = context.WriteResponse(Response{
 		StatusCode: status,
 		Header:     stdhttp.Header{"Content-Type": {"text/plain; charset=utf-8"}},

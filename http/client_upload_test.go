@@ -472,12 +472,9 @@ func fibUploadSink(c *Context) {
 	})
 }
 
-// The same uploads against fib's own server, over HTTP/1 and h2c, and, on
-// h2c, its early answer, which it gives without reading the body. On HTTP/1
-// the server closes the connection at once when it leaves that much body
-// unread, with no lingering close, so the client's next write can bring a
-// reset that loses the answer, for net/http's client as for this one; the
-// early answer over HTTP/1 is tested against net/http's server instead.
+// The same uploads against fib's own server, over HTTP/1 and h2c, and its
+// early answer, which it gives without reading the body; see also
+// TestServerEarlyAnswerLingers.
 func TestClientUploadToFibServer(t *testing.T) {
 	config := DefaultConfig()
 	config.StreamRequestBody = true
@@ -527,9 +524,6 @@ func TestClientUploadToFibServer(t *testing.T) {
 				}
 			})
 		}
-		if tc.proto == 1 {
-			continue
-		}
 		t.Run(tc.name+"/early", func(t *testing.T) {
 			body := newGenBody(-1)
 			req := mustRequest(t, stdhttp.MethodPost, early, nil)
@@ -543,5 +537,67 @@ func TestClientUploadToFibServer(t *testing.T) {
 			}
 			body.waitClosed(t)
 		})
+	}
+}
+
+// A fib server that answers an upload before reading it, and closes the
+// connection on the rest, closes it lingering: it shuts its write side and
+// drops what the client still sends, rather than closing with the body unread
+// and resetting a connection whose client, busy writing, may not have read the
+// answer yet. Every early answer reaches net/http's client and this one, for
+// a body of a declared length and for a chunked one, whether the handler gave
+// it to a streamed body or the server refused a body past MaxBodyBytes.
+func TestServerEarlyAnswerLingers(t *testing.T) {
+	streamed := DefaultConfig()
+	streamed.StreamRequestBody = true
+	refusing := DefaultConfig()
+	refusing.MaxBodyBytes = 1 << 20
+	tooLarge := HandlerFunc(func(c *Context) {
+		_ = c.Respond(stdhttp.StatusRequestEntityTooLarge, "text/plain", []byte("too large"))
+	})
+	servers := []struct{ name, url, body string }{
+		{"handler", "http://" + serve(t, NewHandlerWithConfig(streamed, tooLarge)), "too large"},
+		{"refused", "http://" + serve(t, NewHandlerWithConfig(refusing, tooLarge)),
+			stdhttp.StatusText(stdhttp.StatusRequestEntityTooLarge) + "\n"},
+	}
+	fibClient := newTestClient(t, uploadClientConfig())
+	transport := &stdhttp.Transport{}
+	t.Cleanup(transport.CloseIdleConnections)
+	stdClient := &stdhttp.Client{Transport: transport, Timeout: time.Minute}
+	clients := []struct {
+		name string
+		do   func(*stdhttp.Request) (*stdhttp.Response, error)
+	}{
+		{"net-http", stdClient.Do},
+		{"fib", func(req *stdhttp.Request) (*stdhttp.Response, error) { return fibClient.Go(req).Wait() }},
+	}
+
+	runs := 50
+	if testing.Short() {
+		runs = 10
+	}
+	for _, server := range servers {
+		for _, client := range clients {
+			for _, declared := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%s/%s/declared=%v", server.name, client.name, declared), func(t *testing.T) {
+					for i := range runs {
+						body := newGenBody(-1)
+						req := mustRequest(t, stdhttp.MethodPost, server.url, nil)
+						req.Body = body
+						if declared {
+							req.ContentLength = 1 << 40
+						}
+						resp, err := client.do(req)
+						if err != nil {
+							t.Fatalf("run %d: %v", i, err)
+						}
+						if got := readBody(t, resp); resp.StatusCode != stdhttp.StatusRequestEntityTooLarge || got != server.body {
+							t.Fatalf("run %d: status %d, body %q", i, resp.StatusCode, got)
+						}
+						body.waitClosed(t)
+					}
+				})
+			}
+		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"net/textproto"
 	"strconv"
 	"sync"
+	"time"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
@@ -29,6 +30,26 @@ var ErrWouldBlock = fib.ErrWouldBlock
 // Past it the connection closes instead: draining an upload nobody wants is
 // work the client, not the server, should pay for.
 const discardAfterHandler = 256 << 10
+
+// lingerTimeout bounds the lingering close of a connection that ends with a
+// request body still arriving: how long it goes on reading and dropping the
+// body after its write side is shut, so that the client, which may be busy
+// sending, reads the response before the close resets the connection. It is
+// net/http's own figure.
+const lingerTimeout = 500 * time.Millisecond
+
+// closeAfterResponse ends an HTTP/1 connection once its response has gone.
+// unread says the peer is still sending a body nobody will read, whose bytes
+// left unread at the close would have the kernel reset the connection, and
+// perhaps throw away a response the client has not read yet; such a
+// connection lingers instead. See fib.Connection.CloseAfterSendLinger.
+func closeAfterResponse(c *fib.Connection, unread bool) {
+	if unread {
+		c.CloseAfterSendLinger(lingerTimeout)
+		return
+	}
+	c.CloseAfterSend()
+}
 
 // BodyFunc receives a request's body as it arrives, piece by piece; see
 // Context.OnBody. fin marks the last call, and err a body that will not be
@@ -508,14 +529,16 @@ func (s *BodyStream) holdReads(hold bool) {
 // reading. It reports whether the connection has to close: either the client
 // is still waiting for the 100 Continue that now will never come, or what is
 // left of the body is more than the server is willing to read and throw away.
-func (s *BodyStream) abandon() (closing bool) {
+// unread says some of the body is still to come.
+func (s *BodyStream) abandon() (closing, unread bool) {
 	s.mu.Lock()
 	s.abandoned = true
 	dropped := s.dropLocked()
 	s.releaseLocked()
 	defer s.credited(dropped)
+	unread = !s.ended && s.err == nil
 	switch {
-	case s.ended || s.err != nil:
+	case !unread:
 	case s.wantContinue && !s.continueSent:
 		closing = true
 	default:
@@ -523,7 +546,15 @@ func (s *BodyStream) abandon() (closing bool) {
 	}
 	// A sink still waiting for the rest hears that it is not coming.
 	s.deliverLocked(true)
-	return closing
+	return closing, unread
+}
+
+// unfinished reports whether some of the body is still to come.
+func (s *BodyStream) unfinished() bool {
+	s.mu.Lock()
+	unfinished := !s.ended && s.err == nil
+	s.mu.Unlock()
+	return unfinished
 }
 
 // absorb takes as much of src as the body's framing accounts for, hands the

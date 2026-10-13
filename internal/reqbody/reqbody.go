@@ -102,14 +102,22 @@ func (s *Source) Take() (io.ReadCloser, error) {
 
 // Close closes the body being sent, if any, which ends a Read on it that is
 // waiting, for a body that allows that, as io.Pipe's does. It is for when
-// the request is over: no attempt follows.
+// the request is over: no attempt follows. A body no attempt has taken yet,
+// as when the response came before the sending began, is closed too, since
+// a transport closes the request's body whatever becomes of the request.
 func (s *Source) Close() {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
 	s.closed = true
-	current := s.current
+	current, untaken := s.current, !s.taken
 	s.mu.Unlock()
 	if current != nil {
 		current.Close()
+	} else if untaken {
+		_ = s.req.Body.Close()
 	}
 }
 

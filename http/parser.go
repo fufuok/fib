@@ -267,6 +267,10 @@ type Parser struct {
 	// that a handler switched to another protocol through Context.Upgrade.
 	spent    bool
 	upgraded bool
+	// lingers records that the request a spent connection ends on left its
+	// body still arriving, which the close lingers for; see
+	// closeAfterResponse.
+	lingers bool
 	// headerComplete records that the request being parsed has its header and
 	// is waiting for its body, which is what tells ReadHeaderTimeout from
 	// ReadTimeout. requestStart is when that request's first byte arrived,
