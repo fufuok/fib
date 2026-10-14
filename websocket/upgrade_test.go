@@ -22,11 +22,16 @@ import (
 // upgradeServer serves plain HTTP and, on /ws, WebSocket through Upgrade,
 // with ws echoing what it is sent. It reports what OnClose hears on closed.
 func upgradeServer(t *testing.T, config Config) (string, chan closeReport) {
+	return upgradeServerWith(t, config, (*Connection).WriteMessage)
+}
+
+// upgradeServerWith is upgradeServer with the echo sent by echo.
+func upgradeServerWith(t *testing.T, config Config, echo func(*Connection, Opcode, []byte) error) (string, chan closeReport) {
 	t.Helper()
 	closed := make(chan closeReport, 4)
 	ws := NewHandlerWithConfig(config, HandlerFuncs{
 		Message: func(c *Connection, opcode Opcode, payload []byte) {
-			if err := c.WriteMessage(opcode, payload); err != nil {
+			if err := echo(c, opcode, payload); err != nil {
 				t.Error(err)
 			}
 		},

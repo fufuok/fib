@@ -178,9 +178,17 @@ type Connection struct {
 type transport interface {
 	SendParts(first, second []byte) error
 	SendOwned(data []byte) error
+	// SendShared sends a frame that other connections may be sending too,
+	// which is never written into; see PreparedMessage.
+	SendShared(data []byte) error
 	CloseAfterSend()
 	Close() error
 }
+
+var (
+	errDataOpcode = errors.New("websocket: a message requires Text or Binary opcode")
+	errCloseSent  = errors.New("websocket: close already sent")
+)
 
 type connectionCloseState struct {
 	code   uint16
@@ -191,7 +199,7 @@ func (c *Connection) Subprotocol() string { return c.subprotocol }
 
 func (c *Connection) WriteMessage(opcode Opcode, payload []byte) error {
 	if opcode != Text && opcode != Binary {
-		return errors.New("websocket: WriteMessage requires Text or Binary opcode")
+		return errDataOpcode
 	}
 	if opcode == Text && !utf8.Valid(payload) {
 		return ErrInvalidPayload
@@ -240,7 +248,7 @@ func (c *Connection) Close(code uint16, reason string) error {
 
 func (c *Connection) writeFrame(opcode Opcode, payload []byte) error {
 	if c.closeSent.Load() {
-		return errors.New("websocket: close already sent")
+		return errCloseSent
 	}
 	if c.compress && (opcode == Text || opcode == Binary) {
 		compressor, compressed := compressMessage(payload, int(c.windowBits))

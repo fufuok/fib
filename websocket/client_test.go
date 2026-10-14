@@ -46,7 +46,7 @@ func startClientEngine(t *testing.T) *fib.Engine {
 }
 
 // startWebSocketServer runs a fib WebSocket server and returns its ws:// URL.
-func startWebSocketServer(t *testing.T, config Config, handler Handler) string {
+func startWebSocketServer(t testing.TB, config Config, handler Handler) string {
 	t.Helper()
 	engineConfig := fib.DefaultConfig()
 	engineConfig.Addr = "127.0.0.1:0"

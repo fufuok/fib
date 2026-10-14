@@ -353,8 +353,8 @@ frames carry the tunnel both ways under its flow control. Anything else gets
 
 The `TunnelHandler` hears `OnTunnelOpen` before `Upgrade` returns, then
 `OnTunnelData` for what arrives, and `OnTunnelClose` once, with its calls one
-at a time and in order. `Tunnel.Send`, `SendParts` and `SendOwned` may be
-called from any goroutine; `CloseAfterSend` ends the connection, or this side
+at a time and in order. `Tunnel.Send`, `SendParts`, `SendOwned` and
+`SendShared` may be called from any goroutine; `CloseAfterSend` ends the connection, or this side
 of the stream, once what was sent has gone, and `Close` ends it at once.
 `Upgrade` is called from the handler, before it has written anything.
 

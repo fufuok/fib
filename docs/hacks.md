@@ -534,6 +534,7 @@ backlog of its own is paused too**.
 | --- | --- | --- |
 | `Send(b)` | tries a direct write, copies the remainder into the send queue; never blocks | default |
 | `SendParts(a, b)` | sends two parts through `writev` without joining them; under backpressure copies only the unsent suffix | frame header + payload, avoiding a join copy |
+| `SendShared(b)` | like `SendOwned`, never copies, but only ever reads `b` and never pools it, so one `b` can go to many connections; slow peers queue that one array | broadcast (`websocket.PreparedMessage` uses it) |
 | `SendFile(f, off, n)` | queues a file range in order with surrounding `Send`s; `sendfile(2)` straight to the socket, the file is read as the peer receives | large files, memory does not grow with file size |
 | `Cork()` / `Flush()` | manual control of write coalescing | answering several requests **outside the round**; or when a handler must hand data to the socket midway |
 

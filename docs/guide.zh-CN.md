@@ -109,7 +109,9 @@
   每连接水位线生效）；连接数很多、水位线乘连接数超出内存承受范围时再设置它。
 - `Send` 先直接发送，余量复制进发送队列。默认启用自适应 writev：单缓冲走
   write，`SendParts` 的两段数据和包含多个缓冲的发送队列走 writev；仅在背压
-  时复制未发送部分。
+  时复制未发送部分。`SendOwned` 把缓冲交给连接，背压时直接排队、不复制；`SendShared`
+  同样不复制，但保证只读不写、不放回池，所以同一个缓冲可以同时发给多个连接（广播），
+  慢连接的队列里排的都是这一份。
 - worker 通过 command queue 与 `eventfd` 请求 event loop 刷新写关注或关闭连接。事件循环醒着时
   （从一次 wait 返回到下一次 wait 之前）入队的命令不写 `eventfd`：循环在下一次 wait 之前自己
   清空队列，以及这些命令排出的那一轮。在循环上执行的一轮关闭自己的连接时（关闭、再释放 fd），
@@ -1278,6 +1280,53 @@ handler := websocket.HandlerFuncs{
   消息按窗口大小分段、各段独立压缩后拼成一个 DEFLATE 流，保证回溯距离不超过窗口。
 - `MaxMessageBytes` 限制的是解压后的大小，超过时以 1009 关闭；解压失败或解压后的
   Text 不是合法 UTF-8 时以 1007 关闭。
+
+### 向多个连接广播（fan-out）
+
+同一条消息发给多个连接时，用 `PreparedMessage`：
+
+```go
+m, err := websocket.NewPreparedMessage(websocket.Text, payload) // payload 被复制，之后可以复用
+if err != nil {
+    return err // opcode 不是 Text/Binary，或 Text 不是合法 UTF-8
+}
+for _, c := range conns {
+    _ = c.WritePreparedMessage(m)
+}
+```
+
+逐个连接调用 `WriteMessage` 时，每个连接都要校验一遍 UTF-8，开了压缩还要各自压缩一遍。
+`PreparedMessage` 只校验、成帧一次，压缩也只做一次（按协商的窗口大小，每种窗口最多一次，
+通常只有一种），因为发送端不保留上下文，同一条消息对同一窗口压出的字节完全相同。
+
+- server 端所有连接发送同一份帧，不复制：对端读得慢、发不出去的部分，在各连接的发送队列里
+  排的都是这一份帧（`fib.Connection.SendShared`），而 `WriteMessage` 会给每个连接复制一份。
+  广播大消息给大量慢连接时，内存差别就是 N 份和 1 份。
+- client 端每帧都要用自己的随机 mask（RFC 6455 第 5.3 节），所以 client 连接共享的只是压缩
+  结果，帧仍然各自构造。
+- `PreparedMessage` 不会被修改，可以并发使用、保存下来重复发送。
+- 经 `ServerHandler.Upgrade` 升级的连接同样适用：HTTP/1.1 上与直接接入的连接一样共享同一份帧；
+  HTTP/2、HTTP/3 的 stream 要把消息再封进 DATA 帧，仍然复制，但压缩同样只做一次。
+
+参考（14 核 macOS，回环，64 个连接，一次广播的耗时）：
+
+| 场景 | `WriteMessage` | `PreparedMessage` |
+| --- | --- | --- |
+| 未压缩，1 KiB | 243 µs | 238 µs |
+| 未压缩，16 KiB | 351 µs | 345 µs |
+| 压缩，1 KiB | 433 µs | 230 µs |
+| 压缩，16 KiB | 1547 µs | 253 µs |
+
+不压缩、连接都读得及时时，每个连接的开销基本就是一次 writev，两者差不多；收益来自压缩和慢连接。
+
+**用几个 goroutine 发？** 一个就够。fib 的发送从不阻塞：直接做非阻塞 writev，socket 写不下
+就放进该连接的发送队列后返回，一个慢连接卡不住整个循环。每个连接的成本大约是一次系统调用
+（微秒级），一万个连接一轮约十几到几十毫秒。只有连接数很大且对广播延迟敏感，或者走 TLS
+（每个连接要单独加密）时，才值得把连接按 `GOMAXPROCS` 分成几片并行发送；不需要每个连接
+一个 goroutine。
+
+要注意的是发送队列本身没有上限：`WriteBufferHighWatermark` 只暂停该连接的读，不限制往它发。
+对端长期不读时，广播会持续堆积在它的队列里，应用应该自己断开这类连接（比如用应用层心跳判断）。
 
 ### 在 HTTP server 中升级为 WebSocket
 

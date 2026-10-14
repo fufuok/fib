@@ -461,6 +461,7 @@ Data: func(c *fib.Connection, data []byte) {
 | --- | --- | --- |
 | `Send(b)` | 先尝试直接写，余量复制进发送队列；永不阻塞 | 默认 |
 | `SendParts(a, b)` | 两段数据不拼接，走 `writev`；背压时只复制未发出的后缀 | 帧头 + payload，避免拼接拷贝 |
+| `SendShared(b)` | 与 `SendOwned` 一样不复制，但只读不写、不放回池，同一个 `b` 可以同时发给多个连接；慢连接的队列里排的都是这一份 | 广播（`websocket.PreparedMessage` 用它） |
 | `SendFile(f, off, n)` | 排进发送队列，与前后 `Send` 保序；`sendfile(2)` 直发，随对端接收进度读文件 | 大文件，内存不随文件大小增长 |
 | `Cork()` / `Flush()` | 手动控制合并写 | 在**本轮之外**回复多个请求；或在 handler 里需要中途把数据交给 socket |
 

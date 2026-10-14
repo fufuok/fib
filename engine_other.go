@@ -671,6 +671,10 @@ func (c *Connection) Flush() error { return nil }
 // SendOwned is equivalent to Send on the synchronous portable backend.
 func (c *Connection) SendOwned(data []byte) error { return c.Send(data) }
 
+// SendShared is equivalent to Send on the synchronous portable backend, which
+// never keeps data past the call.
+func (c *Connection) SendShared(data []byte) error { return c.Send(data) }
+
 func (c *Connection) SendParts(first, second []byte) error {
 	if l := c.layer; l != nil {
 		return l.Send(first, second)

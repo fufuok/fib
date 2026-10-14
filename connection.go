@@ -782,6 +782,20 @@ func (c *Connection) SendOwned(data []byte) error {
 	return c.send(data, sendOwned)
 }
 
+// SendShared sends data without copying it, like SendOwned, but promises to
+// treat it as read-only: the connection never writes into data or hands it to
+// a pool, and only reads it until it is written. The same array can therefore
+// go to many connections at once, as a broadcast does, and what the slow ones
+// cannot take yet waits in their queues as one shared array instead of a copy
+// each. The caller must not change data afterwards, but may go on reading it.
+// It is copied, as Send copies, only where a layer such as TLS transforms it.
+func (c *Connection) SendShared(data []byte) error {
+	if l := c.layer; l != nil {
+		return l.Send(data, nil)
+	}
+	return c.send(data, sendOwned)
+}
+
 // sendRaw writes bytes to the socket below any layer.
 func (c *Connection) sendRaw(data []byte) error {
 	return c.send(data, sendCopy)

@@ -206,6 +206,23 @@ app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 To serve only WebSocket, bind the WebSocket handler directly:
 `fib.Bind(config, websocket.NewHandlerWithConfig(cfg, handlers))`.
 
+To send one message to many connections, prepare it once:
+
+```go
+m, _ := websocket.NewPreparedMessage(websocket.Text, payload)
+for _, c := range conns {
+	_ = c.WritePreparedMessage(m)
+}
+```
+
+It is checked and framed once, and compressed at most once for each permessage-deflate
+window in use, where `WriteMessage` compresses for every connection. On a server all
+connections send the same frame, so peers too slow to take it at once queue that one frame
+rather than a copy each. Sends never block, so one goroutine looping over the connections is
+enough; split them across a few goroutines only for very many connections or with TLS, which
+encrypts per connection. A peer that never reads keeps queueing what is sent to it, so close
+such peers yourself.
+
 ### arpc
 
 ```go

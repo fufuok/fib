@@ -198,6 +198,21 @@ app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 只提供 WebSocket 时，可以直接 bind WebSocket handler：
 `fib.Bind(config, websocket.NewHandlerWithConfig(cfg, handlers))`。
 
+同一条消息发给多个连接时，先准备一次：
+
+```go
+m, _ := websocket.NewPreparedMessage(websocket.Text, payload)
+for _, c := range conns {
+	_ = c.WritePreparedMessage(m)
+}
+```
+
+消息只校验、成帧一次，permessage-deflate 每种窗口最多压缩一次（`WriteMessage` 是每个连接
+各压缩一次）。server 端所有连接发送同一份帧，读得慢的对端在队列里排的也是这一份，不各自复制。
+发送从不阻塞，一个 goroutine 循环发送即可；只有连接数很多或走 TLS（每个连接单独加密）时，
+才值得分到几个 goroutine 并行。对端一直不读时，发给它的数据会一直排队，这类连接需要应用自己
+关闭。详见 [guide](docs/guide.zh-CN.md#向多个连接广播fan-out)。
+
 ### arpc
 
 ```go

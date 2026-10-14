@@ -96,6 +96,18 @@ func (t *Tunnel) SendParts(first, second []byte) error { return t.w.SendParts(fi
 // afterwards.
 func (t *Tunnel) SendOwned(data []byte) error { return t.w.SendOwned(data) }
 
+// SendShared sends data, which the tunnel only reads, so the same array may
+// go through many tunnels at once; the caller must not change it afterwards.
+// Over HTTP/1.1 it is fib.Connection.SendShared, which queues data itself
+// rather than a copy. A writer that has no such method frames what it sends,
+// and is handed data as SendParts would hand it.
+func (t *Tunnel) SendShared(data []byte) error {
+	if s, ok := t.w.(interface{ SendShared([]byte) error }); ok {
+		return s.SendShared(data)
+	}
+	return t.w.SendParts(data, nil)
+}
+
 // CloseAfterSend ends the tunnel once what has been sent through it has gone.
 // On HTTP/2 and HTTP/3 that ends this side of the stream, and the tunnel ends
 // when the peer ends its side too.
