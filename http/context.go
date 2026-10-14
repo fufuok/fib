@@ -313,14 +313,11 @@ func (c *Context) retain() bool {
 // until it has released every Retain it took, and no longer.
 func (c *Context) Release() { c.giveBack(false) }
 
-// Retained reports whether the response is still being held open.
+// Retained reports whether the response is still being held open by a Retain
+// not yet released, including once the handler has returned.
 func (c *Context) Retained() bool {
 	w := c.word.Load()
-	holds := w & ctxHolds
-	if w&ctxShare != 0 {
-		holds++
-	}
-	return ctxState(w) == ctxOpen && holds > 1
+	return ctxState(w) == ctxOpen && w&ctxHolds != 0
 }
 
 // Err is why the request ended before its response did — the connection
@@ -804,10 +801,10 @@ func (c *Context) giveBack(returning bool) {
 			// to take it.
 			c.forget()
 		}
-		if returning && !c.wrote && (c.w == nil || c.w.status == 0) {
-			// The handler returned without answering, retained nothing and
-			// has no one to answer for it: as net/http does, that is an
-			// empty 200.
+		if !c.wrote && (c.w == nil || c.w.status == 0) {
+			// The last hold went without the request being answered, at the
+			// handler's return or at a Release, and there is no one left to
+			// answer it: as net/http does, that is an empty 200.
 			c.WriteHeader(200)
 		}
 		_ = c.Finish()
