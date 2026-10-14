@@ -698,7 +698,7 @@ func TestCvCliStreamHoldAndFail(t *testing.T) {
 		_, _ = cr.Body.Read(make([]byte, 1))
 	})
 	cs.s.Start()
-	cr := cvCliWait(t, cs.called, "the callback")
+	cvCliWait(t, cs.called, "the callback")
 	cs.s.Data([]byte("0123456789"))
 	cs.s.End()
 	cs.mu.Lock()
@@ -712,7 +712,7 @@ func TestCvCliStreamHoldAndFail(t *testing.T) {
 		_, _ = cr.Body.Read(make([]byte, 1))
 	})
 	cs.s.Start()
-	cr = cvCliWait(t, cs.called, "the callback")
+	cr := cvCliWait(t, cs.called, "the callback")
 	boom := errors.New("cvcli: boom")
 	cs.s.Fail(boom)
 	if _, err := cr.Body.Read(make([]byte, 1)); !errors.Is(err, boom) {
