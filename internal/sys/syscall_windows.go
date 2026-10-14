@@ -132,8 +132,20 @@ func ListenBacklog(backlog int) int {
 
 func IsWouldBlock(err error) bool { return err == WSAEWOULDBLOCK }
 
-// wsaBufs fills bufs from the non-empty slices in data and reports how many it
-// used.
+// WSABuf describes b, or as much of it as one WSABUF can hold.
+//
+// It returns the WSABUF rather than filling one in, as WSABufs does, for a
+// caller whose b may be on its stack: a pointer stored through a slice goes to
+// the heap as far as the compiler can tell, even when the slice is of an array
+// on the caller's stack, so WSABufs puts what it describes there, and a frame
+// header handed to Connection.SendParts would be allocated each time. A
+// WSABUF assigned straight into the caller's array leaves b where it is.
+func WSABuf(b []byte) syscall.WSABuf {
+	return syscall.WSABuf{Len: uint32(min(len(b), MaxWSABufLen)), Buf: unsafe.SliceData(b)}
+}
+
+// WSABufs fills bufs from the non-empty slices in data and reports how many
+// it used. What data points at escapes to the heap; see WSABuf.
 func WSABufs(bufs []syscall.WSABuf, data ...[]byte) int {
 	count := 0
 	for _, b := range data {
@@ -143,7 +155,7 @@ func WSABufs(bufs []syscall.WSABuf, data ...[]byte) int {
 		if count == len(bufs) {
 			break
 		}
-		bufs[count] = syscall.WSABuf{Len: uint32(min(len(b), MaxWSABufLen)), Buf: &b[0]}
+		bufs[count] = WSABuf(b)
 		count++
 		if len(b) > MaxWSABufLen {
 			// The rest of this slice has to go before anything after it.

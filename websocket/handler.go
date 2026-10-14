@@ -269,9 +269,11 @@ func (c *Connection) sendFrame(opcode Opcode, payload []byte, compressed bool) e
 		return c.sendMaskedFrame(opcode, payload, compressed)
 	}
 	// The header stays on this stack only if nothing it is handed to can keep
-	// it. A *fib.Connection copies it, which the compiler sees through a
-	// direct call; through the transport interface it cannot, so any other
-	// transport gets a pooled copy instead.
+	// it. A *fib.Connection writes it beside the payload and copies only what
+	// the socket cannot take yet, which the compiler sees through a direct
+	// call on every platform (TestServerWriteMessageAllocs holds it to that);
+	// through the transport interface it cannot, so any other transport gets
+	// a pooled copy instead.
 	var header [maxFrameHeader]byte
 	headerLen, err := frameHeader(header[:], opcode, len(payload))
 	if err != nil {

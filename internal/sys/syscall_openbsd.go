@@ -8,6 +8,10 @@ import (
 // OpenBSD only lets system calls through libc, so these go through the
 // syscall package rather than trapping directly.
 
+// As on Darwin, go:noescape keeps what iovecs points at off the heap: the
+// body is out of the compiler's sight here, but syscall.writev keeps nothing.
+//
+//go:noescape
 //go:linkname writev syscall.writev
 func writev(fd int, iovecs []syscall.Iovec) (cnt uintptr, err error)
 

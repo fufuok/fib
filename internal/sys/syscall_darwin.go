@@ -90,6 +90,13 @@ func DefaultBacklog() int {
 // writev is the libc wrapper the syscall package already binds. Darwin wants
 // system calls to go through libc rather than trapping directly.
 //
+// Without a body here the compiler has to assume iovecs escapes, and with it
+// every buffer an iovec points at, so each two-part send, a WebSocket frame
+// header and its payload for one, put both the header and the iovec array on
+// the heap. syscall.writev itself keeps nothing (the compiler finds iovecs
+// does not escape it), which go:noescape says on its behalf.
+//
+//go:noescape
 //go:linkname writev syscall.writev
 func writev(fd int, iovecs []syscall.Iovec) (cnt uintptr, err error)
 

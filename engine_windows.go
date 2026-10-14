@@ -185,8 +185,7 @@ func (c *Connection) sysSendDatagrams(datagrams [][]byte) error {
 
 // sysSendDatagram sends one datagram without waiting. Callers hold c.mu.
 func (c *Connection) sysSendDatagram(data []byte) error {
-	var bufs [1]syscall.WSABuf
-	sys.WSABufs(bufs[:], data)
+	bufs := [1]syscall.WSABuf{sys.WSABuf(data)}
 	var n uint32
 	if l := c.udp.listener; l != nil {
 		return syscall.WSASendto(l.fd, &bufs[0], 1, &n, 0, c.udp.sa, nil, nil)
@@ -306,8 +305,7 @@ func (e *Engine) postRecvFrom(l *udpListener) error {
 		l.op.ov = syscall.Overlapped{}
 		l.flags = 0
 		l.fromLen = int32(unsafe.Sizeof(l.from))
-		var bufs [1]syscall.WSABuf
-		sys.WSABufs(bufs[:], l.buf)
+		bufs := [1]syscall.WSABuf{sys.WSABuf(l.buf)}
 		var n uint32
 		err = syscall.WSARecvFrom(l.fd, &bufs[0], 1, &n, &l.flags, &l.from, &l.fromLen, &l.op.ov, nil)
 		if err == nil || err == syscall.ERROR_IO_PENDING {
@@ -381,8 +379,7 @@ func (c *Connection) armDatagramReadLocked() error {
 	c.recvFlags = 0
 	c.readArmed = true
 	c.outstanding.Add(1)
-	var bufs [1]syscall.WSABuf
-	sys.WSABufs(bufs[:], c.udp.buf)
+	bufs := [1]syscall.WSABuf{sys.WSABuf(c.udp.buf)}
 	var n uint32
 	err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &c.recvFlags, &c.readOp.ov, nil)
 	if err != nil && err != syscall.ERROR_IO_PENDING {
@@ -938,8 +935,7 @@ func (c *Connection) sysRead(buf []byte) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
-	var bufs [1]syscall.WSABuf
-	sys.WSABufs(bufs[:], buf)
+	bufs := [1]syscall.WSABuf{sys.WSABuf(buf)}
 	var n, flags uint32
 	if err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &flags, nil, nil); err != nil {
 		return 0, err
@@ -948,8 +944,7 @@ func (c *Connection) sysRead(buf []byte) (int, error) {
 }
 
 func (c *Connection) sysRecvOOB(buf []byte) (int, error) {
-	var bufs [1]syscall.WSABuf
-	sys.WSABufs(bufs[:], buf)
+	bufs := [1]syscall.WSABuf{sys.WSABuf(buf)}
 	var n uint32
 	flags := uint32(sys.MsgOOB)
 	if err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &flags, nil, nil); err != nil {
@@ -962,13 +957,26 @@ func (c *Connection) sysRecvOOB(buf []byte) (int, error) {
 }
 
 func (c *Connection) sysWrite(buf []byte) (int, error) {
-	var bufs [1]syscall.WSABuf
-	return c.wsaSend(bufs[:sys.WSABufs(bufs[:], buf)])
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	bufs := [1]syscall.WSABuf{sys.WSABuf(buf)}
+	return c.wsaSend(bufs[:])
 }
 
+// sysWrite2 fills its array itself rather than through sys.WSABufs, which
+// would put first, usually a frame header on the caller's stack, on the heap.
 func (c *Connection) sysWrite2(first, second []byte) (int, error) {
-	var bufs [2]syscall.WSABuf
-	return c.wsaSend(bufs[:sys.WSABufs(bufs[:], first, second)])
+	if len(first) == 0 {
+		return c.sysWrite(second)
+	}
+	bufs := [2]syscall.WSABuf{sys.WSABuf(first)}
+	if len(second) == 0 || len(first) > sys.MaxWSABufLen {
+		// The rest of first has to go before any of second.
+		return c.wsaSend(bufs[:1])
+	}
+	bufs[1] = sys.WSABuf(second)
+	return c.wsaSend(bufs[:])
 }
 
 func (c *Connection) sysWritev(buffers [][]byte) (int, error) {
