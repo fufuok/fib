@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
-	"net/textproto"
 	"net/url"
 	"sort"
 	"strconv"
@@ -1416,7 +1415,7 @@ func appendHeaderLines(out []byte, header stdhttp.Header, skip func(string) bool
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" {
+		if !validHeaderName(key) {
 			return nil, errors.New("http: invalid response header name")
 		}
 		for _, value := range header[key] {
@@ -1430,6 +1429,21 @@ func appendHeaderLines(out []byte, header stdhttp.Header, skip func(string) bool
 		}
 	}
 	return out, nil
+}
+
+// validHeaderName reports whether name is a token (RFC 9110 section 5.1),
+// which a field name has to be. Canonicalising leaves a name that is not one,
+// such as "Bad Name", as it is, so that does not tell.
+func validHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if !tokenByte[name[i]] {
+			return false
+		}
+	}
+	return true
 }
 
 func validHeaderValue(value string) bool {
