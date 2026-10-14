@@ -549,15 +549,23 @@ func TestServerSkipsEarlyDataOverTCP(t *testing.T) {
 	cert, pool := issueCert(t, keyOf(t, "ecdsa-p256"))
 	for _, tc := range []struct {
 		name    string
-		early   int // bytes of early data records sent after the ClientHello
+		early   int  // bytes of early data records sent after the ClientHello
+		retry   bool // the server wants a key share the client did not send
 		wantErr bool
 	}{
-		{"none sent", 0, false},
-		{"a little", 300, false},
-		{"more than is skipped", maxSkippedEarly + 1000, true},
+		{"none sent", 0, false, false},
+		{"a little", 300, false, false},
+		{"more than is skipped", maxSkippedEarly + 1000, false, true},
+		{"after a HelloRetryRequest", 300, true, false},
+		{"more than is skipped after a HelloRetryRequest", maxSkippedEarly + 1000, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := newSrvHS(&stdtls.Config{Certificates: []stdtls.Certificate{cert}}, newTicketKeys(&stdtls.Config{}))
+			config := &stdtls.Config{Certificates: []stdtls.Certificate{cert}}
+			if tc.retry {
+				// The client sends an X25519 share only.
+				config.CurvePreferences = []stdtls.CurveID{stdtls.CurveP256}
+			}
+			srv := newSrvHS(config, newTicketKeys(&stdtls.Config{}))
 			cli := newHS(t, pool, nil)
 			rec := cli.hello()
 			orig := rec[recordHeaderLen:]
@@ -600,6 +608,9 @@ func TestServerSkipsEarlyDataOverTCP(t *testing.T) {
 			}
 			if srv.state != srvDone || cli.state != hsDone {
 				t.Fatalf("server state %d, client state %d", srv.state, cli.state)
+			}
+			if srv.retried != tc.retry {
+				t.Fatalf("server retried %v, want %v", srv.retried, tc.retry)
 			}
 		})
 	}

@@ -852,18 +852,23 @@ func (h *serverHS) clientHello(msg []byte, out *[]byte) *hsError {
 			want = g
 		}
 	}
+	if ch.earlyData && len(ch.psks) == 0 {
+		return fail(alertIllegalParameter, "early_data without pre_shared_key")
+	}
 	if share == nil {
 		if h.retried || want == 0 {
 			return fail(alertHandshakeFailure, "no key exchange group in common with the client")
+		}
+		if h.quic == nil && ch.earlyData {
+			// A HelloRetryRequest rejects the early data, which the client
+			// sends before it has the answer, and which is skipped.
+			h.skipEarly = maxSkippedEarly
 		}
 		return h.helloRetryRequest(want, out)
 	}
 	// Everything that can fail is done before the ServerHello is sent.
 	if herr := h.selectProtocol(); herr != nil {
 		return herr
-	}
-	if ch.earlyData && len(ch.psks) == 0 {
-		return fail(alertIllegalParameter, "early_data without pre_shared_key")
 	}
 	h.psk, h.resumed = nil, false
 	var pskIndex int
