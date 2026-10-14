@@ -686,7 +686,9 @@ func(c *fibhttp.Context) {
 **异常情况**：连接断开、读超时、body 收不完，都会让请求被取消——不再写出任何东西，剩余
 引用全部作废，handler 只被告知一次：`OnBody` 的 `err`，以及 `Context.OnCancel(func(error))`
 （给只 `Retain`、不用 `OnBody` 的异步 handler）。两者都在 engine 的 stream 协程池上执行
-而不是事件循环上，拖不住服务端。`Context.Err()` 可以主动查。之后一切幂等：已经结束的请求上再调
+而不是事件循环上，拖不住服务端。`Context.Err()` 可以主动查。需要 `context.Context` 的代码
+（数据库查询、`httputil.ReverseProxy`）用 `c.Context()`：请求被取消时它随之取消
+（`context.Cause` 是原因），否则在请求结束（handler 返回且全部 `Release`）时取消。之后一切幂等：已经结束的请求上再调
 `Retain`、`Release`、`Finish` 都是空操作，往上面写会返回那个原因而不会把连接写坏。
 
 `Context.Flush()` 语义不变，仍然是 `http.Flusher`：把暂存的 body 立即发出去，响应不结束。

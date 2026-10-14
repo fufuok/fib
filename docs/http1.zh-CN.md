@@ -102,6 +102,14 @@ handler。这样的 handler 占着连接的这一轮，而读到对端断开本�
 context：如果 FIN 到达时 handler 还在处理，它就收不到响应。这是 epoll 和 kqueue 后端才有的能力；Windows 只在两轮
 之间才挂读，原地阻塞的 handler 要等到返回才会知道，而那时响应已经发出去了。
 
+`Request.Context()` 不会被取消，这样请求不必各自带一个 context。只通过 `context.Context`
+得知请求结束的代码（`database/sql`、`httputil.ReverseProxy`、gRPC 客户端等）改用
+`Context.Context()`，或者带上它的请求 `c.Request.WithContext(c.Context())`。它在第一次被调用时
+才创建；请求被取消时它随之取消，`context.Cause` 就是 `OnCancel` 收到的原因；否则在请求结束时
+取消：handler 已返回、每个 `Retain` 都已 `Release`，与 `net/http` 在 `ServeHTTP` 返回后取消请求
+context 一致。它不引用 `Context` 本身，所以即使 Reuse 选项把 `Context` 回收去服务别的请求，
+它也可以比请求活得久。
+
 从这里开始一切都是幂等的：已经结束的请求上再调 `Retain`、`Release`、`Finish` 都是空操作，
 清理代码可以放心调用而不必先判断；往上面写数据会返回那个原因，而不会把连接写坏。
 

@@ -133,6 +133,18 @@ epoll and kqueue backends' doing. On Windows, which arms a read only between
 rounds, a handler that waits in place hears nothing until it returns, by which
 time its response has gone out.
 
+`Request.Context()` is not cancelled, so that a request needs no context of
+its own. Code that hears of a request ending only through a
+`context.Context`, as `database/sql`, `httputil.ReverseProxy` and gRPC
+clients do, is handed `Context.Context()` instead, or a request carrying it,
+`c.Request.WithContext(c.Context())`. It is made the first time it is asked
+for, and cancelled when the request is, with what `OnCancel` is told as its
+`context.Cause`, or otherwise once the request has ended: the handler has
+returned and every `Retain` has been released, as `net/http` cancels a
+request's context once `ServeHTTP` returns. It holds nothing of the
+`Context`, so it may outlive the request even when the Reuse options recycle
+the `Context` for another.
+
 From there everything is idempotent: `Retain`, `Release` and `Finish` on a
 request that has ended do nothing, so cleanup code may call them without
 checking, and writing to it fails with the reason rather than corrupting the

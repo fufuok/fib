@@ -151,8 +151,10 @@ over HTTP/1.x, HTTP/2 and HTTP/3. Here is what carries over and what behaves dif
 - **Hijacking**: `http.Hijacker` is not implemented, so libraries that hijack the connection, such
   as gorilla/websocket, do not work. Switch protocols with `Context.Upgrade` or
   `websocket.ServerHandler.Upgrade` instead.
-- **Cancellation**: `c.Request.Context()` is not cancelled when the client goes away. Use `c.OnCancel` or
-  `c.Err()`.
+- **Cancellation**: `c.Request.Context()` is not cancelled when the client goes away. Use `c.OnCancel`,
+  `c.Err()`, or `c.Context()`, a `context.Context` cancelled when the request is (`context.Cause` gives
+  the reason) or ends, made only for a handler that asks for it. Code that takes the request's context,
+  such as `httputil.ReverseProxy`, can be handed `c.Request.WithContext(c.Context())`.
 
 ### Router
 

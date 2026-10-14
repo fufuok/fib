@@ -87,11 +87,12 @@ type Context struct {
 	mu   sync.Mutex
 	err  error
 	// body is OnBody's callback. handover is the body OnBody was asked for
-	// while the handler ran, owed once it returns; see later. cancel is
-	// OnCancel's. deliverMu keeps body callbacks one at a time.
+	// while the handler ran, owed once it returns; see later. cancel holds
+	// OnCancel's and what Context handed out. deliverMu keeps body callbacks
+	// one at a time.
 	body      BodyFunc
 	handover  func(worker bool)
-	cancel    func(error)
+	cancel    *cancelHooks
 	deliverMu sync.Mutex
 	// server and parser are the HTTP/1 connection this request arrived on,
 	// which a release away from the worker needs to carry on with. They are

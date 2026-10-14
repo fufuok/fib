@@ -3,6 +3,7 @@
 package http
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/url"
@@ -201,6 +202,11 @@ func (c *Context) drop(bits uint64) {
 // ended runs once nothing can reach the Context any more but the server: the
 // body's buffer goes back, and whatever the Reuse options recycle goes too.
 func (c *Context) ended() {
+	if h := c.cancel; h != nil && h.stop != nil {
+		stop := h.stop
+		h.stop = nil
+		stop(nil)
+	}
 	if c.whole != nil {
 		c.whole.release()
 	}
@@ -239,8 +245,12 @@ func (c *Context) recycle() {
 		writerPool.Put(w)
 	}
 	c.w, c.stream, c.external = nil, nil, nil
-	c.err, c.body, c.bodyDone, c.cancel = nil, nil, false, nil
+	c.err, c.body, c.bodyDone = nil, nil, false
 	c.bodyHeld, c.handover = false, nil
+	if h := c.cancel; h != nil {
+		// Kept for the next request, which is as likely to want it.
+		*h = cancelHooks{}
+	}
 	c.server, c.parser, c.whole, c.block = nil, nil, nil, nil
 	if st := c.route; st != nil {
 		if st.shared {
@@ -358,9 +368,76 @@ func (c *Context) OnCancel(fn func(error)) {
 		c.mu.Unlock()
 		return
 	}
-	c.cancel = fn
+	c.hooks().fn = fn
 	c.mu.Unlock()
 }
+
+// cancelHooks is what hears of a request ending: OnCancel's callback, and the
+// context Context handed out with what cancels it, once. They share a pointer
+// so that a Context, which every HTTP/2 and HTTP/3 stream carries, grows by
+// no more than one word for them.
+type cancelHooks struct {
+	fn   func(error)
+	ctx  context.Context
+	stop context.CancelCauseFunc
+}
+
+// hooks returns the Context's cancelHooks, made the first time they are
+// needed. Callers hold mu.
+func (c *Context) hooks() *cancelHooks {
+	if c.cancel == nil {
+		c.cancel = new(cancelHooks)
+	}
+	return c.cancel
+}
+
+// Context is a context.Context for the request, for code that hears of a
+// request ending only through one, as httputil.ReverseProxy and
+// database/sql do. Request.Context() is not cancelled; this one is, as
+// net/http's request context is: when the request is cancelled, for any of
+// the reasons OnCancel is told of, and otherwise once it has ended — the
+// handler has returned and every Retain has been released. From then on its
+// Done channel is closed, its Err is context.Canceled, and context.Cause
+// reports the reason OnCancel was given, or context.Canceled for a request
+// that ended in the ordinary way. Its values are Request.Context()'s.
+//
+// It is made the first time it is asked for, so a handler that does not ask
+// pays nothing for it. It holds nothing of the Context, so it can outlive the
+// request and goes on reporting how the request ended, even once the Reuse
+// options have the Context serving another. Asked for once the request has
+// ended, it returns a context that is already cancelled.
+func (c *Context) Context() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if h := c.cancel; h != nil && h.ctx != nil {
+		return h.ctx
+	}
+	// cancelWith moves the state on under mu, as OnCancel relies on too.
+	w := c.word.Load()
+	if ctxState(w) != ctxOpen && w&ctxAlive == 0 {
+		return endedContext
+	}
+	parent := context.Background()
+	if c.Request != nil {
+		parent = c.Request.Context()
+	}
+	ctx, stop := context.WithCancelCause(parent)
+	h := c.hooks()
+	if ctxState(w) == ctxCancelled {
+		stop(c.err)
+	} else {
+		h.stop = stop
+	}
+	h.ctx = ctx
+	return ctx
+}
+
+// endedContext is what Context returns for a request that has ended already.
+var endedContext = func() context.Context {
+	ctx, stop := context.WithCancel(context.Background())
+	stop()
+	return ctx
+}()
 
 // BodyComplete reports whether the whole request body has arrived: always
 // for a body read whole before the handler ran, and for a streamed one once
@@ -806,10 +883,18 @@ func (c *Context) cancelWith(err error, gen uint64) {
 		}
 	}
 	c.err = err
-	onCancel := c.cancel
-	c.cancel = nil
+	var onCancel func(error)
+	var stop context.CancelCauseFunc
+	if h := c.cancel; h != nil {
+		// The context stays, for a Context asked for again to return.
+		onCancel, stop = h.fn, h.stop
+		h.fn, h.stop = nil, nil
+	}
 	c.mu.Unlock()
 	c.forget()
+	if stop != nil {
+		stop(err)
+	}
 	if stream := c.RequestBody(); stream == nil {
 		c.deliverBody(nil, true, err, false)
 	} else if !stream.failSink(err) {

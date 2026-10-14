@@ -146,7 +146,10 @@ HTTP/2、HTTP/3 上都适用。兼容的部分与行为不同的部分：
   （与 net/http 一致），handler 仍可以回复。
 - **Hijack**：没有实现 `http.Hijacker`，所以需要 hijack 连接的库（如 gorilla/websocket）不能用。
   切换协议请用 `Context.Upgrade` 或 `websocket.ServerHandler.Upgrade`。
-- **取消**：客户端断开时 `c.Request.Context()` 不会被取消，请用 `c.OnCancel` 或 `c.Err()`。
+- **取消**：客户端断开时 `c.Request.Context()` 不会被取消，请用 `c.OnCancel`、`c.Err()`，或
+  `c.Context()`：一个在请求被取消（`context.Cause` 给出原因）或结束时被取消的 `context.Context`，
+  只为调用它的 handler 创建。`httputil.ReverseProxy` 这类读请求 context 的代码可以传
+  `c.Request.WithContext(c.Context())`。
 
 ### 路由
 
