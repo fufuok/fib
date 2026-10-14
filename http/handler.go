@@ -251,6 +251,17 @@ type StreamEnder interface {
 	RequestEnded()
 }
 
+// StreamDeadliner is implemented by a Stream whose response, and request
+// body, can be given deadlines of their own, which is what Context's
+// SetWriteDeadline and SetReadDeadline, and so http.ResponseController's,
+// hand on to it once the Context has checked the response is not finished.
+// A Stream that does not implement it has them report
+// http.ErrNotSupported.
+type StreamDeadliner interface {
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+}
+
 // ParseRequestTarget parses an origin-form request target into u, as
 // url.ParseRequestURI does, but without allocating for the plain path and
 // query nearly every request has: those are slices of target. It is for
@@ -526,9 +537,51 @@ func (h *ServerHandler) idleTimeout() time.Duration {
 // and a connection this parser has finished with — one that is closing, or
 // that has become HTTP/2 — is left alone entirely. Callers hold parser.mu.
 func (h *ServerHandler) armRead(c *fib.Connection, parser *Parser) {
-	if !h.timed || parser.spent {
+	if parser.spent {
 		return
 	}
+	if parser.bodyArmed {
+		h.armBodyRead(c, parser)
+		return
+	}
+	if h.timed {
+		_ = c.SetReadDeadline(h.readDeadline(parser))
+	}
+}
+
+// armBodyRead is armRead while a body that streams is arriving, or a
+// deadline its handler set may still be the connection's: the handler's
+// deadline, set with SetReadDeadline, stands in for Config.ReadTimeout's
+// while its body is still arriving and its response still open, and gives
+// way to whatever the connection waits for next after that.
+func (h *ServerHandler) armBodyRead(c *fib.Connection, parser *Parser) {
+	var at time.Time
+	if h.timed {
+		at = h.readDeadline(parser)
+	}
+	b := parser.bodyDeadline
+	b.mu.Lock()
+	b.open = nil
+	if parser.stream != nil {
+		if context := parser.liveContext.Load(); context != nil && ctxState(context.word.Load()) == ctxOpen {
+			b.open = context
+		}
+	}
+	own := b.open != nil && b.owner == b.open
+	if own {
+		at = b.at
+	}
+	if h.timed || own || b.applied {
+		_ = c.SetReadDeadline(at)
+	}
+	b.applied = own
+	parser.bodyArmed = b.open != nil
+	b.mu.Unlock()
+}
+
+// readDeadline is the read deadline Config's timeouts put on what the
+// connection is waiting for.
+func (h *ServerHandler) readDeadline(parser *Parser) time.Time {
 	var at time.Time
 	switch state := parser.waitState(); state {
 	case waitIdle:
@@ -547,17 +600,25 @@ func (h *ServerHandler) armRead(c *fib.Connection, parser *Parser) {
 			at = parser.requestStart.Add(d)
 		}
 	}
-	_ = c.SetReadDeadline(at)
+	return at
 }
 
 // releaseTimeouts hands the connection over to another protocol: this parser
-// stops timing it, and the deadline it had goes with it.
+// stops timing it, and the deadline it had goes with it, whether the
+// Config's or one the handler set.
 func (h *ServerHandler) releaseTimeouts(c *fib.Connection, parser *Parser) {
 	parser.spent = true
-	if h.timed {
+	applied := false
+	if b := parser.bodyDeadline; b != nil {
+		b.mu.Lock()
+		applied = b.applied
+		b.open, b.owner, b.applied = nil, nil, false
+		b.mu.Unlock()
+	}
+	if h.timed || applied {
 		_ = c.SetReadDeadline(time.Time{})
 	}
-	if h.config.WriteTimeout > 0 {
+	if h.config.WriteTimeout > 0 || !parser.writeDeadline.IsZero() {
 		parser.writeDeadline = time.Time{}
 		_ = c.SetWriteDeadline(time.Time{})
 	}
@@ -712,6 +773,9 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		context.begin(true, false)
 		parser.busy = true
 		parser.liveContext.Store(context)
+		if context.streamed {
+			parser.openBody(context)
+		}
 		var bodyErr error
 		if parser.stream != nil {
 			// Hand the body what has already arrived before the handler runs,
@@ -732,6 +796,11 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			// sendBody refuses to stream more of it afterwards.
 			parser.writeDeadline = time.Now().Add(d)
 			_ = c.SetWriteDeadline(parser.writeDeadline)
+		} else if !parser.writeDeadline.IsZero() {
+			// The last response's handler set a deadline of its own, which
+			// does not carry over to this one.
+			parser.writeDeadline = time.Time{}
+			_ = c.SetWriteDeadline(time.Time{})
 		}
 		// The handler runs here, on the connection's worker, whether or not
 		// its body has all arrived: reading a streamed body never waits, so
@@ -793,6 +862,9 @@ func (h *ServerHandler) endRequestLocked(context *Context) bool {
 	tooMuchLeft, unread := false, false
 	if stream := context.RequestBody(); stream != nil {
 		tooMuchLeft, unread = stream.abandon()
+	}
+	if context.streamed {
+		parser.closeBody(context)
 	}
 	// A request cancelled while its handler ran, by a hangup heard before the
 	// round could read it, has no response for the client to read, and

@@ -275,6 +275,68 @@ func (c *Context) FlushError() error {
 	return c.Conn.Flush()
 }
 
+// SetWriteDeadline replaces the deadline Config.WriteTimeout puts on the
+// response, for this response alone, as http.ResponseController's does: a
+// zero t lifts it, which is how a handler that streams for as long as its
+// client listens (server-sent events, a long download) keeps WriteTimeout
+// from cutting it off, and a t in the past ends the response at once. It
+// sets one too when Config.WriteTimeout does not. What passing it does is
+// what passing WriteTimeout does: on HTTP/1 the connection is closed if
+// output is still queued for the client, and a Write made after it fails;
+// on HTTP/2 and HTTP/3 the stream is reset. It reports ErrResponseWritten
+// once the response is finished, and http.ErrNotSupported on a stream
+// served outside this package that is not a StreamDeadliner.
+func (c *Context) SetWriteDeadline(t time.Time) error {
+	if c.wrote {
+		return ErrResponseWritten
+	}
+	switch {
+	case c.isHTTP1():
+		if c.parser != nil {
+			c.parser.writeDeadline = t
+		}
+		return c.Conn.SetWriteDeadline(t)
+	case c.stream != nil:
+		return c.stream.setWriteDeadline(t)
+	}
+	if d, ok := c.external.(StreamDeadliner); ok {
+		return d.SetWriteDeadline(t)
+	}
+	return stdhttp.ErrNotSupported
+}
+
+// SetReadDeadline gives the rest of the request's body until t to arrive,
+// for this request alone, as http.ResponseController's does. On HTTP/1 it
+// replaces the deadline Config.ReadTimeout puts on a body that streams: a
+// zero t lifts it, which is how a handler taking a long upload keeps
+// ReadTimeout from cutting it off, and the connection is closed if the body
+// has not all arrived by t. HTTP/2 and HTTP/3 put no read deadline on a
+// stream of their own; one set here fails a body still arriving at t with
+// os.ErrDeadlineExceeded, as net/http's HTTP/2 server does, leaving the
+// stream open for the handler to answer, and a zero t lifts it.
+//
+// A body that had all arrived before the handler ran, as every body does
+// that does not stream (see Config.StreamRequestBody), has nothing left to
+// bound, so setting it does nothing then, as it does once a streamed body
+// has ended. It reports ErrResponseWritten once the response is finished.
+func (c *Context) SetReadDeadline(t time.Time) error {
+	switch {
+	case c.wrote:
+		return ErrResponseWritten
+	case c.isHTTP1():
+		if !c.streamed || c.parser == nil || c.parser.bodyDeadline == nil {
+			return nil
+		}
+		return c.parser.bodyDeadline.set(c, t)
+	case c.stream != nil:
+		return c.stream.setReadDeadline(t)
+	}
+	if d, ok := c.external.(StreamDeadliner); ok {
+		return d.SetReadDeadline(t)
+	}
+	return stdhttp.ErrNotSupported
+}
+
 // ReadFrom copies src into the response body, as io.Copy does through
 // io.ReaderFrom. On an HTTP/1 connection a regular file, or an
 // *io.LimitedReader over one as http.ServeContent passes, goes from the file

@@ -117,6 +117,11 @@ type h2ServerConn struct {
 	// lastStreamID is the highest client stream accepted, which GOAWAY
 	// reports as the last one this side will process.
 	lastStreamID uint32
+	// readTimers holds the timers that fail a stream's body once the
+	// deadline its handler set with SetReadDeadline has passed, made with
+	// the first of them; see setReadDeadline. The stream has no room for one
+	// of its own, and few streams set one.
+	readTimers map[*h2ServerStream]*time.Timer
 	// Server push: whether the client allows it, the next promised stream,
 	// how many pushed streams the client allows open at once, and how many
 	// are.
@@ -1098,6 +1103,7 @@ func (sc *h2ServerConn) handleStreamedData(st *h2ServerStream, f *h2Frame) error
 func (sc *h2ServerConn) endStreamed(st *h2ServerStream, trailer stdhttp.Header) error {
 	sc.mu.Lock()
 	st.remoteDone = true
+	sc.stopReadTimerLocked(st)
 	if st.localDone {
 		sc.forgetLocked(st)
 	}
@@ -1136,6 +1142,7 @@ func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
 	if feed := st.feed; feed != nil && !st.remoteDone {
 		feed.Fail(err)
 	}
+	sc.stopReadTimerLocked(st)
 	sc.endTunnelLocked(st, err)
 	if o := st.out; o != nil {
 		// A handler waiting for room to write finds the stream gone.
@@ -1178,6 +1185,108 @@ func (sc *h2ServerConn) armWriteTimeout(st *h2ServerStream) {
 		st.writeTimer = time.AfterFunc(d, st.writeTimedOut)
 	}
 	sc.mu.Unlock()
+}
+
+// setWriteDeadline replaces the clock armWriteTimeout started on st's
+// response with one that runs out at t, or with none when t is zero; see
+// Context.SetWriteDeadline. A timer that has fired already has the stream
+// on its way to being reset, which it reports.
+func (st *h2ServerStream) setWriteDeadline(t time.Time) error {
+	sc := st.sc
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.closed || st.reset {
+		return st.closedErrLocked()
+	}
+	if st.localDone {
+		// The response has all gone; there is nothing left to bound.
+		return nil
+	}
+	if sc.streams[st.id] != st {
+		return st.closedErrLocked()
+	}
+	if timer := st.writeTimer; timer != nil {
+		if !timer.Stop() {
+			return os.ErrDeadlineExceeded
+		}
+		st.writeTimer = nil
+		// The new timer takes the stopped one's reference.
+		if t.IsZero() {
+			st.unref()
+		}
+	} else if !t.IsZero() {
+		st.refs.Add(1)
+	}
+	if !t.IsZero() {
+		st.writeTimer = time.AfterFunc(time.Until(t), st.writeTimedOut)
+	}
+	return nil
+}
+
+// setReadDeadline gives the rest of st's request body until t to arrive,
+// or as long as it takes when t is zero; see Context.SetReadDeadline. Once t
+// has passed, a body still arriving fails with os.ErrDeadlineExceeded, as
+// net/http's HTTP/2 server fails it: the stream stays open for the handler
+// to answer, and what more of the body arrives is dropped, its room given
+// back. A stream has no read deadline otherwise, and a body that has all
+// arrived has nothing left to bound. A timer that has fired already has
+// failed the body, or is about to, which it reports.
+func (st *h2ServerStream) setReadDeadline(t time.Time) error {
+	sc := st.sc
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.closed || st.reset {
+		return st.closedErrLocked()
+	}
+	if st.remoteDone || st.feed == nil {
+		return nil
+	}
+	if timer, ok := sc.readTimers[st]; ok {
+		if !timer.Stop() {
+			return os.ErrDeadlineExceeded
+		}
+		delete(sc.readTimers, st)
+		// The new timer takes the stopped one's reference.
+		if t.IsZero() {
+			st.unref()
+		}
+	} else if !t.IsZero() {
+		st.refs.Add(1)
+	}
+	if !t.IsZero() {
+		if sc.readTimers == nil {
+			sc.readTimers = make(map[*h2ServerStream]*time.Timer)
+		}
+		sc.readTimers[st] = time.AfterFunc(time.Until(t), st.readTimedOut)
+	}
+	return nil
+}
+
+// readTimedOut fails a body that outlasted the deadline its handler set;
+// see setReadDeadline. A timer stopped once it had fired finds itself gone
+// from readTimers, and leaves the body alone.
+func (st *h2ServerStream) readTimedOut() {
+	sc := st.sc
+	sc.mu.Lock()
+	if _, ok := sc.readTimers[st]; ok {
+		delete(sc.readTimers, st)
+		if !sc.closed && !st.reset && !st.remoteDone {
+			st.feed.Fail(os.ErrDeadlineExceeded)
+		}
+	}
+	sc.mu.Unlock()
+	st.unref()
+}
+
+// stopReadTimerLocked stops st's read timer, if it has one, as
+// stopWriteTimerLocked stops its write timer.
+func (sc *h2ServerConn) stopReadTimerLocked(st *h2ServerStream) {
+	if t, ok := sc.readTimers[st]; ok {
+		delete(sc.readTimers, st)
+		if t.Stop() {
+			st.unref()
+		}
+	}
 }
 
 // stopWriteTimerLocked stops st's write timer, if it has one, and gives up
@@ -1465,6 +1574,7 @@ func (st *h2ServerStream) writeInterim(status int, header stdhttp.Header) error 
 func (sc *h2ServerConn) forgetLocked(st *h2ServerStream) {
 	st.reset = st.reset || !st.localDone
 	sc.stopWriteTimerLocked(st)
+	sc.stopReadTimerLocked(st)
 	st.pending = nil
 	if o := st.out; o != nil {
 		bufferpool.Put(o.buf)

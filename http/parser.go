@@ -113,7 +113,9 @@ type Config struct {
 	// ReadTimeout bounds how long a whole request, header and body, may take
 	// to arrive, measured from its first byte. It bounds a streamed body for
 	// as long as it is still arriving, and stops once the request has all
-	// arrived, so a handler is never cut off by it. Zero means no limit.
+	// arrived, so a handler is never cut off by it. A handler can lift it,
+	// or set another, for its own streamed body with Context.SetReadDeadline.
+	// Zero means no limit.
 	ReadTimeout time.Duration
 	// IdleTimeout bounds how long a kept-alive connection may sit between
 	// requests. Zero means ReadTimeout; both zero means no limit.
@@ -129,8 +131,10 @@ type Config struct {
 	// response has not all gone by then is reset with INTERNAL_ERROR, which
 	// ends that request, not the connection its client shares with others;
 	// a handler waiting to write is let go, its Context is cancelled, and a
-	// Write made after it has passed fails with os.ErrDeadlineExceeded. Zero
-	// means no limit. HTTP/3 has http3.Config.WriteTimeout.
+	// Write made after it has passed fails with os.ErrDeadlineExceeded. A
+	// handler can lift it, or set another, for its own response with
+	// Context.SetWriteDeadline. Zero means no limit. HTTP/3 has
+	// http3.Config.WriteTimeout.
 	WriteTimeout time.Duration
 	// StreamRequestBodyBuffer is how many bytes of a streamed HTTP/1 body may
 	// wait unread before the connection stops reading its socket, so that a

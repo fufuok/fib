@@ -109,7 +109,9 @@ type Config struct {
 	// H3_INTERNAL_ERROR, which ends that request and leaves the rest of the
 	// connection serving: a handler waiting for a client that stopped taking
 	// its body is let go, its Context is cancelled, and a Write made after it
-	// has passed fails with os.ErrDeadlineExceeded. Zero means no limit.
+	// has passed fails with os.ErrDeadlineExceeded. A handler can lift it,
+	// or set another, for its own response with Context.SetWriteDeadline.
+	// Zero means no limit.
 	WriteTimeout time.Duration
 	// MaxDatagramSize is the largest UDP payload the server sends once a
 	// connection's handshake is over, if the client allows it. Zero means
@@ -735,8 +737,12 @@ func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
 		rs.mu.Lock()
 		rs.closed = true
 		stopped := rs.stopWriteTimerLocked()
+		readStopped := rs.stopReadTimerLocked()
 		rs.mu.Unlock()
 		if stopped {
+			rs.unref()
+		}
+		if readStopped {
 			rs.unref()
 		}
 		rs.failBody(net.ErrClosed)
@@ -947,6 +953,11 @@ type streamedBody struct {
 	// it, hence the lock.
 	mu   sync.Mutex
 	skip int64
+	// readTimer fails the body once the deadline its handler set with
+	// SetReadDeadline has passed, or is nil; see SetReadDeadline. It is
+	// guarded by the request stream's mu, and holds a reference to the
+	// stream until it is stopped or has run.
+	readTimer *time.Timer
 }
 
 // addSkip records n bytes of the body that were given back as they arrived.
@@ -993,7 +1004,11 @@ func (rs *requestStream) feed(data []byte, fin bool) {
 	}
 	rs.mu.Lock()
 	rs.remoteDone = true
+	readStopped := rs.stopReadTimerLocked()
 	rs.mu.Unlock()
+	if readStopped {
+		rs.unref()
+	}
 	if rs.parser.midFrame() {
 		rs.sc.fail(connErr(ErrCodeFrameError, "request stream ended inside a frame"))
 		return
@@ -1269,8 +1284,12 @@ func (rs *requestStream) abort(code ErrorCode) {
 	rs.mu.Lock()
 	rs.closed = true
 	stopped := rs.stopWriteTimerLocked()
+	readStopped := rs.stopReadTimerLocked()
 	rs.mu.Unlock()
 	if stopped {
+		rs.unref()
+	}
+	if readStopped {
 		rs.unref()
 	}
 	abortStream(rs.s, code)
@@ -1319,8 +1338,12 @@ func (rs *requestStream) peerReset() {
 	wasOpen := !rs.closed && (!rs.responded || rs.upgraded || rs.streaming)
 	rs.closed = true
 	stopped := rs.stopWriteTimerLocked()
+	readStopped := rs.stopReadTimerLocked()
 	rs.mu.Unlock()
 	if stopped {
+		rs.unref()
+	}
+	if readStopped {
 		rs.unref()
 	}
 	if wasOpen {
@@ -1465,6 +1488,119 @@ func (rs *requestStream) armWriteTimeout() {
 	rs.mu.Unlock()
 }
 
+// SetWriteDeadline replaces the clock armWriteTimeout started on the
+// response with one that runs out at t, or with none when t is zero; see
+// http.StreamDeadliner. A timer that has fired already has the stream on its
+// way to being reset, which it reports.
+func (rs *requestStream) SetWriteDeadline(t time.Time) error {
+	rs.mu.Lock()
+	if rs.closed {
+		err := rs.closedErrLocked()
+		rs.mu.Unlock()
+		return err
+	}
+	if rs.responded && !rs.streaming {
+		// The response has been written whole; there is nothing left to
+		// bound.
+		rs.mu.Unlock()
+		return nil
+	}
+	stopped := false
+	if timer := rs.writeTimer; timer != nil {
+		if !timer.Stop() {
+			rs.mu.Unlock()
+			return os.ErrDeadlineExceeded
+		}
+		rs.writeTimer, stopped = nil, true
+	}
+	if !t.IsZero() {
+		// The new timer takes the stopped one's reference, or one of its own.
+		if stopped {
+			stopped = false
+		} else {
+			rs.refs.Add(1)
+		}
+		rs.writeTimer = time.AfterFunc(time.Until(t), rs.writeTimedOut)
+	}
+	rs.mu.Unlock()
+	if stopped {
+		rs.unref()
+	}
+	return nil
+}
+
+// SetReadDeadline gives the rest of the request body until t to arrive, or
+// as long as it takes when t is zero; see http.StreamDeadliner. Once t has
+// passed, a body still arriving fails with os.ErrDeadlineExceeded: the stream
+// stays open for the handler to answer, and what more of the body arrives is
+// dropped, its room given back. A stream has no read deadline otherwise, and
+// a body that has all arrived has nothing left to bound. A timer that has
+// fired already has failed the body, or is about to, which it reports.
+func (rs *requestStream) SetReadDeadline(t time.Time) error {
+	rs.mu.Lock()
+	if rs.closed {
+		err := rs.closedErrLocked()
+		rs.mu.Unlock()
+		return err
+	}
+	b := rs.streamed
+	if rs.remoteDone || b == nil || b.feed == nil {
+		rs.mu.Unlock()
+		return nil
+	}
+	stopped := false
+	if timer := b.readTimer; timer != nil {
+		if !timer.Stop() {
+			rs.mu.Unlock()
+			return os.ErrDeadlineExceeded
+		}
+		b.readTimer, stopped = nil, true
+	}
+	if !t.IsZero() {
+		// The new timer takes the stopped one's reference, or one of its own.
+		if stopped {
+			stopped = false
+		} else {
+			rs.refs.Add(1)
+		}
+		b.readTimer = time.AfterFunc(time.Until(t), rs.readTimedOut)
+	}
+	rs.mu.Unlock()
+	if stopped {
+		rs.unref()
+	}
+	return nil
+}
+
+// readTimedOut fails a body that outlasted the deadline its handler set;
+// see SetReadDeadline. A timer stopped once it had fired finds readTimer
+// gone, and leaves the body alone.
+func (rs *requestStream) readTimedOut() {
+	defer rs.unref()
+	rs.mu.Lock()
+	b := rs.streamed
+	fire := b.readTimer != nil && !rs.closed && !rs.remoteDone
+	b.readTimer = nil
+	rs.mu.Unlock()
+	if fire {
+		b.feed.Fail(os.ErrDeadlineExceeded)
+	}
+}
+
+// stopReadTimerLocked stops the read timer, if there is one, as
+// stopWriteTimerLocked stops the write timer.
+func (rs *requestStream) stopReadTimerLocked() bool {
+	b := rs.streamed
+	if b == nil || b.readTimer == nil {
+		return false
+	}
+	t := b.readTimer
+	b.readTimer = nil
+	return t.Stop()
+}
+
+var _ fibhttp.StreamDeadliner = (*requestStream)(nil)
+
 // stopWriteTimerLocked stops the write timer, if there is one, and reports
 // whether the caller is to give up the reference it held, which it is to do
 // once it has let go of rs.mu; a timer that has fired gives it up itself.
@@ -1481,10 +1617,15 @@ func (rs *requestStream) writeTimedOut() {
 	rs.mu.Lock()
 	open := rs.writeTimer != nil && !rs.closed && (!rs.responded || rs.streaming)
 	rs.writeTimer = nil
+	readStopped := false
 	if open {
 		rs.closed, rs.timedOut = true, true
+		readStopped = rs.stopReadTimerLocked()
 	}
 	rs.mu.Unlock()
+	if readStopped {
+		rs.unref()
+	}
 	if !open {
 		return
 	}

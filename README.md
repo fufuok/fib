@@ -141,7 +141,13 @@ over HTTP/1.x, HTTP/2 and HTTP/3. Here is what carries over and what behaves dif
 - **Streaming**: on HTTP/1.x, `Write` and `Flush` stream the response as it is written.
 - **Files**: `http.ServeFile`, `http.ServeContent` and `http.FileServer` work. On HTTP/1.x they send
   files with sendfile(2), via `ReadFrom`.
-- **`http.ResponseController`** works, because Context has `FlushError`.
+- **`http.ResponseController`**: `Flush`, `SetWriteDeadline` and `SetReadDeadline` work; `Hijack`
+  does not (see below), and `EnableFullDuplex` reports `http.ErrNotSupported`. A zero
+  `SetWriteDeadline` lifts `WriteTimeout` for one response, as SSE streams and long downloads do, on
+  HTTP/1.x, HTTP/2 and HTTP/3. `SetReadDeadline` bounds or lifts the time left for a streamed body
+  to arrive. On HTTP/1.x it stands in for `ReadTimeout` and closes the connection when it passes;
+  on HTTP/2 and HTTP/3 it fails that stream's body with `os.ErrDeadlineExceeded`, as net/http does,
+  and the handler can still answer.
 - **Hijacking**: `http.Hijacker` is not implemented, so libraries that hijack the connection, such
   as gorilla/websocket, do not work. Switch protocols with `Context.Upgrade` or
   `websocket.ServerHandler.Upgrade` instead.

@@ -19,14 +19,85 @@ import (
 type serverState struct {
 	liveContext atomic.Pointer[Context]
 	// writeDeadline is when the response being written stops being allowed
-	// to, under Config.WriteTimeout, or zero. It is set before the handler
-	// runs and read by whatever writes the response.
+	// to, under Config.WriteTimeout or as the handler set it with
+	// SetWriteDeadline, or zero. It is set before the handler runs and read
+	// by whatever writes the response.
 	writeDeadline time.Time
+	// bodyDeadline is what a handler's SetReadDeadline shares with the
+	// connection for a body that streams, allocated with the connection's
+	// first such body, and bodyArmed tells armRead to consult it. bodyArmed
+	// is guarded by the parser's mu.
+	bodyDeadline *bodyDeadline
+	bodyArmed    bool
 }
 
 func (p *Parser) resetServerState() {
 	p.liveContext.Store(nil)
 	p.writeDeadline = time.Time{}
+	p.bodyDeadline, p.bodyArmed = nil, false
+}
+
+// bodyDeadline is a deadline a handler set with SetReadDeadline for the rest
+// of its request's body to arrive by, which stands in for the one
+// Config.ReadTimeout puts on it. The handler may set it from any goroutine,
+// while the connection's worker re-arms the connection's read deadline at
+// the end of every round it runs (see armRead); mu orders the two, so that
+// neither undoes the other.
+type bodyDeadline struct {
+	mu sync.Mutex
+	// open is the request whose body is still arriving and whose response is
+	// still open, the only one a deadline set now can apply to, or nil.
+	open *Context
+	// owner is the request the handler set at for, or nil.
+	owner *Context
+	at    time.Time
+	// applied records that the connection's read deadline is the handler's,
+	// which armRead replaces once it no longer applies.
+	applied bool
+}
+
+// openBody records that context's body streams and is still arriving, for
+// SetReadDeadline to bound. Callers hold the parser's mu.
+func (p *Parser) openBody(context *Context) {
+	b := p.bodyDeadline
+	if b == nil {
+		b = new(bodyDeadline)
+		p.bodyDeadline = b
+	}
+	b.mu.Lock()
+	b.open, b.owner = context, nil
+	b.mu.Unlock()
+	p.bodyArmed = true
+}
+
+// closeBody forgets a deadline context's handler set, once the connection is
+// done with its request: a Context the Reuse options recycle comes back as
+// another request's, which must not find it. Callers hold the parser's mu.
+func (p *Parser) closeBody(context *Context) {
+	if b := p.bodyDeadline; b != nil {
+		b.mu.Lock()
+		if b.owner == context {
+			b.owner = nil
+		}
+		b.mu.Unlock()
+	}
+}
+
+// set gives c's body until t to arrive, or as long as it takes when t is
+// zero, applying it to the connection at once if the body is still
+// arriving; otherwise armRead applies it, or it has nothing left to bound.
+func (b *bodyDeadline) set(c *Context, t time.Time) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ctxState(c.word.Load()) != ctxOpen {
+		return ErrResponseWritten
+	}
+	b.owner, b.at = c, t
+	if b.open != c {
+		return nil
+	}
+	b.applied = true
+	return c.Conn.SetReadDeadline(t)
 }
 
 // blockServerState is the part of a requestBlock a server serves the request
