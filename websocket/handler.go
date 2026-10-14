@@ -353,6 +353,25 @@ type connectionState struct {
 // upgraded reports whether the opening handshake has completed.
 func (s *connectionState) upgraded() bool { return s.websocket.conn != nil }
 
+// openState is a connectionState whose opening handshake has completed and
+// whose handler has had OnOpen, attached under a type of its own once it
+// has: OnShutdown, which runs on the event loop, learns it from the
+// attachment, which a worker writes atomically, rather than from websocket,
+// which the worker fills in, and the state needs no room for it.
+type openState connectionState
+
+// stateOf returns c's connectionState, whether its handshake has completed
+// or not, or nil.
+func stateOf(c *fib.Connection) *connectionState {
+	switch state := c.Attachment().(type) {
+	case *openState:
+		return (*connectionState)(state)
+	case *connectionState:
+		return state
+	}
+	return nil
+}
+
 type ServerHandler struct {
 	config           Config
 	handler          Handler
@@ -403,7 +422,7 @@ func (h *ServerHandler) OnOpen(c *fib.Connection) {
 }
 
 func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
-	state, _ := c.Attachment().(*connectionState)
+	state := stateOf(c)
 	if state == nil {
 		h.OnOpen(c)
 		state, _ = c.Attachment().(*connectionState)
@@ -492,6 +511,7 @@ func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, reque
 		}
 		h.handler.OnOpen(&state.websocket, request)
 	}
+	c.SetAttachment((*openState)(state))
 	if len(remainder) != 0 {
 		h.handleFrames(state, remainder)
 	}
@@ -778,8 +798,35 @@ func (h *ServerHandler) reject(c *fib.Connection, request *stdhttp.Request, stat
 
 func (h *ServerHandler) OnPriorityData(*fib.Connection, []byte) {}
 
+// OnShutdown ends the connection as its engine shuts down; see
+// fib.Engine.Shutdown. An open WebSocket is sent a close frame with 1001
+// (going away) and closes once it has gone, and one still in its opening
+// handshake closes at once: it would be told to go away as soon as it
+// opened. It runs on the event loop, and the close frame is sent from the
+// engine's handler pool, since sending may wait on a layer such as TLS.
+func (h *ServerHandler) OnShutdown(c *fib.Connection) {
+	switch state := c.Attachment().(type) {
+	case *openState:
+		if ws := &state.websocket; !ws.closeSent.Load() {
+			elsewhere(c, func() { _ = ws.Close(CloseGoingAway, "") })
+		}
+	case *connectionState:
+		_ = c.Close()
+	}
+}
+
+var _ fib.ShutdownHandler = (*ServerHandler)(nil)
+
+// elsewhere runs fn on the engine's handler pool, or on a goroutine of its
+// own once the pool has stopped taking work.
+func elsewhere(c *fib.Connection, fn func()) {
+	if pool := c.Engine().HandlerPool(); pool == nil || !pool.Go(fn) {
+		go fn()
+	}
+}
+
 func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
-	state, _ := c.Attachment().(*connectionState)
+	state := stateOf(c)
 	c.SetAttachment(nil)
 	if state == nil {
 		return

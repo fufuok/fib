@@ -243,6 +243,32 @@ func (e *Engine) stopListening() {
 	}
 }
 
+// beginShutdown starts Shutdown: the listeners stop taking connections, as
+// Stop has them do, while the loops go on serving the connections there are.
+func (e *Engine) beginShutdown() {
+	e.draining.Store(true)
+	e.stopListening()
+	for _, p := range e.pollers {
+		p.draining.Store(true)
+		p.stopListening()
+	}
+}
+
+// shutdownConnections runs one round of Shutdown on the loop: each open
+// connection is told the engine is shutting down, and the answer is how many
+// of those Shutdown waits for remain. Callers run on the event loop.
+func (e *Engine) shutdownConnections() int {
+	n := 0
+	for _, entries := range e.connections {
+		for _, c := range entries {
+			if c != nil && shutdownConnection(c) {
+				n++
+			}
+		}
+	}
+	return n + e.shutdownUDPPeers()
+}
+
 // listenSockname returns the address of the i-th listener, fd, which is the
 // one it had before it stopped listening if it has.
 func (e *Engine) listenSockname(i, fd int) (syscall.Sockaddr, error) {

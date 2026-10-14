@@ -72,6 +72,31 @@ type HangupHandler interface {
 	OnHangup(*Connection)
 }
 
+// ShutdownHandler is a Handler told that its engine is shutting down; see
+// Engine.Shutdown. The engine cannot tell whether a connection is in the
+// middle of an exchange or idle between two, and Shutdown waits for every
+// connection it accepted to close. OnShutdown is the protocol's cue to end
+// the connection as soon as it can without cutting an exchange short: to
+// close it now if it is idle, to close it once the exchange in flight is
+// done, or to tell the peer it is going away, as HTTP/2's GOAWAY and a
+// WebSocket close frame do. Engine.ShuttingDown says the same thing to code
+// that asks, such as a protocol about to keep a connection open for its next
+// exchange.
+//
+// OnShutdown runs when Shutdown begins and then again, at a falling rate,
+// for as long as the connection stays open, so that a connection busy the
+// first time is found idle a later one; it must be safe to call more than
+// once. It is not called for a connection the engine dialed, nor for one
+// already closing. It runs on the connection's event loop, like OnHangup,
+// and may run while one of the connection's rounds is running OnData: it
+// must not block, nor take a lock that a handler in OnData may hold. The
+// portable backend calls it on the goroutine that called Shutdown, under
+// the same rules.
+type ShutdownHandler interface {
+	Handler
+	OnShutdown(*Connection)
+}
+
 // HandlerFuncs allows callers to implement only the callbacks they need.
 type HandlerFuncs struct {
 	Open         func(*Connection)

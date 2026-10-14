@@ -43,8 +43,16 @@ func (st *h2ServerStream) upgraded() bool { return st.tunnel != nil && st.tunnel
 func (sc *h2ServerConn) serveTunnel(st *h2ServerStream) {
 	// A tunnel outlives its handler's return; its stream is not recycled.
 	st.pooled = false
-	st.tunnel = &h2Tunnel{feed: TunnelFeed{tunnel: Tunnel{conn: sc.conn, w: (*h2TunnelWriter)(st),
+	tunnel := &h2Tunnel{feed: TunnelFeed{tunnel: Tunnel{conn: sc.conn, w: (*h2TunnelWriter)(st),
 		limit: int(sc.handler.config.MaxBodyBytes)}}}
+	// Set under the lock, where a shutdown retiring the connection looks for
+	// its tunnels. One that began before this is told here instead.
+	sc.mu.Lock()
+	st.tunnel = tunnel
+	sc.mu.Unlock()
+	if sc.retiring.Load() {
+		tunnel.feed.Shutdown()
+	}
 	st.block.bind(sc.conn, nil).stream = st
 	sc.handler.streams.Serve(&sc.gate, sc.conn, sc.handler.handler, &st.block)
 }

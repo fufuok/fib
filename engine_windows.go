@@ -498,6 +498,25 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 // listener is what stops it, and the loop may be posting an AcceptEx on it.
 func (e *Engine) stopListening() {}
 
+// beginShutdown starts Shutdown. The listeners are closed by the loop, in
+// the first round of Shutdown, for the reason stopListening is the loop's.
+func (e *Engine) beginShutdown() { e.draining.Store(true) }
+
+// shutdownConnections runs one round of Shutdown on the loop: the listeners
+// stop taking connections, if they have yet to, each open connection is told
+// the engine is shutting down, and the answer is how many of those Shutdown
+// waits for remain. Callers run on the event loop.
+func (e *Engine) shutdownConnections() int {
+	_ = e.closeListeners()
+	n := 0
+	for c := range e.conns {
+		if shutdownConnection(c) {
+			n++
+		}
+	}
+	return n + e.shutdownUDPPeers()
+}
+
 // closeListeners closes the TCP listeners, which stops them taking
 // connections, and the AcceptEx calls still pending on them complete with
 // errors that Close collects. Callers run on the event loop, or after it.

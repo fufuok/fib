@@ -178,6 +178,42 @@ if err := server.Run(); err != nil { panic(err) }
 config.Addrs = []string{"127.0.0.1:9000", "127.0.0.1:9001"}
 ```
 
+### 优雅停机（Shutdown）
+
+`Stop` 让 `Run` 立即返回，已建立的连接留给 `Close` 直接关闭。`Shutdown(ctx)` 与
+`net/http.Server.Shutdown` 对应：监听立即停止接收新连接（新客户端连接直接被拒绝，
+负载均衡可以马上转向其他实例），事件循环继续服务已建立的连接，等到引擎 accept 的
+连接全部关闭或 `ctx` 结束后再像 `Stop` 一样停止引擎、让 `Run` 返回。`ctx` 先结束时
+返回 `ctx.Err()`，此时仍未关闭的连接由之后的 `Close` 关闭：
+
+```go
+go func() {
+    <-sigCtx.Done() // SIGINT/SIGTERM
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    _ = server.Shutdown(ctx)
+}()
+if err := server.Run(); err != nil { panic(err) } // Shutdown 停止引擎后返回
+server.Close()
+```
+
+引擎分不清连接是在处理请求还是空闲，这由连接上的协议决定：handler 实现
+`fib.ShutdownHandler` 时，停机期间引擎在事件循环上对每个未关闭的连接调用
+`OnShutdown`，开始时调用一次，之后按逐渐拉长的间隔重复调用，直到连接关闭；它不能
+阻塞。HTTP server 借此关闭空闲的 HTTP/1 连接，正在处理请求的连接在响应写出后关闭
+（响应带 `Connection: close`），还没发来任何字节的连接给 5 秒发送第一个请求；HTTP/2
+连接发送 GOAWAY，在途 stream 完成后关闭。HTTP/3 同样发送 GOAWAY，请求完成后关闭
+QUIC 连接，客户端地址上不再有连接时随即关闭（不再等 `UDPIdleTimeout`），停机期间
+不接受新的 QUIC 连接。`websocket.ServerHandler` 给已打开的 WebSocket 发送 1001
+（going away）关闭帧后关闭连接，握手还没完成的连接直接关闭。`Context.Upgrade` 切换
+出的隧道（HTTP/1 连接，或 HTTP/2、HTTP/3 的 stream）由其上的协议结束：隧道 handler
+实现 `http.TunnelShutdownHandler` 时会收到 `OnTunnelShutdown`，`websocket` 的
+`Upgrade` 借此同样发送 1001。`tls.Handler` 会把 `OnShutdown` 转给内层 handler。
+没有实现这些接口的连接要等对端或 handler 关闭，或者等到 `ctx` 结束。
+`Engine.ShuttingDown()` 报告停机是否
+已经开始，可用于让健康检查在排空期间返回失败。引擎主动 Dial 的连接不在等待之列；
+UDP 监听已知的 peer 会被等待，停机期间来自未知地址的数据报被丢弃。
+
 ### net.Conn 与 deadline
 
 `*fib.Connection` 实现了 `net.Conn`，可以直接交给只需要拿地址、写数据、设超时、关连接

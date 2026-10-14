@@ -590,6 +590,9 @@ func (c *Conn) RemoteAddr() net.Addr {
 // packets by it when they arrive from an address it does not know.
 func (c *Conn) LocalCID() []byte { return c.scid }
 
+// Handler is the handler the connection was accepted or dialed with.
+func (c *Conn) Handler() Handler { return c.handler }
+
 // Owns reports whether packets sent to the connection ID cid are this
 // connection's: cid is its own, or, on a server, the one the client chose
 // for its first packets, which its Initial and 0-RTT packets go to until it

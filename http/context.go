@@ -29,12 +29,17 @@ type serverState struct {
 	// is guarded by the parser's mu.
 	bodyDeadline *bodyDeadline
 	bodyArmed    bool
+	// quietSince is when the engine's shutdown first found the connection
+	// without a byte from its client, in Unix nanoseconds, or zero; see
+	// ServerHandler.OnShutdown. Guarded by the parser's mu.
+	quietSince int64
 }
 
 func (p *Parser) resetServerState() {
 	p.liveContext.Store(nil)
 	p.writeDeadline = time.Time{}
 	p.bodyDeadline, p.bodyArmed = nil, false
+	p.quietSince = 0
 }
 
 // bodyDeadline is a deadline a handler set with SetReadDeadline for the rest

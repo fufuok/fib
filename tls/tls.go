@@ -377,6 +377,15 @@ func (h *Handler) OnHangup(c *fib.Connection) {
 	}
 }
 
+// OnShutdown passes word that the engine is shutting down on to the wrapped
+// handler, when it takes it, so that the protocol inside the TLS stream can
+// end the connection once it is idle; see fib.ShutdownHandler.
+func (h *Handler) OnShutdown(c *fib.Connection) {
+	if inner, ok := h.inner().(fib.ShutdownHandler); ok {
+		inner.OnShutdown(c)
+	}
+}
+
 func (h *Handler) OnClose(c *fib.Connection, err error) {
 	if t, ok := c.Layer().(*layer); ok {
 		if t.abortNative() {

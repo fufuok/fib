@@ -137,6 +137,15 @@ func (u *upgradedConn) OnTunnelData(_ *epollhttp.Tunnel, data []byte) {
 	serveFrames(u.handler.handler, u.handler.frames, &u.ws, &u.parser, data)
 }
 
+var _ epollhttp.TunnelShutdownHandler = (*upgradedConn)(nil)
+
+// OnTunnelShutdown sends a close frame with 1001 (going away) as the server
+// shuts down, which ends the tunnel once it has gone; see
+// http.TunnelShutdownHandler.
+func (u *upgradedConn) OnTunnelShutdown(*epollhttp.Tunnel) {
+	_ = u.ws.Close(CloseGoingAway, "")
+}
+
 func (u *upgradedConn) OnTunnelClose(_ *epollhttp.Tunnel, err error) {
 	code, reason := u.ws.closeStatus()
 	u.handler.handler.OnClose(&u.ws, code, reason, err)

@@ -94,8 +94,10 @@ Behavior users need to be aware of.
 - Acknowledgements stop covering what the peer has seen acknowledged (RFC
   9000 section 13.2.4), so a peer that skips packet numbers, as quiche does,
   gets ACK frames of a few ranges rather than of every range kept.
-- `Engine.Stop`/`Close` sends neither CONNECTION_CLOSE nor GOAWAY; connections
-  are dropped and clients find out only when they time out.
+- `Engine.Shutdown` sends GOAWAY, lets the requests in flight finish, and
+  closes each connection with H3_NO_ERROR, but `Engine.Stop`/`Close` on their
+  own send neither CONNECTION_CLOSE nor GOAWAY; connections are dropped and
+  clients find out only when they time out.
 - Like the `http` package, `http3` builds only on the three native backends
   (Linux, macOS, Windows); on the portable backend (e.g. FreeBSD) the package is
   empty.
@@ -271,8 +273,8 @@ In order of priority.
   handshakes, so a flood of Initials from spoofed addresses can burn CPU on TLS.
   Consider enabling Retry under load.
 - **Closing and draining states**: implement the 3×PTO closing period and
-  CONNECTION_CLOSE retransmission; allow a fixed stateless reset key; send GOAWAY
-  and CONNECTION_CLOSE when the `Engine` stops.
+  CONNECTION_CLOSE retransmission; allow a fixed stateless reset key; send
+  CONNECTION_CLOSE on `Engine.Stop`/`Close` too.
 
 ### 2. Performance (medium)
 

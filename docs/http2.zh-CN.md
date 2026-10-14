@@ -106,8 +106,9 @@
   对端声明的上限。
 - **优雅关闭时的 TCP RST**：GOAWAY 后连接在所有 stream 完成时关闭，但不会先半关闭、
   排空对端仍在发送的数据；如果此时 socket 中还有未读数据，内核会发送 RST。
-- **引擎停止**：`Engine.Stop`/`Close` 不会给 HTTP/2 连接发送 GOAWAY，连接被直接关闭，
-  客户端看到的是连接中断而不是优雅关闭。
+- **引擎停止**：`Engine.Shutdown` 会发送 GOAWAY，并在连接的 stream 都完成后关闭连接；
+  但单独调用 `Engine.Stop`/`Close` 时仍不发送 GOAWAY，连接被直接关闭，客户端看到的是
+  连接中断而不是优雅关闭。
 - **空闲与保活**：服务端没有 HTTP/2 连接的空闲超时，也不发送 PING 保活；客户端只有
   `IdleConnTimeout`（空闲时关闭），不做 PING 健康检查，无法及时发现静默断开的连接。
 - **SETTINGS 确认超时**：不检测对端是否在合理时间内确认了本端的 SETTINGS
@@ -197,7 +198,6 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
   BDP 动态调整窗口。
 - 发送侧对多个待发送 stream 做轮询或按权重调度，保证公平。
 - 发送时遵守对端的 `SETTINGS_MAX_HEADER_LIST_SIZE`。
-- 服务端：可配置的空闲超时和 PING 保活；`Engine` 停止时对 HTTP/2 连接发送 GOAWAY
-  并等待在途 stream 完成（优雅停机）；GOAWAY 后半关闭并排空输入，避免 RST。
+- 服务端：可配置的空闲超时和 PING 保活；GOAWAY 后半关闭并排空输入，避免 RST。
 - 客户端：可选的 PING 健康检查、按负载选择连接、SETTINGS 确认超时检测。
 - 客户端可选地等待 100-continue 再发送 body。

@@ -28,6 +28,7 @@ import (
 	"net"
 	stdhttp "net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -315,6 +316,13 @@ func (h *ServerHandler) pathFor(peer *udpPeer, cid, data []byte) *peerPath {
 		peer.closeIfUnused()
 		return nil
 	}
+	if c.Engine().ShuttingDown() {
+		// No connection starts while the engine shuts down, as no TCP one
+		// is accepted; the client's Initial is dropped, as one from an
+		// address the engine does not know is.
+		peer.closeIfUnused()
+		return nil
+	}
 	h.accept(peer, data)
 	return nil
 }
@@ -414,6 +422,42 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 		if path.qc != nil && path.qc.SendsOn(path) {
 			path.qc.Abort(err)
 		}
+	}
+}
+
+// OnShutdown ends the connections on the address as the engine shuts down;
+// see fib.Engine.Shutdown. Each HTTP/3 connection sends GOAWAY, finishes the
+// requests it has, and closes once its streams have; the address's
+// fib.Connection, which would otherwise stay for the client's next
+// connection until it had been quiet for Config.UDPIdleTimeout, closes once
+// none is left on it, since no new one starts now.
+//
+// It runs on the event loop, and again on each round of the shutdown until
+// the address closes; the connections are retired on the engine's handler
+// pool, since that takes their locks, which their own goroutines may hold.
+func (h *ServerHandler) OnShutdown(c *fib.Connection) {
+	peer, ok := c.Attachment().(*udpPeer)
+	if !ok {
+		// Its first datagram has yet to be handled; a later round finds it.
+		return
+	}
+	conns := peer.shutdown()
+	if conns == nil {
+		_ = c.Close()
+		return
+	}
+	for _, qc := range conns {
+		if sc, ok := qc.Handler().(*serverConn); ok && sc.retiring.CompareAndSwap(false, true) {
+			elsewhere(c, func() { sc.retire(qc) })
+		}
+	}
+}
+
+// elsewhere runs fn on the engine's handler pool, or on a goroutine of its
+// own once the pool has stopped taking work.
+func elsewhere(c *fib.Connection, fn func()) {
+	if pool := c.Engine().HandlerPool(); pool == nil || !pool.Go(fn) {
+		go fn()
 	}
 }
 
@@ -540,6 +584,27 @@ func (p *udpPeer) closeIfUnused() {
 	}
 }
 
+// shutdown returns the connections on the address, as the engine shuts
+// down. With none left, it returns nil and marks the address closing, which
+// the handler then closes.
+func (p *udpPeer) shutdown() []*quic.Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.paths) == 0 {
+		p.closing = true
+		return nil
+	}
+	conns := make([]*quic.Conn, 0, len(p.paths))
+	for _, path := range p.paths {
+		// A path whose connection is still being accepted has none yet,
+		// and keeps the address open until a later round.
+		if path.qc != nil && !slices.Contains(conns, path.qc) {
+			conns = append(conns, path.qc)
+		}
+	}
+	return conns
+}
+
 func (p *udpPeer) isClosing() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -566,6 +631,7 @@ func (p *peerPath) Close() error {
 
 var (
 	_ fib.DatagramsHandler  = (*ServerHandler)(nil)
+	_ fib.ShutdownHandler   = (*ServerHandler)(nil)
 	_ quic.CallsDoneHandler = (*serverConn)(nil)
 	_ quic.PathHandler      = (*serverConn)(nil)
 )
@@ -605,6 +671,9 @@ type serverConn struct {
 	nextID    uint64
 	goingAway bool
 	goAwayID  uint64
+	// retiring says the engine's shutdown has had retire run, which it does
+	// once however often it is told; see ServerHandler.OnShutdown.
+	retiring atomic.Bool
 }
 
 func (sc *serverConn) OnHandshake(qc *quic.Conn) {
@@ -791,6 +860,27 @@ func (sc *serverConn) goAway() {
 		payload := quic.AppendVarint(nil, sc.goAwayID)
 		_ = control.Write(append(appendFrameHeader(nil, frameGoAway, len(payload)), payload...), false)
 	}
+}
+
+// retire is the server shutting down: GOAWAY tells the client which
+// requests will be served, those finish, and the connection closes once
+// every stream has, at once if none is open. A tunnel's stream finishes when
+// the protocol it carries ends it, which its handler is told to do; see
+// fibhttp.TunnelShutdownHandler.
+func (sc *serverConn) retire(qc *quic.Conn) {
+	sc.goAway()
+	var tunnels []*fibhttp.TunnelFeed
+	sc.mu.Lock()
+	for _, rs := range sc.streams {
+		if rs.tunnel != nil {
+			tunnels = append(tunnels, rs.tunnel)
+		}
+	}
+	sc.mu.Unlock()
+	for _, tunnel := range tunnels {
+		tunnel.Shutdown()
+	}
+	qc.CloseWhenDone(uint64(ErrCodeNoError), "")
 }
 
 // requestStream is a request being read and then answered.

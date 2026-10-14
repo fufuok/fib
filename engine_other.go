@@ -3,6 +3,7 @@
 package fib
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -34,8 +35,11 @@ type Engine struct {
 	releaseTaskPool func()
 	taskWG          sync.WaitGroup
 	stopping        atomic.Bool
+	// draining says Shutdown has begun: the listeners are closed, no UDP
+	// peer is opened, and the connections are left to finish.
+	draining atomic.Bool
 	// stopped closes when Stop is called, which is what Run waits on when
-	// there is no listener to serve.
+	// there is no listener to serve, or once Shutdown has closed them.
 	stopped        chan struct{}
 	closeOnce      sync.Once
 	mu             sync.Mutex
@@ -179,6 +183,16 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 // error any of them reported.
 func (e *Engine) Run() error {
 	e.logRun()
+	err := e.serveListeners()
+	if err == nil && e.draining.Load() {
+		// Shutdown closed the listeners, and the connections they took are
+		// still being served until it stops the engine.
+		<-e.stopped
+	}
+	return err
+}
+
+func (e *Engine) serveListeners() error {
 	if len(e.listeners) == 0 && len(e.udpListeners) == 0 {
 		// A client engine's connections are served by their own readers, so
 		// Run only has to last as long as the engine does.
@@ -348,6 +362,47 @@ func (e *Engine) finishConnection(c *Connection, err error) {
 	e.mu.Unlock()
 	c.handler.OnClose(c, err)
 }
+
+// beginShutdown starts Shutdown: the listeners are closed, which stops them
+// taking connections, while the connections there are go on being served.
+// The UDP sockets stay open, since the peers' datagrams arrive on them.
+func (e *Engine) beginShutdown() {
+	if !e.draining.CompareAndSwap(false, true) {
+		return
+	}
+	for _, listener := range e.listeners {
+		_ = listener.Close()
+	}
+}
+
+// shutdownRound tells each open connection the engine is shutting down, here
+// on the goroutine calling Shutdown, and reports how many of those Shutdown
+// waits for remain.
+func (e *Engine) shutdownRound(context.Context) (int, error) {
+	if e.stopping.Load() {
+		return 0, nil
+	}
+	e.mu.Lock()
+	connections := make([]*Connection, 0, len(e.connections))
+	for c := range e.connections {
+		if !c.dialed {
+			connections = append(connections, c)
+		}
+	}
+	e.mu.Unlock()
+	for _, c := range connections {
+		c.mu.Lock()
+		closing := c.closing
+		c.mu.Unlock()
+		if !closing {
+			if h, ok := c.handler.(ShutdownHandler); ok {
+				h.OnShutdown(c)
+			}
+		}
+	}
+	return len(connections), nil
+}
+
 func (e *Engine) Stop() {
 	if e.stopping.CompareAndSwap(false, true) {
 		close(e.stopped)
@@ -1048,7 +1103,7 @@ func (e *Engine) udpPeer(l *udpListener, addr netip.AddrPort) *Connection {
 	c.fd.Store(-1)
 	c.udpActive.Store(time.Now().UnixNano())
 	e.mu.Lock()
-	if e.stopping.Load() {
+	if e.stopping.Load() || e.draining.Load() {
 		e.mu.Unlock()
 		return nil
 	}

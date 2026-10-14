@@ -46,6 +46,20 @@ type TunnelHandler interface {
 	OnTunnelClose(t *Tunnel, err error)
 }
 
+// TunnelShutdownHandler is a TunnelHandler told that the server is shutting
+// down; see fib.Engine.Shutdown. A tunnel is the protocol it carries' to end,
+// and keeps its connection, and so the shutdown, open until it does:
+// OnTunnelShutdown is that protocol's cue to end it, as a WebSocket does by
+// sending a close frame with 1001 (going away).
+//
+// It is called once per tunnel, after OnTunnelOpen, on a goroutine of the
+// server's, and may run while another of the tunnel's calls does; a tunnel
+// that ends first may not hear it at all.
+type TunnelShutdownHandler interface {
+	TunnelHandler
+	OnTunnelShutdown(t *Tunnel)
+}
+
 // TunnelWriter is what a Tunnel sends through: the connection itself on
 // HTTP/1, which a *fib.Connection is, or a stream of a protocol that frames
 // what it sends, as a protocol served outside this package gives NewTunnelFeed.
@@ -77,8 +91,12 @@ type Tunnel struct {
 	// opened is set once the handler has it; delivering while a goroutine is
 	// making the handler's calls, which is then the one to make those queued
 	// behind it; ended once the tunnel has ended, and told once OnTunnelClose
-	// has been called.
+	// has been called. greeted is set once OnTunnelOpen has returned, and
+	// shutdown once the server has said it is shutting down, which the
+	// handler hears after the first of the two if it came second; see
+	// TunnelShutdownHandler.
 	opened, delivering, ended, told bool
+	greeted, shutdown               bool
 	err                             error
 }
 
@@ -178,7 +196,39 @@ func (t *Tunnel) open(handler TunnelHandler) {
 	t.opened, t.delivering = true, true
 	t.mu.Unlock()
 	handler.OnTunnelOpen(t)
+	t.mu.Lock()
+	t.greeted = true
+	shutdown := t.shutdown
+	t.mu.Unlock()
+	if shutdown {
+		t.tellShutdown()
+	}
 	t.drain()
+}
+
+// markShutdown records that the server is shutting down, and reports whether
+// the handler is to be told now, with tellShutdown: once, for a tunnel whose
+// OnTunnelOpen has returned and that has not ended. One still opening is
+// told by open once OnTunnelOpen returns.
+func (t *Tunnel) markShutdown() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.shutdown || t.ended {
+		return false
+	}
+	t.shutdown = true
+	return t.greeted
+}
+
+// tellShutdown tells the handler, if it takes it, that the server is
+// shutting down.
+func (t *Tunnel) tellShutdown() {
+	t.mu.Lock()
+	handler := t.handler
+	t.mu.Unlock()
+	if h, ok := handler.(TunnelShutdownHandler); ok {
+		h.OnTunnelShutdown(t)
+	}
 }
 
 // end ends the tunnel, which the handler hears once what arrived before has
@@ -228,6 +278,17 @@ func (f *TunnelFeed) Write(data []byte) error { return f.tunnel.deliver(data) }
 // End ends the tunnel, with err saying why: nil or io.EOF for a peer that
 // ended its side. The handler hears of it once, after what arrived before.
 func (f *TunnelFeed) End(err error) { f.tunnel.end(err) }
+
+// Shutdown tells the tunnel's handler that the server is shutting down, if
+// it is a TunnelShutdownHandler: now, if the tunnel is open, or as it opens.
+// It does so once however often it is called, and not for a tunnel that has
+// ended. The protocol calls it when the engine shuts down, from a goroutine
+// that may wait, since the handler's call runs on it.
+func (f *TunnelFeed) Shutdown() {
+	if f.tunnel.markShutdown() {
+		f.tunnel.tellShutdown()
+	}
+}
 
 // StreamUpgrader is implemented by a Stream whose request can become a tunnel:
 // an extended CONNECT on a protocol served outside this package.

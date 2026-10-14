@@ -295,6 +295,12 @@ func (c *Context) closeAfterResponse() {
 	closeAfterResponse(c.Conn, c.lingers || stream != nil && stream.unfinished())
 }
 
+// draining reports whether the HTTP/1 connection's engine is shutting down,
+// in which case the response closes the connection, as net/http's do once
+// Shutdown has begun, rather than keep it for a request it would not wait
+// for; see fib.Engine.Shutdown.
+func (c *Context) draining() bool { return c.Conn != nil && c.Conn.Engine().ShuttingDown() }
+
 func (c *Context) Respond(status int, contentType string, body []byte) error {
 	if contentType == "" {
 		return c.WriteResponse(Response{StatusCode: status, Body: body})
@@ -410,7 +416,8 @@ func (c *Context) writeHTTP1(response Response, contentType string) error {
 	if response.StatusCode == 0 {
 		response.StatusCode = stdhttp.StatusOK
 	}
-	closeConnection := response.Close || c.Request.Close || headerHasToken(response.Header, "Connection", "close")
+	closeConnection := response.Close || c.Request.Close || headerHasToken(response.Header, "Connection", "close") ||
+		c.draining()
 	if err := c.sendResponse(response, contentType, closeConnection); err != nil {
 		return err
 	}
@@ -1176,6 +1183,75 @@ func (h *ServerHandler) OnHangup(c *fib.Connection) {
 	// of the two cancellations gets there first is the one that counts.
 	c.CloseWithError(io.EOF)
 	cancelElsewhere(c, func() { context.cancelWith(io.EOF, gen) })
+}
+
+// shutdownQuietGrace is how long a connection that has sent nothing at all
+// is given to send its first request once its engine starts shutting down,
+// before OnShutdown takes it for idle: a client that has just connected may
+// have its request on the way. net/http.Server.Shutdown gives a new
+// connection five seconds from its accept. A variable, so that tests can
+// shorten it.
+var shutdownQuietGrace = 5 * time.Second
+
+// OnShutdown ends the connection as its engine shuts down, the way
+// net/http.Server.Shutdown ends its own; see fib.Engine.Shutdown. An HTTP/1
+// connection between requests closes now, and one serving a request closes
+// once its response is written, which says Connection: close. One that has
+// not sent a byte yet is given shutdownQuietGrace to send its first request.
+// An HTTP/2 connection sends GOAWAY, finishes the streams it has, and closes
+// after the last. A tunnel, which Upgrade switched a request to, is the
+// protocol it carries' to end, which hears of the shutdown if its handler is
+// a TunnelShutdownHandler: the HTTP/1 connection the tunnel took, or the
+// HTTP/2 stream, then closes when it does.
+//
+// It runs on the event loop, and again on each round of the shutdown until
+// the connection closes; see fib.ShutdownHandler.
+func (h *ServerHandler) OnShutdown(c *fib.Connection) {
+	switch state := c.Attachment().(type) {
+	case *h2ServerConn:
+		if state.retiring.CompareAndSwap(false, true) {
+			// GOAWAY is sent under the connection's lock, which a stream
+			// writing its response may hold.
+			cancelElsewhere(c, state.retire)
+		}
+	case *TunnelFeed:
+		if state.tunnel.markShutdown() {
+			// The handler's call may wait, which the loop must not.
+			cancelElsewhere(c, state.tunnel.tellShutdown)
+		}
+	case *Parser:
+		if h.idleForShutdown(state) {
+			// Closing goes through the connection's layer, whose lock a
+			// round decrypting what just arrived may hold.
+			cancelElsewhere(c, c.CloseAfterSend)
+		}
+	}
+}
+
+// idleForShutdown reports whether an HTTP/1 connection is between requests,
+// and if it is marks it spent, so that a request arriving before it closes is
+// not begun. A parser that is held is busy: it is held while a request is
+// served, and a later round of the shutdown finds it idle if the response
+// has not closed it by then.
+func (h *ServerHandler) idleForShutdown(parser *Parser) bool {
+	if !parser.mu.TryLock() {
+		return false
+	}
+	defer parser.mu.Unlock()
+	if parser.spent || parser.waitState() != waitIdle {
+		return false
+	}
+	if !parser.sniffed {
+		now := time.Now().UnixNano()
+		if parser.quietSince == 0 {
+			parser.quietSince = now
+		}
+		if time.Duration(now-parser.quietSince) < shutdownQuietGrace {
+			return false
+		}
+	}
+	parser.spent = true
+	return true
 }
 
 // sendResponse writes a whole HTTP/1 response to the connection.

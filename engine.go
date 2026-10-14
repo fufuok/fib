@@ -3,6 +3,7 @@
 package fib
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -75,6 +76,9 @@ const (
 	// commandDetach releases the descriptor of a connection whose last
 	// round has run its OnClose; see closeConnection.
 	commandDetach
+	// commandShutdown has the loop tell its connections the engine is
+	// shutting down and count the ones still open; see Shutdown.
+	commandShutdown
 )
 
 type command struct {
@@ -82,6 +86,7 @@ type command struct {
 	connection *Connection
 	dial       *dialRequest
 	err        error
+	round      *shutdownRound
 }
 type commandBatch struct{ items []command }
 
@@ -115,6 +120,9 @@ type Engine struct {
 	sendBufferSize     int
 	handler            Handler
 	stopping           atomic.Bool
+	// draining says Shutdown has begun: the listeners have stopped, no UDP
+	// peer is opened, and the connections are left to finish.
+	draining atomic.Bool
 	// outputWaiters are the connections a writer waits in waitOutput on, which
 	// Stop lets go: no write edge reaches them once the loop has stopped.
 	// Guarded by outputWaitMu.
@@ -504,7 +512,8 @@ func (e *Engine) submitReady(pool TaskPool, ready []*Connection, tasks []taskpoo
 // Stop makes Run return, once it has stopped the engine's pollers too. Its
 // listeners stop taking connections at once, so a client connecting from then
 // on is refused rather than accepted into a backlog nothing serves; the
-// connections already open are left to Close.
+// connections already open are left to Close. Shutdown stops the engine
+// once those connections have finished instead.
 func (e *Engine) Stop() {
 	e.stopping.Store(true)
 	e.stopListening()
@@ -513,6 +522,39 @@ func (e *Engine) Stop() {
 	for _, p := range e.pollers {
 		p.Stop()
 	}
+}
+
+// shutdownRound has each of the engine's loops tell its connections the
+// engine is shutting down, and reports how many connections the engine
+// accepted are still open between them; see Shutdown.
+func (e *Engine) shutdownRound(ctx context.Context) (int, error) {
+	round := newShutdownRound(1 + len(e.pollers))
+	for _, l := range append([]*Engine{e}, e.pollers...) {
+		if !l.request(command{kind: commandShutdown, round: round}) {
+			// Closed: nothing is left open on it.
+			round.report(0)
+		}
+	}
+	return round.await(ctx, e)
+}
+
+// shutdownConnection tells c's handler, if it is a ShutdownHandler, that the
+// engine is shutting down, and reports whether c is one Shutdown waits for:
+// a connection the engine accepted, or a UDP listener's peer, that has not
+// yet closed or still has its OnClose to run. Callers run on the event loop.
+func shutdownConnection(c *Connection) bool {
+	if c.dialed {
+		return false
+	}
+	c.mu.Lock()
+	closing, open := c.closing, !c.closed || c.closePending
+	c.mu.Unlock()
+	if !closing {
+		if h, ok := c.handler.(ShutdownHandler); ok {
+			h.OnShutdown(c)
+		}
+	}
+	return open
 }
 
 // releaseOutputWaiters wakes every writer waiting in waitOutput on one of the
@@ -734,6 +776,8 @@ func (e *Engine) drainCommands() {
 			e.admitAccepted(cmd.connection)
 		case commandDetach:
 			e.detach(cmd.connection)
+		case commandShutdown:
+			cmd.round.report(e.shutdownConnections())
 		default:
 			e.refreshConnection(cmd.connection)
 		}
@@ -1196,7 +1240,8 @@ func sockaddrToUDPAddr(sa syscall.Sockaddr) *net.UDPAddr {
 
 // udpPeer returns the connection for the peer whose address a receive left
 // in from, opening one if this is the first datagram from it. It returns nil
-// once the engine is stopping. Callers run on the event loop.
+// for a new peer once the engine is stopping or shutting down, as a listener
+// stops taking connections then. Callers run on the event loop.
 func (e *Engine) udpPeer(l *udpListener, from *syscall.RawSockaddrAny) *Connection {
 	key, zone, ok := rawSockaddrKey(from)
 	if !ok {
@@ -1205,7 +1250,7 @@ func (e *Engine) udpPeer(l *udpListener, from *syscall.RawSockaddrAny) *Connecti
 	if c := l.peers[key]; c != nil {
 		return c
 	}
-	if e.stopping.Load() {
+	if e.stopping.Load() || e.draining.Load() {
 		return nil
 	}
 	sa := keySockaddr(key, zone)
@@ -1404,6 +1449,20 @@ func (e *Engine) sweepUDP() {
 			}
 		}
 	}
+}
+
+// shutdownUDPPeers is shutdownConnections for the peers of the engine's UDP
+// listeners. Callers run on the event loop.
+func (e *Engine) shutdownUDPPeers() int {
+	n := 0
+	for _, l := range e.udpListeners {
+		for _, c := range l.peers {
+			if shutdownConnection(c) {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // closeUDPPeers closes every peer without a callback, as Close does for TCP

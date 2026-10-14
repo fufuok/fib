@@ -141,9 +141,10 @@ These are constants today and cannot be configured:
   stream has finished, but it does not half-close and drain what the peer is
   still sending first; if unread data is left in the socket, the kernel sends a
   RST.
-- **Engine shutdown**: `Engine.Stop`/`Close` sends no GOAWAY to HTTP/2
-  connections; they are closed outright, and clients see a broken connection
-  rather than a graceful close.
+- **Engine shutdown**: `Engine.Shutdown` sends GOAWAY and closes each
+  connection once its streams have finished, but `Engine.Stop`/`Close` on
+  their own still close HTTP/2 connections outright, and clients see a broken
+  connection rather than a graceful close.
 - **Idle and keep-alive**: the server has no idle timeout for HTTP/2
   connections and sends no PING keep-alives. The client only has
   `IdleConnTimeout` (closing when idle) and does no PING health checks, so a
@@ -258,9 +259,8 @@ concurrency.
   the bandwidth-delay product.
 - Schedule streams with pending data round-robin or by weight, for fairness.
 - Honour the peer's `SETTINGS_MAX_HEADER_LIST_SIZE` when sending.
-- Server: configurable idle timeout and PING keep-alive; GOAWAY to HTTP/2
-  connections when the `Engine` stops, waiting for in-flight streams (graceful
-  shutdown); half-close and drain input after GOAWAY to avoid RST.
+- Server: configurable idle timeout and PING keep-alive; half-close and drain
+  input after GOAWAY to avoid RST.
 - Client: optional PING health checks, least-loaded connection selection, and
   a SETTINGS acknowledgement timeout.
 - Support sending request trailers.

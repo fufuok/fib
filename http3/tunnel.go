@@ -26,7 +26,15 @@ func (rs *requestStream) serveTunnel() {
 	// A tunnel outlives its handler's return; its stream is not recycled.
 	rs.pooled = false
 	sc := rs.sc
-	rs.tunnel = fibhttp.NewTunnelFeed(sc.conn, (*tunnelWriter)(rs), int(sc.h.config.MaxBodyBytes))
+	tunnel := fibhttp.NewTunnelFeed(sc.conn, (*tunnelWriter)(rs), int(sc.h.config.MaxBodyBytes))
+	// Set under the lock, where a shutdown retiring the connection looks for
+	// its tunnels. One that began before this is told here instead.
+	sc.mu.Lock()
+	rs.tunnel = tunnel
+	sc.mu.Unlock()
+	if sc.retiring.Load() {
+		tunnel.Shutdown()
+	}
 	rs.block.Context(sc.conn, rs, nil)
 	sc.h.streams.Queue(&sc.batch, &sc.gate, sc.conn, sc.h.handler, &rs.block)
 }

@@ -109,7 +109,10 @@ type h2ServerConn struct {
 	sendWindow    int64
 	goAway        bool
 	peerGoingAway bool
-	closed        bool
+	// retiring says the engine's shutdown has had retire sent GOAWAY, which
+	// it does once however often it is told; see ServerHandler.OnShutdown.
+	retiring atomic.Bool
+	closed   bool
 	// closeScheduled says the connection is already waiting out
 	// h2PeerGoAwayGrace, so that each stream that ends after it does not
 	// start the wait again.
@@ -414,6 +417,31 @@ func (sc *h2ServerConn) fail(err *H2ConnError) {
 	clear(sc.streams)
 	sc.mu.Unlock()
 	sc.conn.CloseAfterSend()
+}
+
+// retire is the server shutting down: GOAWAY tells the client that no
+// stream after the last it opened will be served, the streams open finish,
+// and the connection closes after the last of them, at once if none is. A
+// tunnel's stream finishes when the protocol it carries ends it, which its
+// handler is told to do; see TunnelShutdownHandler.
+func (sc *h2ServerConn) retire() {
+	var tunnels []*TunnelFeed
+	sc.mu.Lock()
+	if !sc.closed && !sc.goAway {
+		sc.goAway = true
+		sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID, H2NoError, ""))
+	}
+	for _, st := range sc.streams {
+		if st.tunnel != nil {
+			tunnels = append(tunnels, &st.tunnel.feed)
+		}
+	}
+	sc.closeFinishedLocked()
+	sc.mu.Unlock()
+	// The handlers send from their calls, which takes the lock.
+	for _, feed := range tunnels {
+		feed.Shutdown()
+	}
 }
 
 // shutdown is the connection closing underneath.
