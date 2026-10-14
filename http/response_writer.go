@@ -697,6 +697,19 @@ func (c *Context) Finish() error {
 		return nil
 	}
 	w.finished = true
+	err := c.finish(w)
+	if err != nil && c.isHTTP1() && !c.wrote {
+		// Nothing can answer the request now, and a connection kept open
+		// would leave its client waiting, or reading the response to the
+		// next request it pipelined as this one's.
+		c.closing = true
+		c.closeAfterResponse()
+	}
+	return err
+}
+
+// finish is Finish once the response is marked finished.
+func (c *Context) finish(w *responseWriter) error {
 	if c.holdsWhole() || !c.isHTTP1() && !w.committed {
 		// Held whole, or short enough to send whole now the handler is done.
 		w.sniff()

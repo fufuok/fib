@@ -463,9 +463,6 @@ func (s *BodyStream) push(data []byte) {
 		s.drain(true)
 		return
 	}
-	if s.read > 0 && s.read == len(s.buf) {
-		s.buf, s.read = s.buf[:0], 0
-	}
 	// A sink that is busy on another goroutine takes this once it is done
 	// with what it has; until then it is buffered, and bounded, as it is for
 	// a reader.
@@ -562,10 +559,7 @@ func (s *BodyStream) unfinished() bool {
 // the body ended there.
 func (s *BodyStream) absorb(src []byte) (used int, done bool, err error) {
 	if s.decoder == nil {
-		used, done, err = s.reserve(len(src))
-		if err != nil {
-			return used, false, err
-		}
+		used, done = s.reserve(len(src))
 		s.push(src[:used])
 		if !done {
 			return used, false, nil
@@ -601,19 +595,18 @@ func (s *BodyStream) keepScratch(b []byte) { s.scratch = b }
 // reserve claims up to n bytes of a Content-Length body: it returns how many
 // of them the body is still owed and whether that is the last of it. The count
 // lives under the lock because abandon reads it from the handler's goroutine
-// while the connection's worker is still delivering.
-func (s *BodyStream) reserve(n int) (int, bool, error) {
+// while the connection's worker is still delivering. It needs no check
+// against MaxStreamedBodyBytes: a Content-Length over it is refused before
+// the body streams, and no more than that length is ever claimed.
+func (s *BodyStream) reserve(n int) (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if int64(n) > s.remaining {
 		n = int(s.remaining)
 	}
-	if s.limit > 0 && s.total+int64(n) > s.limit {
-		return n, false, ErrBodyTooLarge
-	}
 	s.total += int64(n)
 	s.remaining -= int64(n)
-	return n, s.remaining == 0, nil
+	return n, s.remaining == 0
 }
 
 // account adds n bytes to a chunked body and reports whether it has outgrown

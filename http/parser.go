@@ -415,26 +415,21 @@ func (p *Parser) feedOne() (*stdhttp.Request, bool, error) {
 		// net/http owns the chunk decoder; only chunked requests need this
 		// second parse. Content-Length requests reuse the header parse below.
 		// The request it makes replaces the one parsed into the block.
+		// The body needs no limit here: chunkedEnd has framed it and refused
+		// one that decodes past MaxBodyBytes.
 		frame.block = nil
 		var reader *requestReader
+		var body []byte
 		req, reader, err = readRequest(p.buffer[:frame.end], true)
+		if err == nil {
+			req.Close = req.Close || frame.request.Close
+			body, err = io.ReadAll(req.Body)
+			_ = req.Body.Close()
+		}
+		releaseRequestReader(reader)
 		if err != nil {
-			if reader != nil {
-				releaseRequestReader(reader)
-			}
 			p.discard()
 			return nil, false, fmt.Errorf("%w: %v", ErrMalformed, err)
-		}
-		req.Close = req.Close || frame.request.Close
-		body, readErr := io.ReadAll(io.LimitReader(req.Body, p.config.MaxBodyBytes+1))
-		_ = req.Body.Close()
-		releaseRequestReader(reader)
-		if readErr != nil || int64(len(body)) > p.config.MaxBodyBytes {
-			p.discard()
-			if int64(len(body)) > p.config.MaxBodyBytes {
-				return nil, false, ErrBodyTooLarge
-			}
-			return nil, false, fmt.Errorf("%w: %v", ErrMalformed, readErr)
 		}
 		req.Body = &wholeBody{data: body}
 	} else if req.ContentLength > 0 {

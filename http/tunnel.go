@@ -326,6 +326,12 @@ func (c *Context) Upgrade(protocol string, header stdhttp.Header, handler Tunnel
 	if !c.handling() {
 		return nil, ErrNotUpgradable
 	}
+	upgrader, _ := c.external.(StreamUpgrader)
+	if c.external != nil && upgrader == nil {
+		// Refused before the hooks run, so the response the handler answers
+		// with instead still has them to run.
+		return nil, ErrNotUpgradable
+	}
 	status := stdhttp.StatusOK
 	if c.external == nil && c.stream == nil {
 		status = stdhttp.StatusSwitchingProtocols
@@ -342,10 +348,6 @@ func (c *Context) Upgrade(protocol string, header stdhttp.Header, handler Tunnel
 	var err error
 	switch {
 	case c.external != nil:
-		upgrader, ok := c.external.(StreamUpgrader)
-		if !ok {
-			return nil, ErrNotUpgradable
-		}
 		t, err = upgrader.Upgrade(c.Request, protocol, header)
 	case c.stream != nil:
 		t, err = c.stream.upgrade(c.Request, protocol, header)

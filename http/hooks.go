@@ -125,11 +125,10 @@ func (h *responseHooks) before(response *Response) {
 }
 
 // beforeHeader runs the OnHeader hooks for a response whose header is
-// settled before its body is written; it has no OnResponse hooks.
+// settled before its body is written; it has no OnResponse hooks. It runs at
+// most once a response: its callers return before it once the header is
+// settled, and a response that failed to go resets ran.
 func (h *responseHooks) beforeHeader(status int, header stdhttp.Header) {
-	if h.ran {
-		return
-	}
 	h.ran = true
 	for i := len(h.list) - 1; i >= 0; i-- {
 		if hook := h.list[i]; hook.header != nil {

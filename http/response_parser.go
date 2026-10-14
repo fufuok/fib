@@ -180,9 +180,8 @@ func (p *responseParser) feedStream() (*stdhttp.Response, error) {
 	case framingLength:
 		n := min(int64(len(p.buffer)), p.remaining)
 		if n > 0 {
-			if err := p.pass(p.buffer[:n]); err != nil {
-				return nil, err
-			}
+			// Within the limit: parseHead refused a Content-Length past it.
+			_ = p.pass(p.buffer[:n])
 			p.consume(int(n))
 			p.remaining -= n
 		}
@@ -310,19 +309,17 @@ func bodyAllowed(req *stdhttp.Request, status int) bool {
 }
 
 // completeChunked decodes a chunked body, through net/http's own decoder so
-// that trailers land where callers expect them.
+// that trailers land where callers expect them. The body needs no limit here:
+// chunkedEnd has framed it and refused one that decodes past maxBody.
 func (p *responseParser) completeChunked(end int, req *stdhttp.Request) (*stdhttp.Response, error) {
+	var body []byte
 	full, err := stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(p.buffer[:end])), req)
+	if err == nil {
+		body, err = io.ReadAll(full.Body)
+		_ = full.Body.Close()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMalformedResponse, err)
-	}
-	body, err := io.ReadAll(io.LimitReader(full.Body, p.maxBody+1))
-	_ = full.Body.Close()
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrMalformedResponse, err)
-	}
-	if int64(len(body)) > p.maxBody {
-		return nil, ErrResponseBodyTooLarge
 	}
 	p.head = full
 	return p.complete(end, body), nil

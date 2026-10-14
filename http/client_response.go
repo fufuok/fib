@@ -39,12 +39,14 @@ type ClientResponse struct {
 	*stdhttp.Response
 
 	mu sync.Mutex
-	// whole, fn, inCallback and delivered serve a response that arrived
-	// whole: OnBody delivers its body once the callback has returned.
+	// whole, fn, inCallback, delivered and taken serve a response that
+	// arrived whole: OnBody delivers its body once the callback has returned,
+	// and taken is how much of it that was.
 	whole      *bufferedBody
 	fn         BodyFunc
 	inCallback bool
 	delivered  bool
+	taken      int64
 	// s is the stream of a response whose body was still arriving when the
 	// callback ran, and nil for one that arrived whole.
 	s *ResponseStream
@@ -141,6 +143,9 @@ func (c *ClientResponse) deliverWhole() {
 	} else if body := c.Response.Body; body != nil && body != stdhttp.NoBody {
 		data, _ = io.ReadAll(body)
 	}
+	c.mu.Lock()
+	c.taken = int64(len(data))
+	c.mu.Unlock()
 	fn(data, true, nil)
 }
 
@@ -169,10 +174,7 @@ func (c *ClientResponse) Consumed() int64 {
 	if c.s == nil {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if c.delivered {
-			return int64(len(c.whole.data))
-		}
-		return 0
+		return c.taken
 	}
 	return c.s.consumedBytes()
 }

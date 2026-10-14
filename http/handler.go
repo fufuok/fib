@@ -396,6 +396,11 @@ func (c *Context) writeResponse(response Response) error {
 	default:
 		err = c.writeHTTP1(response, "")
 	}
+	if err != nil && hooks != nil && !c.wrote {
+		// Nothing was sent, so the response the handler answers with
+		// instead still has its hooks to run.
+		hooks.ran = false
+	}
 	if err == nil && hooks != nil {
 		size := int64(len(response.Body))
 		if c.Request.Method == stdhttp.MethodHead || !statusHasBody(response.StatusCode) {
@@ -672,9 +677,8 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 		state.feed(data)
 		return
 	case *TunnelFeed:
-		if err := state.Write(data); err != nil {
-			c.CloseWithError(err)
-		}
+		// An HTTP/1 tunnel's feed has no limit, so Write refuses nothing.
+		_ = state.Write(data)
 		return
 	case *Parser:
 		parser = state
@@ -734,7 +738,7 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 				resumed = true
 			}
 			if err != nil {
-				h.failStream(c, parser, err)
+				h.failStream(c, parser)
 				return
 			}
 			if !done && !resumed {
@@ -765,10 +769,9 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			h.upgradeH2C(c, parser, request, settings)
 			return
 		}
+		// The block, when there is one, is the one request was parsed into:
+		// feedOne sets both from the same frame.
 		block := parser.block
-		if block != nil && &block.request != request {
-			block = nil
-		}
 		parser.block = nil
 		context := h.newContext(block)
 		context.Conn, context.Request, context.server, context.parser = c, request, h, parser
@@ -823,7 +826,7 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		if bodyErr != nil {
 			// The body was refused or misframed before the handler even saw
 			// it, which its own read told it; the connection cannot go on.
-			h.failStream(c, parser, bodyErr)
+			h.failStream(c, parser)
 			return
 		}
 		if !context.settle() {
@@ -954,16 +957,12 @@ func (h *ServerHandler) finishRequest(context *Context) {
 
 // failStream ends a connection whose streamed body could not be framed or grew
 // past what the server accepts. The handler has the request already, so the
-// failure reaches it through the body rather than as a status.
-func (h *ServerHandler) failStream(c *fib.Connection, parser *Parser, err error) {
+// failure reaches it through the body rather than as a status. The handler
+// may still be writing a response to a request it was given, so what it has
+// sent goes out before the connection ends.
+func (h *ServerHandler) failStream(c *fib.Connection, parser *Parser) {
 	parser.spent = true
-	if errors.Is(err, ErrMalformed) || errors.Is(err, ErrHeaderTooLarge) || errors.Is(err, ErrBodyTooLarge) {
-		// The handler may still be writing a response to a request it was
-		// given; let what it has sent go out before the connection ends.
-		c.CloseAfterSend()
-		return
-	}
-	c.CloseWithError(err)
+	c.CloseAfterSend()
 }
 
 // refuse answers a request the server could not parse or would not serve, and
