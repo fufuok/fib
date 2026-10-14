@@ -1525,9 +1525,16 @@ func (h *serverHS) sendTicket(out *[]byte) *hsError {
 		h.ticketMsg = msg
 		return nil
 	}
-	sealed, err := h.tx.seal(*out, recordTypeHandshake, msg, nil)
-	if err != nil {
-		return fail(alertInternalError, "%v", err)
+	// The ticket carries the client's certificates, so it may be longer than
+	// a record: it is split across records as the flight's messages are.
+	sealed := *out
+	for len(msg) > 0 {
+		n := min(len(msg), maxPlaintext)
+		var err error
+		if sealed, err = h.tx.seal(sealed, recordTypeHandshake, msg[:n], nil); err != nil {
+			return fail(alertInternalError, "%v", err)
+		}
+		msg = msg[n:]
 	}
 	*out = sealed
 	return nil

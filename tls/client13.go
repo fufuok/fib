@@ -445,7 +445,7 @@ func (h *clientHS) hello() []byte {
 	h.earlyActive = h.offerEarly && h.session != nil
 	msg := h.clientHello()
 	h.transcript = append(h.transcript, msg...)
-	rec := appendRecord(nil, recordTypeHandshake, 0x0301, msg)
+	rec := appendRecords(nil, recordTypeHandshake, 0x0301, msg)
 	if h.earlyActive {
 		secret, err := h.earlySecret()
 		if err != nil {
@@ -488,6 +488,18 @@ func (h *clientHS) earlySecret() ([]byte, error) {
 func appendRecord(dst []byte, typ byte, version uint16, body []byte) []byte {
 	dst = append(dst, typ, byte(version>>8), byte(version), byte(len(body)>>8), byte(len(body)))
 	return append(dst, body...)
+}
+
+// appendRecords appends msg in the clear, split across records if it is
+// longer than one: a ClientHello that offers a session carries its ticket,
+// which carries the certificates the client sent when it made it.
+func appendRecords(dst []byte, typ byte, version uint16, msg []byte) []byte {
+	for len(msg) > 0 {
+		n := min(len(msg), maxPlaintext)
+		dst = appendRecord(dst, typ, version, msg[:n])
+		msg = msg[n:]
+	}
+	return dst
 }
 
 // builder appends length-prefixed fields.
@@ -1164,7 +1176,7 @@ func (h *clientHS) helloRetryRequest(msg []byte, cipherSuite uint16, s suite, se
 		return nil
 	}
 	h.sendCCS(out)
-	*out = appendRecord(*out, recordTypeHandshake, 0x0303, second)
+	*out = appendRecords(*out, recordTypeHandshake, 0x0303, second)
 	return nil
 }
 
