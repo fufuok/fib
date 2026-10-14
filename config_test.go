@@ -251,24 +251,24 @@ func testPollersAccept(t *testing.T, reusePort bool) {
 			}
 		},
 	})
-	if !server.pollersListen || len(server.listenFDs) != 1 {
-		t.Fatalf("engine has pollersListen=%v and %d listeners", server.pollersListen, len(server.listenFDs))
+	if !server.pollersListen || len(server.listeners) != 1 {
+		t.Fatalf("engine has pollersListen=%v and %d listeners", server.pollersListen, len(server.listeners))
 	}
-	if acceptsConnections(t, server.listenFDs[0]) {
+	if acceptsConnections(t, server.listeners[0].fd) {
 		t.Fatal("the engine's own socket listens beside its pollers'")
 	}
-	bound, err := syscall.Getsockname(server.listenFDs[0])
+	bound, err := syscall.Getsockname(server.listeners[0].fd)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i, p := range server.pollers {
-		if len(p.listenFDs) != 1 {
-			t.Fatalf("poller %d has %d listeners, want 1", i, len(p.listenFDs))
+		if len(p.listeners) != 1 {
+			t.Fatalf("poller %d has %d listeners, want 1", i, len(p.listeners))
 		}
-		if !acceptsConnections(t, p.listenFDs[0]) {
+		if !acceptsConnections(t, p.listeners[0].fd) {
 			t.Fatalf("poller %d's socket does not listen", i)
 		}
-		if got, err := syscall.Getsockname(p.listenFDs[0]); err != nil || netaddr.ToAddr(got).String() != netaddr.ToAddr(bound).String() {
+		if got, err := syscall.Getsockname(p.listeners[0].fd); err != nil || netaddr.ToAddr(got).String() != netaddr.ToAddr(bound).String() {
 			t.Fatalf("poller %d is bound to %v (%v), want %v", i, netaddr.ToAddr(got), err, netaddr.ToAddr(bound))
 		}
 	}
@@ -381,12 +381,12 @@ func TestReusePortLeavesUnixListenersOnEngine(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	if server.pollersListen || !acceptsConnections(t, server.listenFDs[0]) {
+	if server.pollersListen || !acceptsConnections(t, server.listeners[0].fd) {
 		t.Fatal("a Unix listener was left to the pollers")
 	}
 	for i, p := range server.pollers {
-		if len(p.listenFDs) != 0 {
-			t.Fatalf("poller %d listens on %d sockets, want none", i, len(p.listenFDs))
+		if len(p.listeners) != 0 {
+			t.Fatalf("poller %d listens on %d sockets, want none", i, len(p.listeners))
 		}
 	}
 }

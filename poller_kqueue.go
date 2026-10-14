@@ -29,19 +29,19 @@ func (e *Engine) openBackend() error {
 	if err != nil {
 		return err
 	}
-	changes := make([]syscall.Kevent_t, 0, len(e.listenFDs)+1)
-	for _, fd := range e.listenFDs {
-		if e.pollersListen {
+	changes := make([]syscall.Kevent_t, 0, len(e.listeners)+len(e.udpListeners)+1)
+	for _, l := range e.listeners {
+		if l.spread {
 			// Its pollers accept for it; see Config.ReusePort.
-			break
+			continue
 		}
-		changes = append(changes, newKevent(fd, syscall.EVFILT_READ, syscall.EV_ADD|syscall.EV_CLEAR))
+		changes = append(changes, newKevent(l.fd, syscall.EVFILT_READ, syscall.EV_ADD|syscall.EV_CLEAR))
 	}
 	// UDP sockets are level-triggered, so the loop can stop reading one after
 	// its share of a round and still hear about the rest. Those of an engine
 	// whose pollers read for it go to the first poller; see openUDPBeside.
 	for _, l := range e.udpListeners {
-		if e.pollersListen {
+		if e.udpSpread {
 			break
 		}
 		changes = append(changes, newKevent(l.fd, syscall.EVFILT_READ, syscall.EV_ADD))
@@ -235,11 +235,4 @@ const pausesInPlace = true
 // setReadPaused does nothing; see pausesInPlace.
 func (e *Engine) setReadPaused(*Connection, bool) error { return nil }
 
-func (e *Engine) isListener(fd int) bool {
-	for _, listenFD := range e.listenFDs {
-		if listenFD == fd {
-			return true
-		}
-	}
-	return false
-}
+func (e *Engine) isListener(fd int) bool { return e.listenerAt(fd) != nil }

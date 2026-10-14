@@ -57,6 +57,10 @@ uSockets, workflow, axum, h2, quiche and rustls.
   `HoldReads` gives read-side flow control.
 - **Pools**: an adaptive worker pool that grows and shrinks with load, and a size-classed buffer
   pool aligned to the Go allocator's size classes.
+- **Many protocols, one engine**: `Config.Bindings` gives each group of addresses, TCP, Unix or
+  UDP, a handler of its own, so one engine serves HTTP, HTTPS, HTTP/3, WebSocket, gRPC and raw TCP
+  side by side on shared loops, pools and buffers. Package `mux` goes further and serves several
+  protocols on one port, told apart by the first bytes each client sends.
 - **Async clients**: non-blocking dial, plus HTTP/1.x, HTTP/2, HTTP/3 and WebSocket clients that
   report results through callbacks or futures.
 - **Static files**: `http.FileCache` serves a directory from memory, with pre-compressed `.br`/`.gz`
@@ -287,9 +291,49 @@ engine, err := fib.Bind(config, fib.HandlerFuncs{
 })
 ```
 
+### Several protocols on one engine
+
+Each `Binding` is one address, or a group of them, on a network of its own, served by a handler
+of its own. A binding with no handler takes the one `Bind` was given.
+
+```go
+config := fib.DefaultConfig()
+config.Bindings = []fib.Binding{
+	{Addr: ":80"}, // plain HTTP, the handler passed to Bind
+	{Addrs: []string{":443", ":8443"}, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
+	{Network: "udp", Addr: ":443", Handler: http3.NewHandler(tlsConfig, web)},
+	{Addr: ":8081", Handler: websocket.NewHandler(wsHandler)},
+	{Addr: ":9000", Handler: grpcServer},
+	{Network: "unix", Addr: "/run/app.sock", Handler: admin},
+}
+engine, err := fib.Bind(config, fibhttp.NewHandler(web))
+addrs, err := engine.BindingAddrs(2) // where binding 2 listens, ports chosen for ":0" included
+```
+
+Every binding shares the engine's event loops, descriptor table, task pool and buffer pool, and
+its settings: backlog, buffers, watermarks, `IOPollers` and `ReusePort` apply to all of them.
+Binding fails as a whole: if one address cannot be taken, none is kept.
+
+Several protocols can also share one port. `mux` looks at the first bytes a client sends, picks
+the route that recognises them, and hands the connection over with `Connection.SetHandler`, after
+which the engine calls the chosen handler directly:
+
+```go
+config.Addr = ":8000"
+engine, err := fib.Bind(config, mux.NewWithConfig(mux.Config{Fallback: rawEcho},
+	mux.Route{Match: mux.TLS(), Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
+	mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(web)}, // HTTP/1.x and h2c
+	mux.Route{Match: mux.Prefix("PING"), Handler: pinger},
+))
+```
+
+Only protocols whose client speaks first can be sniffed; one where the server greets first, such as
+SMTP or MySQL, needs a binding of its own.
+
 ### Examples
 
 ```sh
+go run ./examples/multiprotocol/server # HTTP, HTTPS, HTTP/3, WebSocket and raw TCP from one engine, and a port that sniffs
 go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
 go run ./examples/http/router
@@ -305,7 +349,7 @@ go run ./examples/gateway/server       # upstream, gateway and client, all callb
 go run ./examples/gateway/client
 ```
 
-Each server directory has a matching `client` next to it.
+Each server directory but `multiprotocol` has a matching `client` next to it.
 
 ## Architecture
 
@@ -619,6 +663,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) server and client, wire compatible |
 | [`grpc`](grpc) | gRPC server and client over an HTTP/2 transport of its own, compatible with grpc-go and its generated code |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
+| [`mux`](mux) | Several protocols on one port, told apart by the first bytes a client sends |
 | [`prefork`](prefork) | One program served from several processes sharing its ports (Linux) |
 
 ## Documentation

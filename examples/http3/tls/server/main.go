@@ -66,25 +66,20 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	portNum, _ := strconv.Atoi(port)
 	handler := echo(http3.AltSvc(portNum))
 
-	// HTTP/3: a UDP engine whose handler is http3's. The http.Handler is the
-	// same kind the HTTP/1 and HTTP/2 servers take.
-	udpConfig := fib.DefaultConfig()
-	udpConfig.Network = "udp"
-	udpConfig.Addr = *addr
-	udp, err := fib.Bind(udpConfig, http3.NewHandler(tlsConfig, handler))
+	// One engine, two bindings on the same port number. HTTP/3 is the UDP
+	// one, whose handler is http3's; the http.Handler is the same kind the
+	// HTTP/1 and HTTP/2 servers take. HTTPS over TCP is the other, for
+	// clients that do not know yet that HTTP/3 is here.
+	config := fib.DefaultConfig()
+	config.Bindings = []fib.Binding{
+		{Network: "udp", Addr: *addr, Handler: http3.NewHandler(tlsConfig, handler)},
+		{Network: "tcp", Addr: *addr, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(handler))},
+	}
+	engine, err := fib.Bind(config, nil)
 	if err != nil {
 		return err
 	}
-
-	// HTTPS over TCP, for clients that do not know yet that HTTP/3 is here.
-	tcpConfig := fib.DefaultConfig()
-	tcpConfig.Addr = *addr
-	tcp, err := fib.Bind(tcpConfig, fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(handler)))
-	if err != nil {
-		_ = udp.Close()
-		return err
-	}
-	return example.Serve(ctx, out, ready, "HTTP/3 echo server listening on https://%s (UDP), HTTPS on the same TCP port", udp, tcp)
+	return example.Serve(ctx, out, ready, "HTTP/3 echo server listening on https://%s (UDP), HTTPS on the same TCP port", engine)
 }
 
 func echo(altSvc string) fibhttp.HandlerFunc {

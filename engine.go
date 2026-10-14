@@ -164,8 +164,8 @@ type Engine struct {
 	taskWG          sync.WaitGroup
 	readBufferSize  int
 	closeOnce       sync.Once
-	// udpListeners are the engine's UDP sockets, when Config.Network names
-	// UDP. udpIdleTimeout closes their silent peers, and udpSweep is the
+	// udpListeners are the engine's UDP sockets, those of the bindings whose
+	// network is UDP. udpIdleTimeout closes their silent peers, and udpSweep is the
 	// timer that has the loop check for them, nil once it has been stopped.
 	// udpSweepMu guards it.
 	udpListeners   []*udpListener
@@ -216,24 +216,24 @@ func (e *Engine) releaseSendBuffer(data []byte) {
 }
 
 // Bind creates an engine that listens on config.Addr, or on every address in
-// config.Addrs, and serves the connections it accepts with handler.
+// config.Addrs, and serves the connections it accepts with handler. With
+// config.Bindings, it listens on every binding's addresses instead, and
+// serves each binding's connections with the binding's own handler, or with
+// handler for a binding that names none.
 func Bind(config Config, handler Handler) (*Engine, error) {
-	addrs := config.Addrs
-	if len(addrs) == 0 {
-		addrs = []string{config.Addr}
-	}
-	return newEngine(config, handler, addrs)
+	return newEngine(config, handler, true)
 }
 
 // NewEngine creates an engine with no listeners. Its connections are the ones
-// it dials, which makes it a client engine; config.Addr and config.Addrs are
-// ignored. handler serves connections dialed with Dial, and may be nil when
-// every dial names its own handler through DialWithHandler.
+// it dials, which makes it a client engine; config.Addr, config.Addrs and
+// config.Bindings are ignored. handler serves connections dialed with Dial,
+// and may be nil when every dial names its own handler through
+// DialWithHandler.
 func NewEngine(config Config, handler Handler) (*Engine, error) {
-	return newEngine(config, handler, nil)
+	return newEngine(config, handler, false)
 }
 
-func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) {
+func newEngine(config Config, handler Handler, listen bool) (*Engine, error) {
 	if err := config.validateTaskPool(); err != nil {
 		return nil, err
 	}
@@ -252,7 +252,11 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 	if handler == nil {
 		handler = HandlerFuncs{}
 	}
-	if preforkChild && len(addrs) > 0 {
+	var bindings []Binding
+	if listen {
+		bindings = bindingsOf(config, handler)
+	}
+	if preforkChild && listen {
 		config.ReusePort = true
 	}
 
@@ -289,7 +293,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		handler:        handler}
 	e.readBufferSize = config.ReadBufferSize
 	e.taskPool, e.releaseTaskPool = acquireTaskPool(config)
-	if err := e.open(config, addrs); err != nil {
+	if err := e.open(config, bindings); err != nil {
 		e.releaseTaskPool()
 		return nil, err
 	}
@@ -547,10 +551,12 @@ func shutdownConnection(c *Connection) bool {
 		return false
 	}
 	c.mu.Lock()
-	closing, open := c.closing, !c.closed || c.closePending
+	// The handler is read under the lock, which SetHandler takes, since a
+	// round on a worker may be handing the connection to another one.
+	closing, open, handler := c.closing, !c.closed || c.closePending, c.handler
 	c.mu.Unlock()
 	if !closing {
-		if h, ok := c.handler.(ShutdownHandler); ok {
+		if h, ok := handler.(ShutdownHandler); ok {
 			h.OnShutdown(c)
 		}
 	}
@@ -727,12 +733,16 @@ func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
 	// close is waiting for, is not the peer going.
 	hangup := !submit && !c.hangupNoted && events&(evErr|evHup|evRdHup) != 0 &&
 		!c.flags.has(flagReadShut) && !c.flags.has(flagLingering)
+	var handler Handler
 	if hangup {
 		c.hangupNoted = true
+		// Read under the lock, as SetHandler writes it; see
+		// shutdownConnection.
+		handler = c.handler
 	}
 	c.mu.Unlock()
 	if hangup {
-		if h, ok := c.handler.(HangupHandler); ok {
+		if h, ok := handler.(HangupHandler); ok {
 			h.OnHangup(c)
 		}
 	}
@@ -1009,7 +1019,15 @@ type Config struct {
 	// several addresses shares a single event loop, descriptor table, task
 	// pool and buffer pool across all of them, where a server per address
 	// gives each its own copy of all four.
-	Addrs          []string
+	Addrs []string
+	// Bindings, when it is not empty, is the complete set of what to listen
+	// on, and Addr and Addrs are ignored: each Binding is a group of
+	// addresses on a network of its own, served by a handler of its own, so
+	// that one engine serves TCP, Unix and UDP addresses together, and a
+	// different protocol on each; see Binding. A binding that leaves its
+	// Network empty takes Network, and one that leaves its Handler nil takes
+	// the handler Bind was given.
+	Bindings       []Binding
 	Backlog        int
 	WorkerCount    int
 	MaxEvents      int
@@ -1237,6 +1255,11 @@ type udpState struct {
 // udpListener is a bound UDP socket and the peers it has seen.
 type udpListener struct {
 	udpListenerPlatform
+	// network is the socket's Binding.Network, handler serves its peers,
+	// and binding is the index of the Binding it was opened for.
+	network string
+	handler Handler
+	binding int
 	// peers maps an address to its open connection. Event-loop ownership.
 	peers map[netip.AddrPort]*Connection
 }
@@ -1293,7 +1316,7 @@ func (e *Engine) udpPeer(l *udpListener, from *syscall.RawSockaddrAny) *Connecti
 		return nil
 	}
 	sa := keySockaddr(key, zone)
-	c := &Connection{engine: e, handler: e.handler,
+	c := &Connection{engine: e, handler: l.handler,
 		udp: &udpState{listener: l, sa: sa, key: key, raddr: sockaddrToUDPAddr(sa)}}
 	c.initUDPPeer()
 	c.udp.lastActive.Store(time.Now().UnixNano())
@@ -1517,25 +1540,40 @@ func (e *Engine) closeUDPPeers() {
 // LocalUDPAddrs returns one address per UDP listener, in configured order.
 // Ports left at zero report the port the kernel chose.
 func (e *Engine) LocalUDPAddrs() ([]*net.UDPAddr, error) {
-	listeners := e.udpListeners
-	if len(listeners) == 0 && len(e.pollers) > 0 {
-		// The pollers read the engine's addresses themselves, and the first
-		// holds the sockets the engine bound; see Config.ReusePort.
-		listeners = e.pollers[0].udpListeners
-	}
+	listeners := e.udpSockets()
 	addrs := make([]*net.UDPAddr, 0, len(listeners))
 	for _, l := range listeners {
-		sa, err := l.sockname()
+		addr, err := udpListenerAddr(l)
 		if err != nil {
 			return nil, err
-		}
-		addr := sockaddrToUDPAddr(sa)
-		if addr == nil {
-			return nil, syscall.EAFNOSUPPORT
 		}
 		addrs = append(addrs, addr)
 	}
 	return addrs, nil
+}
+
+// udpSockets returns the sockets the engine bound to its UDP addresses, in
+// configured order.
+func (e *Engine) udpSockets() []*udpListener {
+	if len(e.udpListeners) == 0 && len(e.pollers) > 0 {
+		// The pollers read the engine's addresses themselves, and the first
+		// holds the sockets the engine bound; see Config.ReusePort.
+		return e.pollers[0].udpListeners
+	}
+	return e.udpListeners
+}
+
+// udpListenerAddr returns the address l is bound to.
+func udpListenerAddr(l *udpListener) (*net.UDPAddr, error) {
+	sa, err := l.sockname()
+	if err != nil {
+		return nil, err
+	}
+	addr := sockaddrToUDPAddr(sa)
+	if addr == nil {
+		return nil, syscall.EAFNOSUPPORT
+	}
+	return addr, nil
 }
 
 // LocalUDPAddr returns the address of the engine's first UDP listener.

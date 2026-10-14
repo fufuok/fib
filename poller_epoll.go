@@ -42,12 +42,12 @@ func (e *Engine) openBackend() error {
 		return err
 	}
 	e.epollFD, e.wakeFD = epfd, wakeFD
-	for _, fd := range e.listenFDs {
-		if e.pollersListen {
+	for _, l := range e.listeners {
+		if l.spread {
 			// Its pollers accept for it; see Config.ReusePort.
-			break
+			continue
 		}
-		if err = e.addFD(fd, listenerToken(fd), uint32(syscall.EPOLLIN)|epollET); err != nil {
+		if err = e.addFD(l.fd, listenerToken(l.fd), uint32(syscall.EPOLLIN)|epollET); err != nil {
 			break
 		}
 	}
@@ -55,7 +55,7 @@ func (e *Engine) openBackend() error {
 	// its share of a round and still hear about the rest. Those of an engine
 	// whose pollers read for it go to the first poller; see openUDPBeside.
 	for _, l := range e.udpListeners {
-		if err == nil && !e.pollersListen {
+		if err == nil && !e.udpSpread {
 			err = e.addFD(l.fd, udpToken(l.fd), uint32(syscall.EPOLLIN))
 		}
 	}

@@ -54,6 +54,9 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
 - **背压**：每连接有写水位线（64 KiB），满了就暂停读取；全服务待发字节预算（`MaxPendingBytes`）
   可选、默认关闭，用来限制总量；`HoldReads` 提供读端流控。
 - **池**：随负载伸缩的自适应 worker 池；按 Go 分配器 size class 对齐的分级 buffer 池。
+- **一个引擎，多种协议**：`Config.Bindings` 为每组地址（TCP、Unix 或 UDP）各配一个 handler，
+  一个引擎即可同时提供 HTTP、HTTPS、HTTP/3、WebSocket、gRPC 和裸 TCP，共享事件循环、池和 buffer。
+  `mux` 包更进一步：按客户端最先发送的字节识别协议，让多种协议共用同一个端口。
 - **异步客户端**：非阻塞 dial，以及 HTTP/1.x、HTTP/2、HTTP/3、WebSocket 客户端，结果通过回调或
   future 返回。
 - **静态文件**：`http.FileCache` 从内存提供一个目录下的文件，支持预压缩的 `.br`/`.gz` 文件，并跟随
@@ -276,9 +279,47 @@ engine, err := fib.Bind(config, fib.HandlerFuncs{
 })
 ```
 
+### 一个引擎处理多种协议
+
+每个 `Binding` 是一个或一组地址，有自己的网络类型和自己的 handler；没有指定 handler 的 binding
+使用传给 `Bind` 的那个。
+
+```go
+config := fib.DefaultConfig()
+config.Bindings = []fib.Binding{
+	{Addr: ":80"}, // 明文 HTTP，使用传给 Bind 的 handler
+	{Addrs: []string{":443", ":8443"}, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
+	{Network: "udp", Addr: ":443", Handler: http3.NewHandler(tlsConfig, web)},
+	{Addr: ":8081", Handler: websocket.NewHandler(wsHandler)},
+	{Addr: ":9000", Handler: grpcServer},
+	{Network: "unix", Addr: "/run/app.sock", Handler: admin},
+}
+engine, err := fib.Bind(config, fibhttp.NewHandler(web))
+addrs, err := engine.BindingAddrs(2) // binding 2 实际监听的地址，包括 ":0" 由内核选的端口
+```
+
+所有 binding 共享引擎的事件循环、描述符表、task pool 和 buffer pool，也共享它的配置：backlog、
+buffer、水位线、`IOPollers` 和 `ReusePort` 对每个 binding 都生效。绑定是整体的：任一地址失败，
+已打开的地址都会释放。
+
+多种协议也可以共用一个端口。`mux` 查看客户端最先发送的字节，选出能识别它们的路由，再用
+`Connection.SetHandler` 把连接交出去，此后引擎直接调用选中的 handler：
+
+```go
+config.Addr = ":8000"
+engine, err := fib.Bind(config, mux.NewWithConfig(mux.Config{Fallback: rawEcho},
+	mux.Route{Match: mux.TLS(), Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
+	mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(web)}, // HTTP/1.x 与 h2c
+	mux.Route{Match: mux.Prefix("PING"), Handler: pinger},
+))
+```
+
+只有客户端先发言的协议才能识别；服务端先打招呼的协议（如 SMTP、MySQL）需要单独的 binding。
+
 ### 示例
 
 ```sh
+go run ./examples/multiprotocol/server # 一个引擎同时提供 HTTP、HTTPS、HTTP/3、WebSocket 和裸 TCP，另有一个按首字节分流的端口
 go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
 go run ./examples/http/router
@@ -291,7 +332,7 @@ go run ./examples/gateway/server      # 依次启动 upstream、gateway、client
 go run ./examples/gateway/client
 ```
 
-每个 server 目录旁边都有对应的 `client`。
+除 `multiprotocol` 外，每个 server 目录旁边都有对应的 `client`。
 
 ## 架构
 
@@ -577,6 +618,7 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) 服务端和客户端，协议兼容 |
 | [`grpc`](grpc) | gRPC 服务端和客户端，自带 HTTP/2 传输层，与 grpc-go 及其生成代码兼容 |
 | [`middleware`](middleware) | 中间件链和常用中间件 |
+| [`mux`](mux) | 按客户端最先发送的字节识别协议，多种协议共用一个端口 |
 | [`prefork`](prefork) | 一个程序由多个共享端口的进程服务（Linux） |
 
 ## 文档

@@ -52,15 +52,16 @@ const (
 type enginePlatform struct {
 	backend
 	// udpBatch is what the loop reads UDP datagrams into.
-	udpBatch  *udpbatch.Batch
-	listenFDs []int
-	// pollersListen says the engine's pollers accept its connections, or
-	// read its datagrams, on sockets of their own, and its TCP listeners only
-	// hold their addresses; see Config.ReusePort.
-	pollersListen bool
-	// tcpListeners says the listeners accept TCP connections, which get
-	// TCP_NODELAY as they are accepted.
-	tcpListeners   bool
+	udpBatch *udpbatch.Batch
+	// listeners are the engine's TCP and Unix listening sockets, in
+	// configured order.
+	listeners []streamListener
+	// pollersListen says the engine's pollers accept some of its
+	// connections, or read its datagrams, on sockets of their own; see
+	// Config.ReusePort. Which TCP listeners they accept for each says
+	// itself, and udpSpread says they read every UDP address.
+	pollersListen  bool
+	udpSpread      bool
 	nextGeneration atomic.Uint64
 	// listenMu guards stopping the listeners, which Stop does from whatever
 	// goroutine calls it, and listenAddrs, the addresses they were bound to
@@ -82,6 +83,23 @@ type enginePlatform struct {
 	// Pages are allocated once, on demand, and never copied.
 	// Event-loop ownership.
 	connections [][]*Connection
+}
+
+// streamListener is a TCP or Unix listening socket and what serves the
+// connections it takes.
+type streamListener struct {
+	fd      int
+	network string
+	// unix says the socket is a Unix one, whose connections get no
+	// TCP_NODELAY.
+	unix bool
+	// spread says the engine's pollers accept the address's connections on
+	// sockets of their own, bound beside this one, which only holds the
+	// address; see Config.ReusePort.
+	spread  bool
+	handler Handler
+	// binding is the index of the Binding the socket was opened for.
+	binding int
 }
 
 type connPlatform struct {
@@ -147,50 +165,59 @@ func (c *Connection) sysSendDatagrams(datagrams [][]byte) error {
 	return nil
 }
 
-func (e *Engine) open(config Config, addrs []string) error {
+func (e *Engine) open(config Config, bindings []Binding) error {
 	e.nextGeneration.Store(firstGeneration)
-	e.tcpListeners = !netaddr.IsUnix(config.Network) && !netaddr.IsUDP(config.Network)
 	if p := e.parent; p != nil && p.pollersListen {
 		// A poller that accepts for itself listens beside its parent's
-		// other pollers, on every address the parent is bound to.
-		for _, like := range p.listenFDs {
-			fd, err := listener.CreateLike(listenOptions(config), like)
+		// other pollers, on every TCP address the parent is bound to.
+		for _, like := range p.listeners {
+			if !like.spread {
+				continue
+			}
+			fd, err := listener.CreateLike(listenOptions(config, like.network), like.fd)
 			if err != nil {
 				e.closeListeners()
 				return err
 			}
-			e.listenFDs = append(e.listenFDs, fd)
+			like.fd, like.spread = fd, false
+			e.listeners = append(e.listeners, like)
 		}
 		if err := e.openUDPBeside(config, p); err != nil {
 			e.closeListeners()
 			return err
 		}
 	}
-	udp := netaddr.IsUDP(config.Network)
-	e.pollersListen = e.parent == nil && pollersListen(config)
-	for _, addr := range addrs {
-		if udp {
-			fd, err := listener.CreateUDP(listenOptions(config), addr)
+	for i, b := range bindings {
+		udp := netaddr.IsUDP(b.Network)
+		for _, addr := range b.Addrs {
+			if udp {
+				fd, err := listener.CreateUDP(listenOptions(config, b.Network), addr)
+				if err != nil {
+					e.closeListeners()
+					return err
+				}
+				e.udpListeners = append(e.udpListeners, &udpListener{udpListenerPlatform: udpListenerPlatform{fd: fd},
+					network: b.Network, handler: b.Handler, binding: i, peers: make(map[netip.AddrPort]*Connection)})
+				e.udpSpread = e.udpSpread || pollersListen(config, b.Network)
+				continue
+			}
+			// When the pollers listen, the engine's own socket only holds the
+			// address, and the port the kernel chose for it: were it to listen
+			// too, it would be handed a share of the connections that nothing
+			// accepts.
+			spread := pollersListen(config, b.Network)
+			fd, err := listener.Create(listenOptions(config, b.Network), addr, !spread, spread)
 			if err != nil {
 				e.closeListeners()
 				return err
 			}
-			e.udpListeners = append(e.udpListeners, &udpListener{udpListenerPlatform: udpListenerPlatform{fd: fd},
-				peers: make(map[netip.AddrPort]*Connection)})
-			continue
+			e.listeners = append(e.listeners, streamListener{fd: fd, network: b.Network,
+				unix: netaddr.IsUnix(b.Network), spread: spread, handler: b.Handler, binding: i})
+			e.pollersListen = e.pollersListen || spread
+			e.noteUnixPath(b.Network, addr)
 		}
-		// When the pollers listen, the engine's own socket only holds the
-		// address, and the port the kernel chose for it: were it to listen
-		// too, it would be handed a share of the connections that nothing
-		// accepts.
-		fd, err := listener.Create(listenOptions(config), addr, !e.pollersListen, e.pollersListen)
-		if err != nil {
-			e.closeListeners()
-			return err
-		}
-		e.listenFDs = append(e.listenFDs, fd)
-		e.noteUnixPath(config.Network, addr)
 	}
+	e.pollersListen = e.pollersListen || e.udpSpread
 	if err := e.openBackend(); err != nil {
 		e.closeListeners()
 		return err
@@ -206,6 +233,9 @@ func (e *Engine) open(config Config, addrs []string) error {
 // is in its address's SO_REUSEPORT group whatever else it does, and would be
 // handed a share of the datagrams that nothing reads.
 func (e *Engine) openUDPBeside(config Config, parent *Engine) error {
+	if !parent.udpSpread {
+		return nil
+	}
 	if len(parent.udpListeners) > 0 {
 		e.udpListeners, parent.udpListeners = parent.udpListeners, nil
 		return nil
@@ -214,12 +244,12 @@ func (e *Engine) openUDPBeside(config Config, parent *Engine) error {
 		return nil
 	}
 	for _, like := range parent.pollers[0].udpListeners {
-		fd, err := listener.CreateUDPLike(listenOptions(config), like.fd)
+		fd, err := listener.CreateUDPLike(listenOptions(config, like.network), like.fd)
 		if err != nil {
 			return err
 		}
 		e.udpListeners = append(e.udpListeners, &udpListener{udpListenerPlatform: udpListenerPlatform{fd: fd},
-			peers: make(map[netip.AddrPort]*Connection)})
+			network: like.network, handler: like.handler, binding: like.binding, peers: make(map[netip.AddrPort]*Connection)})
 	}
 	return nil
 }
@@ -236,10 +266,10 @@ func (e *Engine) stopListening() {
 		return
 	}
 	e.listenStopped = true
-	e.listenAddrs = make([]syscall.Sockaddr, len(e.listenFDs))
-	for i, fd := range e.listenFDs {
-		e.listenAddrs[i], _ = syscall.Getsockname(fd)
-		stopListeningFD(fd)
+	e.listenAddrs = make([]syscall.Sockaddr, len(e.listeners))
+	for i, l := range e.listeners {
+		e.listenAddrs[i], _ = syscall.Getsockname(l.fd)
+		stopListeningFD(l.fd)
 	}
 }
 
@@ -283,10 +313,10 @@ func (e *Engine) listenSockname(i, fd int) (syscall.Sockaddr, error) {
 }
 
 func (e *Engine) closeListeners() {
-	for _, fd := range e.listenFDs {
-		syscall.Close(fd)
+	for _, l := range e.listeners {
+		syscall.Close(l.fd)
 	}
-	e.listenFDs = nil
+	e.listeners = nil
 	for _, l := range e.udpListeners {
 		syscall.Close(l.fd)
 	}
@@ -305,6 +335,16 @@ func (e *Engine) newToken(fd int) uint64 {
 func listenerToken(fd int) uint64 { return uint64(uint32(fd)) | listenerKind<<32 }
 func wakeToken(fd int) uint64     { return uint64(uint32(fd)) | wakeKind<<32 }
 func udpToken(fd int) uint64      { return uint64(uint32(fd)) | udpKind<<32 }
+
+// listenerAt returns the TCP or Unix listener on a descriptor, or nil.
+func (e *Engine) listenerAt(fd int) *streamListener {
+	for i := range e.listeners {
+		if e.listeners[i].fd == fd {
+			return &e.listeners[i]
+		}
+	}
+	return nil
+}
 
 // udpListenerAt returns the UDP listener on a descriptor, or nil.
 func (e *Engine) udpListenerAt(fd int) *udpListener {
@@ -473,35 +513,65 @@ func (e *Engine) trackConnection(fd int, c *Connection) {
 	e.connections[page][fd&connPageMask] = c
 }
 
-// ListenAddrs returns the address of every listener, in configured order,
-// whatever its network: a *net.TCPAddr, *net.UnixAddr or *net.UDPAddr. Ports
-// left at zero report the port the kernel chose.
+// ListenAddrs returns the address of every listener, whatever its network: a
+// *net.TCPAddr, *net.UnixAddr or *net.UDPAddr. The TCP and Unix listeners
+// come first, in configured order, and the UDP ones after them, in theirs.
+// Ports left at zero report the port the kernel chose.
 func (e *Engine) ListenAddrs() ([]net.Addr, error) {
-	addrs := make([]net.Addr, 0, len(e.listenFDs)+len(e.udpListeners))
-	for i, fd := range e.listenFDs {
-		sa, err := e.listenSockname(i, fd)
+	return e.listenAddrsOf(-1)
+}
+
+// BindingAddrs returns the addresses of Config.Bindings[i], in the order the
+// binding lists them, as ListenAddrs reports them. An engine bound without
+// Bindings has the one binding, 0, that Network and Addr or Addrs make.
+func (e *Engine) BindingAddrs(i int) ([]net.Addr, error) {
+	if i < 0 {
+		return nil, errNoBinding
+	}
+	addrs, err := e.listenAddrsOf(i)
+	if err == nil && len(addrs) == 0 {
+		err = errNoBinding
+	}
+	return addrs, err
+}
+
+// listenAddrsOf returns the addresses of binding's listeners, or of every
+// listener for a binding below zero.
+func (e *Engine) listenAddrsOf(binding int) ([]net.Addr, error) {
+	addrs := make([]net.Addr, 0, len(e.listeners)+len(e.udpListeners))
+	for i, l := range e.listeners {
+		if binding >= 0 && l.binding != binding {
+			continue
+		}
+		sa, err := e.listenSockname(i, l.fd)
 		if err != nil {
 			return nil, err
 		}
 		addrs = append(addrs, netaddr.ToAddr(sa))
 	}
-	udpAddrs, err := e.LocalUDPAddrs()
-	if err != nil {
-		return nil, err
-	}
-	for _, addr := range udpAddrs {
+	for _, l := range e.udpSockets() {
+		if binding >= 0 && l.binding != binding {
+			continue
+		}
+		addr, err := udpListenerAddr(l)
+		if err != nil {
+			return nil, err
+		}
 		addrs = append(addrs, addr)
 	}
 	return addrs, nil
 }
 
-// LocalAddrs returns one address per TCP listener, in configured order. Ports
-// left at zero report the port the kernel chose. It fails for an engine
-// listening on Unix sockets; ListenAddrs reports those.
+// LocalAddrs returns one address per TCP listener, in configured order,
+// leaving out the Unix ones, which ListenAddrs reports. Ports left at zero
+// report the port the kernel chose.
 func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
-	addrs := make([]*net.TCPAddr, 0, len(e.listenFDs))
-	for i, fd := range e.listenFDs {
-		sa, err := e.listenSockname(i, fd)
+	addrs := make([]*net.TCPAddr, 0, len(e.listeners))
+	for i, l := range e.listeners {
+		if l.unix {
+			continue
+		}
+		sa, err := e.listenSockname(i, l.fd)
 		if err != nil {
 			return nil, err
 		}
@@ -543,6 +613,10 @@ func (e *Engine) Run() error {
 }
 
 func (e *Engine) acceptConnections(listenFD int) {
+	l := e.listenerAt(listenFD)
+	if l == nil {
+		return
+	}
 	for {
 		fd, peer, err := sys.AcceptSocket(listenFD)
 		if err == syscall.EINTR {
@@ -551,19 +625,19 @@ func (e *Engine) acceptConnections(listenFD int) {
 		if err != nil {
 			return
 		}
-		if e.tcpListeners && !sys.AcceptedInheritNoDelay {
+		if !l.unix && !sys.AcceptedInheritNoDelay {
 			// Replies are written whole, so Nagle would only hold a small
 			// one back until the peer's delayed ACK.
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		}
 		if len(e.pollers) == 0 {
-			e.admit(newAccepted(e, e.handler, !e.tcpListeners, peer), fd)
+			e.admit(newAccepted(e, l.handler, l.unix, peer), fd)
 			continue
 		}
 		// The poller registers the descriptor itself, since its table and
 		// its backend are its loop's alone.
 		p := e.pollers[fd%len(e.pollers)]
-		c := newAccepted(p, e.handler, !e.tcpListeners, peer)
+		c := newAccepted(p, l.handler, l.unix, peer)
 		c.fd.Store(int32(fd))
 		if !p.request(command{kind: commandAccept, connection: c}) {
 			syscall.Close(fd)
@@ -717,8 +791,8 @@ func (e *Engine) release() error {
 	}
 	e.closeUDPPeers()
 	e.budgetPaused = nil
-	for _, fd := range e.listenFDs {
-		if err := syscall.Close(fd); err != nil && closeErr == nil {
+	for _, l := range e.listeners {
+		if err := syscall.Close(l.fd); err != nil && closeErr == nil {
 			closeErr = err
 		}
 	}
@@ -735,18 +809,20 @@ func (e *Engine) release() error {
 }
 
 // pollersListen reports whether config has each poller listen on a socket
-// of its own, accepting its TCP connections or reading its UDP datagrams
-// itself. Under IOPollers it does for TCP whatever ReusePort says, where
-// SO_REUSEPORT spreads connections; see Config.ReusePort. UDP needs
-// ReusePort, since a peer's datagrams move between sockets as sockets join.
-func pollersListen(config Config) bool {
-	return (config.ReusePort || !netaddr.IsUDP(config.Network)) && sys.ReusePortSpreads &&
-		pollerCount(config) > 0 && !netaddr.IsUnix(config.Network)
+// of its own for an address on network, accepting its TCP connections or
+// reading its UDP datagrams itself. Under IOPollers it does for TCP whatever
+// ReusePort says, where SO_REUSEPORT spreads connections; see
+// Config.ReusePort. UDP needs ReusePort, since a peer's datagrams move
+// between sockets as sockets join.
+func pollersListen(config Config, network string) bool {
+	return (config.ReusePort || !netaddr.IsUDP(network)) && sys.ReusePortSpreads &&
+		pollerCount(config) > 0 && !netaddr.IsUnix(network)
 }
 
-// listenOptions is what of config the listening sockets are opened by.
-func listenOptions(config Config) listener.Options {
-	return listener.Options{Network: config.Network, Backlog: config.Backlog, ReusePort: config.ReusePort}
+// listenOptions is what of config the listening sockets on network are
+// opened by.
+func listenOptions(config Config, network string) listener.Options {
+	return listener.Options{Network: network, Backlog: config.Backlog, ReusePort: config.ReusePort}
 }
 
 // The readiness backends never have a write outstanding in the kernel: a

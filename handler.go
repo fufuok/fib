@@ -154,8 +154,33 @@ type Layer interface {
 func (c *Connection) CloseWithError(err error) { c.closeWithError(err) }
 
 // Handler returns the handler the engine serves accepted connections with,
-// which is also what a dial that names no handler of its own gets.
+// which is also what a dial that names no handler of its own gets: the one
+// Bind or NewEngine was given. A Binding with a handler of its own serves
+// its connections with that one instead.
 func (e *Engine) Handler() Handler { return e.handler }
+
+// SetHandler hands the connection to h: every callback from here on goes to h
+// instead of the handler that has served it so far, OnData, OnPriorityData
+// and OnClose, and the ones the engine finds by asking what the handler
+// implements, OnHangup, OnShutdown and OnDatagrams. It is for a handler that
+// serves a connection only until it knows what the connection is, as package
+// mux does with the protocol a peer speaks first, and then steps aside, so
+// that the connection costs nothing more for having been looked at. A nil h
+// is a handler that does nothing.
+//
+// h's OnOpen is not called: the caller calls it, if h expects one, and then
+// hands h whatever it read while it decided. Call SetHandler only from the
+// connection's own OnData or OnPriorityData. The rounds that run those follow
+// one another, and the engine reads the handler in them without a lock; only
+// the event loop takes one to read it, which SetHandler takes to write it.
+func (c *Connection) SetHandler(h Handler) {
+	if h == nil {
+		h = HandlerFuncs{}
+	}
+	c.mu.Lock()
+	c.handler = h
+	c.mu.Unlock()
+}
 
 // SetLayer installs l, or removes the layer with nil. Install it in OnOpen,
 // before anything can send, so that no send bypasses it.

@@ -105,6 +105,10 @@ const acceptAddrLen = int(unsafe.Sizeof(syscall.RawSockaddrAny{})) + 16
 type winListener struct {
 	fd     syscall.Handle
 	family int
+	// handler serves the connections the listener takes, and binding is the
+	// index of the Binding it was opened for.
+	handler Handler
+	binding int
 	// addr is the address the listener is bound to, kept for once Run has
 	// closed it.
 	addr   syscall.Sockaddr
@@ -203,33 +207,22 @@ func (c *Connection) FD() int {
 	return int(h)
 }
 
-func (e *Engine) open(config Config, addrs []string) error {
+func (e *Engine) open(config Config, bindings []Binding) error {
 	port, err := syscall.CreateIoCompletionPort(syscall.InvalidHandle, 0, 0, 1)
 	if err != nil {
 		return err
 	}
 	e.port = port
 	e.conns = make(map[*Connection]struct{})
-	if netaddr.IsUDP(config.Network) {
-		return e.openUDP(config, addrs)
-	}
-	for _, addr := range addrs {
-		l, err := createListener(config, addr)
-		if err == nil {
-			if _, err = syscall.CreateIoCompletionPort(l.fd, port, 0, 0); err != nil {
-				syscall.Closesocket(l.fd)
+	// Every socket is opened before any operation is posted on one, so a
+	// binding that fails leaves nothing outstanding to wait for.
+	for i, b := range bindings {
+		for _, addr := range b.Addrs {
+			if err := e.openListener(config, b, i, addr); err != nil {
+				e.abandon()
+				return err
 			}
 		}
-		if err != nil {
-			for _, opened := range e.listeners {
-				syscall.Closesocket(opened.fd)
-			}
-			e.removeUnixPaths()
-			syscall.CloseHandle(port)
-			return err
-		}
-		e.listeners = append(e.listeners, l)
-		e.noteUnixPath(config.Network, addr)
 	}
 	for _, l := range e.listeners {
 		for i := 0; i < acceptsPerListener; i++ {
@@ -242,24 +235,6 @@ func (e *Engine) open(config Config, addrs []string) error {
 			}
 		}
 	}
-	return nil
-}
-
-// openUDP binds the UDP sockets and posts each one's first receive.
-func (e *Engine) openUDP(config Config, addrs []string) error {
-	for _, addr := range addrs {
-		l, err := createUDPListener(config, addr)
-		if err == nil {
-			if _, err = syscall.CreateIoCompletionPort(l.fd, e.port, 0, 0); err != nil {
-				syscall.Closesocket(l.fd)
-			}
-		}
-		if err != nil {
-			e.abandon()
-			return err
-		}
-		e.udpListeners = append(e.udpListeners, l)
-	}
 	for _, l := range e.udpListeners {
 		if err := e.postRecvFrom(l); err != nil {
 			e.abandon()
@@ -269,8 +244,40 @@ func (e *Engine) openUDP(config Config, addrs []string) error {
 	return nil
 }
 
-func createUDPListener(config Config, addr string) (*udpListener, error) {
-	family, bound, err := netaddr.ResolveListen(config.Network, addr)
+// openListener opens the socket of one of binding b's addresses, the i-th
+// binding, and associates it with the completion port.
+func (e *Engine) openListener(config Config, b Binding, i int, addr string) error {
+	if netaddr.IsUDP(b.Network) {
+		l, err := createUDPListener(b.Network, addr)
+		if err == nil {
+			if _, err = syscall.CreateIoCompletionPort(l.fd, e.port, 0, 0); err != nil {
+				syscall.Closesocket(l.fd)
+			}
+		}
+		if err != nil {
+			return err
+		}
+		l.network, l.handler, l.binding = b.Network, b.Handler, i
+		e.udpListeners = append(e.udpListeners, l)
+		return nil
+	}
+	l, err := createListener(config, b.Network, addr)
+	if err == nil {
+		if _, err = syscall.CreateIoCompletionPort(l.fd, e.port, 0, 0); err != nil {
+			syscall.Closesocket(l.fd)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	l.handler, l.binding = b.Handler, i
+	e.listeners = append(e.listeners, l)
+	e.noteUnixPath(b.Network, addr)
+	return nil
+}
+
+func createUDPListener(network, addr string) (*udpListener, error) {
+	family, bound, err := netaddr.ResolveListen(network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +287,7 @@ func createUDPListener(config Config, addr string) (*udpListener, error) {
 	}
 	if family == syscall.AF_INET6 {
 		v6only := 0
-		if config.Network == "udp6" {
+		if network == "udp6" {
 			v6only = 1
 		}
 		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
@@ -406,8 +413,8 @@ func (e *Engine) abandon() {
 	syscall.CloseHandle(e.port)
 }
 
-func createListener(config Config, addr string) (*winListener, error) {
-	family, bound, err := netaddr.ResolveListen(config.Network, addr)
+func createListener(config Config, network, addr string) (*winListener, error) {
+	family, bound, err := netaddr.ResolveListen(network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -421,7 +428,7 @@ func createListener(config Config, addr string) (*winListener, error) {
 		// "tcp" accepts both families on one socket; "tcp6" is IPv6 only. This
 		// is the distinction net.Listen draws between the two networks.
 		v6only := 0
-		if config.Network == "tcp6" {
+		if network == "tcp6" {
 			v6only = 1
 		}
 		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
@@ -459,33 +466,60 @@ func (e *Engine) postAccept(op *acceptOp) error {
 	return nil
 }
 
-// ListenAddrs returns the address of every listener, in configured order,
-// whatever its network: a *net.TCPAddr, *net.UnixAddr or *net.UDPAddr. Ports
-// left at zero report the port the kernel chose.
+// ListenAddrs returns the address of every listener, whatever its network: a
+// *net.TCPAddr, *net.UnixAddr or *net.UDPAddr. The TCP and Unix listeners
+// come first, in configured order, and the UDP ones after them, in theirs.
+// Ports left at zero report the port the kernel chose.
 func (e *Engine) ListenAddrs() ([]net.Addr, error) {
+	return e.listenAddrsOf(-1)
+}
+
+// BindingAddrs returns the addresses of Config.Bindings[i], in the order the
+// binding lists them, as ListenAddrs reports them. An engine bound without
+// Bindings has the one binding, 0, that Network and Addr or Addrs make.
+func (e *Engine) BindingAddrs(i int) ([]net.Addr, error) {
+	if i < 0 {
+		return nil, errNoBinding
+	}
+	addrs, err := e.listenAddrsOf(i)
+	if err == nil && len(addrs) == 0 {
+		err = errNoBinding
+	}
+	return addrs, err
+}
+
+// listenAddrsOf returns the addresses of binding's listeners, or of every
+// listener for a binding below zero.
+func (e *Engine) listenAddrsOf(binding int) ([]net.Addr, error) {
 	addrs := make([]net.Addr, 0, len(e.listeners)+len(e.udpListeners))
 	for _, l := range e.listeners {
-		sa := l.addr
-		addrs = append(addrs, netaddr.ToAddr(sa))
+		if binding < 0 || l.binding == binding {
+			addrs = append(addrs, netaddr.ToAddr(l.addr))
+		}
 	}
-	udpAddrs, err := e.LocalUDPAddrs()
-	if err != nil {
-		return nil, err
-	}
-	for _, addr := range udpAddrs {
+	for _, l := range e.udpListeners {
+		if binding >= 0 && l.binding != binding {
+			continue
+		}
+		addr, err := udpListenerAddr(l)
+		if err != nil {
+			return nil, err
+		}
 		addrs = append(addrs, addr)
 	}
 	return addrs, nil
 }
 
-// LocalAddrs returns one address per TCP listener, in configured order. Ports
-// left at zero report the port the kernel chose. It fails for an engine
-// listening on Unix sockets; ListenAddrs reports those.
+// LocalAddrs returns one address per TCP listener, in configured order,
+// leaving out the Unix ones, which ListenAddrs reports. Ports left at zero
+// report the port the kernel chose.
 func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 	addrs := make([]*net.TCPAddr, 0, len(e.listeners))
 	for _, l := range e.listeners {
-		sa := l.addr
-		addr, err := netaddr.ToTCPAddr(sa)
+		if l.family == syscall.AF_UNIX {
+			continue
+		}
+		addr, err := netaddr.ToTCPAddr(l.addr)
 		if err != nil {
 			return nil, err
 		}
@@ -647,7 +681,7 @@ func (e *Engine) adopt(l *winListener, s syscall.Handle) error {
 		// back until the peer's delayed ACK.
 		_ = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 	}
-	c := &Connection{engine: e, handler: e.handler}
+	c := &Connection{engine: e, handler: l.handler}
 	c.flags.set(flagUnix, l.family == syscall.AF_UNIX)
 	c.handle.Store(uintptr(s))
 	c.readOp = ioOp{kind: opRead, conn: c}
