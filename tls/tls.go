@@ -297,6 +297,9 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 		if err != nil {
 			c.SetLayer(t)
 			h.inner().OnOpen(c)
+			// No handshake will settle the layer, so it is settled here, and
+			// the close goes straight to the wrapped handler.
+			t.settle(h.inner())
 			c.CloseWithError(err)
 			return
 		}
@@ -326,6 +329,7 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 		// What the handler writes in OnOpen follows the hello as early data.
 		if err := c.SendRaw(hello); err != nil {
 			h.inner().OnOpen(c)
+			t.settle(h.inner())
 			c.CloseWithError(err)
 			return
 		}
