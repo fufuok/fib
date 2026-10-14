@@ -108,3 +108,27 @@ func TestStoreGiveBack(t *testing.T) {
 		t.Error("a refund for a window that had passed freed a place in this one")
 	}
 }
+
+// TestStoreStaleEntryNotYetSwept checks that a key whose count is two or more
+// windows old, but which the shard has not yet swept away, counts from
+// nothing, neither its own window nor the one before it carrying over.
+func TestStoreStaleEntryNotYetSwept(t *testing.T) {
+	s := newStore(testWindow, true)
+	// Another key in the same shard, to sweep it without touching "k".
+	other := ""
+	for i := 0; other == ""; i++ {
+		if key := "other" + string(rune('a'+i%26)) + string(rune('a'+i/26)); s.shard(key) == s.shard("k") {
+			other = key
+		}
+	}
+	if !takeAt(t, s, 1000, 1) {
+		t.Fatal("the first request was refused")
+	}
+	// This sweep, a window on, keeps "k", whose window is the one just past;
+	// the next is not due for another window.
+	s.take(other, 2999, 1)
+	used, allowed, _, _ := s.take("k", 3500, 1)
+	if !allowed || used != 1 {
+		t.Errorf("two windows on: used %d, allowed %v; want a fresh count", used, allowed)
+	}
+}

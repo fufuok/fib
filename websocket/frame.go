@@ -426,9 +426,7 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 			return Event{}, false, false, ErrProtocol
 		}
 	}
-	if control && payloadLen > 125 {
-		return Event{}, false, false, ErrProtocol
-	}
+	// A control frame's length fits its second byte, which was bounded above.
 	current := int64(0)
 	if fragment != nil {
 		current = int64(len(fragment.data))

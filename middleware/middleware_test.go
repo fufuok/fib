@@ -58,3 +58,18 @@ func TestAddVary(t *testing.T) {
 		t.Errorf("Vary = %q", got)
 	}
 }
+
+// TestRemoteIP checks that RemoteIP strips the port, and passes on an address
+// that has none, such as a Unix socket's, as it is.
+func TestRemoteIP(t *testing.T) {
+	for addr, want := range map[string]string{
+		"192.0.2.1:8080": "192.0.2.1",
+		"[::1]:443":      "::1",
+		"@":              "@",
+		"/tmp/fib.sock":  "/tmp/fib.sock",
+	} {
+		if got := middleware.RemoteIP(&stdhttp.Request{RemoteAddr: addr}); got != want {
+			t.Errorf("RemoteIP(%q) = %q, want %q", addr, got, want)
+		}
+	}
+}

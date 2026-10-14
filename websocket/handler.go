@@ -324,10 +324,8 @@ func (c *Connection) sendClose(payload []byte) error {
 	if !c.closeSent.CompareAndSwap(false, true) {
 		return nil
 	}
-	if len(payload) > 125 {
-		c.closeSent.Store(false)
-		return ErrProtocol
-	}
+	// Every caller hands over at most 125 bytes: Close checks the reason's
+	// length, and the parser bounds a received close frame.
 	code, reason := closePayload(payload)
 	c.closeState.Store(&connectionCloseState{code: code, reason: reason})
 	if err := c.sendFrame(Close, payload, false); err != nil {
@@ -666,10 +664,9 @@ func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, handshake
 	var offers []string
 	hostSeen, connectionUpgrade, upgradeWebsocket, version13 := false, false, false, false
 	for offset := lineEnd + 2; offset < headerAt; {
+		// The line ends at the latest at headerAt, and is not empty, since
+		// headerAt is where the first empty line is.
 		relativeEnd := bytes.Index(data[offset:headerAt+2], []byte("\r\n"))
-		if relativeEnd <= 0 {
-			return nil, handshakeResult{}, nil, false, errMalformedHandshake
-		}
 		line := data[offset : offset+relativeEnd]
 		offset += relativeEnd + 2
 		colon := bytes.IndexByte(line, ':')

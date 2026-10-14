@@ -250,17 +250,17 @@ func TestHeaderTokenHelpers(t *testing.T) {
 
 func TestValidMinimalRequestURI(t *testing.T) {
 	for uri, want := range map[string]bool{
-		"":          false,
-		"chat":      false,
-		"/a b":      false,
-		"/a\x7f":    false,
-		"/a#frag":   false,
-		"/%2":       false,
-		"/%zz":      false,
-		"/%g0":      false,
-		"/%0g":      false,
+		"":           false,
+		"chat":       false,
+		"/a b":       false,
+		"/a\x7f":     false,
+		"/a#frag":    false,
+		"/%2":        false,
+		"/%zz":       false,
+		"/%g0":       false,
+		"/%0g":       false,
 		"/%2F%af%B9": true,
-		"/chat?x=1": true,
+		"/chat?x=1":  true,
 	} {
 		if got := validMinimalRequestURI([]byte(uri)); got != want {
 			t.Errorf("%q: %v, want %v", uri, got, want)

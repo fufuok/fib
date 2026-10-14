@@ -21,6 +21,10 @@ func TestUTF8ValidatorMatchesStdlibAcrossSplits(t *testing.T) {
 		[]byte("\x80"),
 		[]byte("ab\xce"),
 		[]byte("\xf0\x90\x80"),
+		// Four-byte sequences led by F1-F3, whose continuations take the
+		// whole 80-BF range.
+		[]byte("\xf1\x80\x80\x80\xf3\xbf\xbf\xbf"),
+		[]byte("\xf2\x7f\x80\x80"),
 	}
 	for _, input := range inputs {
 		want := utf8.Valid(input)
