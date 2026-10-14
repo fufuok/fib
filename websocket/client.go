@@ -217,10 +217,10 @@ func (d *Dialer) handshakeRequest(rawURL string, header stdhttp.Header) (
 			return nil, "", false, "", fmt.Errorf("websocket: the dialer sets the %s header itself", name)
 		}
 	}
+	// crypto/rand.Read never fails: it crashes the program rather than return
+	// an error.
 	var nonce [16]byte
-	if _, err = rand.Read(nonce[:]); err != nil {
-		return nil, "", false, "", err
-	}
+	_, _ = rand.Read(nonce[:])
 	key = base64.StdEncoding.EncodeToString(nonce[:])
 	h := header.Clone()
 	if h == nil {
