@@ -878,6 +878,33 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 		}
 		return
 	}
+	e.markClosedLocked(c, closeErr)
+	if !callback {
+		c.mu.Unlock()
+		e.detach(c)
+		return
+	}
+	c.closePending = true
+	schedule := !c.scheduled
+	c.scheduled = true
+	c.mu.Unlock()
+	if c.udp != nil && c.udp.listener != nil {
+		// A listener's peer has no descriptor of its own to be reused under
+		// a round, so it leaves the peer table now: the peer's next datagram
+		// opens a fresh connection rather than being dropped on this one
+		// while its OnClose is still to run.
+		e.detachPeer(c)
+	}
+	if schedule {
+		e.redeliver = append(e.redeliver, c)
+	}
+}
+
+// markClosedLocked closes c from here on: nothing more is sent or read,
+// writers waiting on it are let go, and its queue and its share of the
+// budget are released. What remains, OnClose and the release of the
+// descriptor, is the caller's. Callers hold c.mu.
+func (e *Engine) markClosedLocked(c *Connection, closeErr error) {
 	c.closed = true
 	c.closing = true
 	c.wakeOutputWaitLocked()
@@ -907,24 +934,45 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 		c.charged = 0
 		e.releaseBudget(charged)
 	}
-	if !callback {
-		c.mu.Unlock()
-		e.detach(c)
+}
+
+// cutConnection ends c at once as the engine closes, before the rounds still
+// running have ended: sends are refused from here on, so a handler that
+// answers late writes nothing, and the peer is told. A connection with no
+// round running is closed outright. One with a round running keeps its
+// descriptor until the round has ended, and its socket is shut down instead,
+// which ends the connection for the peer and fails the round's reads and
+// writes without letting the descriptor be reused under it; Close releases
+// it once no round runs. Callers own the loop's state: the loop has stopped.
+func (e *Engine) cutConnection(c *Connection) {
+	if c.dialing != nil {
+		// Close fails the dial, once no round runs.
 		return
 	}
-	c.closePending = true
-	schedule := !c.scheduled
-	c.scheduled = true
-	c.mu.Unlock()
-	if c.udp != nil && c.udp.listener != nil {
-		// A listener's peer has no descriptor of its own to be reused under
-		// a round, so it leaves the peer table now: the peer's next datagram
-		// opens a fresh connection rather than being dropped on this one
-		// while its OnClose is still to run.
-		e.detachPeer(c)
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
 	}
-	if schedule {
-		e.redeliver = append(e.redeliver, c)
+	e.markClosedLocked(c, nil)
+	running := c.scheduled
+	c.mu.Unlock()
+	switch {
+	case c.udp != nil && c.udp.listener != nil:
+		// A listener's peer has no socket of its own to end.
+	case running:
+		c.shutdownSocket()
+	default:
+		e.detach(c)
+	}
+}
+
+// cutUDPPeers is cutConnection for the peers of the engine's UDP listeners.
+func (e *Engine) cutUDPPeers() {
+	for _, l := range e.udpListeners {
+		for _, c := range l.peers {
+			e.cutConnection(c)
+		}
 	}
 }
 

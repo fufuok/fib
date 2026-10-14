@@ -639,7 +639,16 @@ func (e *Engine) detach(c *Connection) {
 	}
 }
 
-// Close releases all resources. Run must have returned before Close is called.
+// Close stops the engine and closes every connection it still has, at once:
+// a peer sees its connection end, and a handler still running, which nothing
+// can interrupt, finds whatever it sends refused, as net/http.Server.Close
+// leaves its handlers. Run must have returned before Close is called.
+//
+// Close releases all resources once no handler is running any more: before
+// it returns when the rounds still running end within a moment of their
+// connections being cut, which is all of them unless a handler is held up by
+// something else, and otherwise when the last of them does, after Close has
+// returned. Closing descriptors it releases then reports no error.
 func (e *Engine) Close() error {
 	var closeErr error
 	e.closeOnce.Do(func() {
@@ -657,40 +666,80 @@ func (e *Engine) Close() error {
 			p.stopListening()
 		}
 		e.stopUDPSweeper()
-		// The pollers' connections are the engine's, so they close first,
-		// while the task pool they run on is still there.
-		for _, p := range e.pollers {
-			if err := p.Close(); err != nil && closeErr == nil {
+		loops := append([]*Engine{e}, e.pollers...)
+		for _, l := range loops {
+			l.cutConnections()
+		}
+		closeErr = afterRounds(func() {
+			for _, l := range loops {
+				l.taskWG.Wait()
+			}
+		}, e.release)
+	})
+	return closeErr
+}
+
+// cutConnections ends every connection of the loop at once; see
+// cutConnection.
+func (e *Engine) cutConnections() {
+	for _, entries := range e.connections {
+		for _, c := range entries {
+			if c != nil {
+				e.cutConnection(c)
+			}
+		}
+	}
+	e.cutUDPPeers()
+}
+
+// shutdownSocket ends the connection's socket both ways, for a connection
+// cut while a round of it runs, keeping its descriptor; see cutConnection.
+func (c *Connection) shutdownSocket() {
+	if fd := c.FD(); fd >= 0 {
+		_ = syscall.Shutdown(fd, syscall.SHUT_RDWR)
+	}
+}
+
+// release is what Close leaves until no round runs: the pollers, the task
+// pool, and the descriptors of the engine, its listeners and the connections
+// left. The pollers' connections are the engine's, so they go first, while
+// the task pool they run on is still there.
+func (e *Engine) release() error {
+	var closeErr error
+	for _, p := range e.pollers {
+		p.closeOnce.Do(func() {
+			p.Stop()
+			p.stopUDPSweeper()
+			if err := p.release(); err != nil && closeErr == nil {
 				closeErr = err
 			}
-		}
-		e.taskWG.Wait()
-		e.releaseTaskPool()
-		e.closeCommands()
-		for _, entries := range e.connections {
-			for _, c := range entries {
-				if c != nil {
-					e.closeConnection(c, nil, false)
-				}
+		})
+	}
+	e.releaseTaskPool()
+	e.closeCommands()
+	for _, entries := range e.connections {
+		for _, c := range entries {
+			if c != nil {
+				e.closeConnection(c, nil, false)
 			}
 		}
-		e.closeUDPPeers()
-		e.budgetPaused = nil
-		for _, fd := range e.listenFDs {
-			if err := syscall.Close(fd); err != nil && closeErr == nil {
-				closeErr = err
-			}
-		}
-		for _, l := range e.udpListeners {
-			if err := syscall.Close(l.fd); err != nil && closeErr == nil {
-				closeErr = err
-			}
-		}
-		e.removeUnixPaths()
-		if err := e.closeBackend(); err != nil && closeErr == nil {
+	}
+	e.closeUDPPeers()
+	e.budgetPaused = nil
+	for _, fd := range e.listenFDs {
+		if err := syscall.Close(fd); err != nil && closeErr == nil {
 			closeErr = err
 		}
-	})
+	}
+	for _, l := range e.udpListeners {
+		if err := syscall.Close(l.fd); err != nil && closeErr == nil {
+			closeErr = err
+		}
+	}
+	e.removeUnixPaths()
+	if err := e.closeBackend(); err != nil && closeErr == nil {
+		closeErr = err
+	}
 	return closeErr
 }
 

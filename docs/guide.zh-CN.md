@@ -197,6 +197,13 @@ if err := server.Run(); err != nil { panic(err) } // Shutdown 停止引擎后返
 server.Close()
 ```
 
+`Close` 与 `net/http.Server.Close` 一样立即切断所有连接，不等待仍在运行的 handler：
+对端马上看到连接结束，handler 之后写出的响应被拒绝、不会发出。handler 无法被中断，
+`Close` 只在它们结束后才释放描述符、事件循环和任务池；运行中的轮次在连接切断后
+片刻内结束时（没有被数据库、sleep 等拖住的 handler 都是如此），这些在 `Close`
+返回前就已释放，否则在最后一个 handler 返回时释放。因此 `Shutdown` 超时后调用
+`Close`，总耗时不会超出 `ctx` 的期限太多，不会被最慢的 handler 拖住。
+
 引擎分不清连接是在处理请求还是空闲，这由连接上的协议决定：handler 实现
 `fib.ShutdownHandler` 时，停机期间引擎在事件循环上对每个未关闭的连接调用
 `OnShutdown`，开始时调用一次，之后按逐渐拉长的间隔重复调用，直到连接关闭；它不能

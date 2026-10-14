@@ -806,41 +806,64 @@ func (e *Engine) detach(c *Connection) {
 	e.forget(c)
 }
 
-// Close releases all resources. Run must have returned before Close is called.
+// Close stops the engine and closes every connection it still has, at once,
+// and releases all resources once no handler is running any more; see the
+// epoll and kqueue backends' Close. Run must have returned before Close is
+// called.
 func (e *Engine) Close() error {
 	var closeErr error
 	e.closeOnce.Do(func() {
 		e.Stop()
 		e.stopUDPSweeper()
-		e.taskWG.Wait()
-		e.releaseTaskPool()
-		e.closeCommands()
 		for c := range e.conns {
-			e.closeConnection(c, nil, false)
+			e.cutConnection(c)
 		}
-		e.closeUDPPeers()
-		e.budgetPaused = nil
-		if err := e.closeListeners(); err != nil && closeErr == nil {
-			closeErr = err
-		}
-		for _, l := range e.udpListeners {
-			l.closed = true
-			if err := syscall.Closesocket(l.fd); err != nil && closeErr == nil {
-				closeErr = err
-			}
-		}
-		e.removeUnixPaths()
-		e.drainPort()
-		// A connection whose completions never arrived still holds its
-		// socket, and the port is about to go with the engine, so nothing
-		// would ever close it. It goes now, orderly close or not.
-		for c := range e.conns {
-			e.closeSocketNow(c)
-		}
-		if err := syscall.CloseHandle(e.port); err != nil && closeErr == nil {
-			closeErr = err
-		}
+		e.cutUDPPeers()
+		closeErr = afterRounds(e.taskWG.Wait, e.release)
 	})
+	return closeErr
+}
+
+// shutdownSocket ends the connection's socket both ways, for a connection
+// cut while a round of it runs, keeping its handle; see cutConnection.
+func (c *Connection) shutdownSocket() {
+	if h := c.socket(); h != syscall.InvalidHandle {
+		_ = syscall.Shutdown(h, syscall.SHUT_RDWR)
+	}
+}
+
+// release is what Close leaves until no round runs: the task pool, the
+// sockets, and the completion port, once the operations closing them
+// cancelled have completed.
+func (e *Engine) release() error {
+	var closeErr error
+	e.releaseTaskPool()
+	e.closeCommands()
+	for c := range e.conns {
+		e.closeConnection(c, nil, false)
+	}
+	e.closeUDPPeers()
+	e.budgetPaused = nil
+	if err := e.closeListeners(); err != nil && closeErr == nil {
+		closeErr = err
+	}
+	for _, l := range e.udpListeners {
+		l.closed = true
+		if err := syscall.Closesocket(l.fd); err != nil && closeErr == nil {
+			closeErr = err
+		}
+	}
+	e.removeUnixPaths()
+	e.drainPort()
+	// A connection whose completions never arrived still holds its
+	// socket, and the port is about to go with the engine, so nothing
+	// would ever close it. It goes now, orderly close or not.
+	for c := range e.conns {
+		e.closeSocketNow(c)
+	}
+	if err := syscall.CloseHandle(e.port); err != nil && closeErr == nil {
+		closeErr = err
+	}
 	return closeErr
 }
 

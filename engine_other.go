@@ -414,6 +414,11 @@ func (e *Engine) Stop() {
 		}
 	}
 }
+
+// Close stops the engine and closes every connection it still has, at once:
+// a handler still running finds whatever it sends refused. It releases the
+// task pool once no handler is running any more, which may be after it has
+// returned; see the native backends' Close.
 func (e *Engine) Close() error {
 	e.closeOnce.Do(func() {
 		e.Stop()
@@ -426,9 +431,13 @@ func (e *Engine) Close() error {
 		for _, c := range connections {
 			c.Close()
 		}
-		e.readers.Wait()
-		e.taskWG.Wait()
-		e.releaseTaskPool()
+		_ = afterRounds(func() {
+			e.readers.Wait()
+			e.taskWG.Wait()
+		}, func() error {
+			e.releaseTaskPool()
+			return nil
+		})
 	})
 	return nil
 }

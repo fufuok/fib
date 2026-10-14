@@ -323,3 +323,48 @@ func TestShutdownOverTLS(t *testing.T) {
 		done <- nil
 	}
 }
+
+// TestShutdownDeadlineThenClose is the drain running out with a handler
+// still at work: Shutdown reports the deadline, and Close then ends the
+// connection at once rather than wait for the handler, whose late response
+// never reaches the client.
+func TestShutdownDeadlineThenClose(t *testing.T) {
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	defer close(release)
+	engine, addr, done := shutdownServer(t, NewHandler(slowHandler(entered, release)))
+	client, _ := stdClient(t)
+	slow := make(chan *stdhttp.Response, 1)
+	go func() {
+		resp, err := client.Get("http://" + addr + "/slow")
+		if err == nil {
+			resp.Body.Close()
+		}
+		slow <- resp
+	}()
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := engine.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Shutdown = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if err := <-done; err != nil {
+		t.Errorf("Run: %v", err)
+	}
+	done <- nil
+	start := time.Now()
+	if err := engine.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Close took %v with a handler running", elapsed)
+	}
+	select {
+	case resp := <-slow:
+		if resp != nil {
+			t.Errorf("request in flight answered %s after Close; want it to fail", resp.Status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client still waits after Close")
+	}
+}
