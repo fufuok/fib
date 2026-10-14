@@ -64,6 +64,9 @@ type transport struct {
 	// writing whether a goroutine is handing it over; see flush.
 	out, spare []byte
 	writing    bool
+	// closeAfterFlush asks whichever goroutine flushes last to close the
+	// connection once it has handed everything over.
+	closeAfterFlush bool
 
 	pool *taskpool.TaskPool
 }
@@ -115,10 +118,12 @@ const maxSpareOut = 256 << 10
 // flush hands what has been framed to the connection. While one goroutine
 // is handing it over, others only add to it, and that goroutine takes what
 // they added too before it stops: frames that streams finish together reach
-// the socket in one write.
+// the socket in one write. So flush may return before what it was called
+// for has been handed over, and a close that has to follow it is asked for
+// with closeAfterFlush rather than made once flush returns.
 func (t *transport) flush() {
 	t.mu.Lock()
-	if t.writing || len(t.out) == 0 {
+	if t.writing {
 		t.mu.Unlock()
 		return
 	}
@@ -141,7 +146,13 @@ func (t *transport) flush() {
 		}
 	}
 	t.writing = false
+	conn := t.conn
+	closing := t.closeAfterFlush && conn != nil
+	t.closeAfterFlush = false
 	t.mu.Unlock()
+	if closing {
+		conn.CloseAfterSend()
+	}
 }
 
 // fail ends the connection for err, with a GOAWAY saying why if it is the
@@ -156,11 +167,9 @@ func (t *transport) fail(err error) {
 		}
 		t.out = appendGoAway(t.out, t.lastPeerID, code, "")
 	}
+	t.closeAfterFlush = true
 	t.mu.Unlock()
 	t.flush()
-	if t.conn != nil {
-		t.conn.CloseAfterSend()
-	}
 }
 
 // onClose ends every stream of a connection that has closed.
@@ -565,12 +574,9 @@ func (t *transport) removeLocked(s *stream) {
 	delete(t.streams, s.id)
 	t.broadcastLocked()
 	if t.goingAway && len(t.streams) == 0 && t.conn != nil {
-		conn := t.conn
 		// Closed after what was framed has gone, which flush hands over.
-		go func() {
-			t.flush()
-			conn.CloseAfterSend()
-		}()
+		t.closeAfterFlush = true
+		go t.flush()
 	}
 }
 

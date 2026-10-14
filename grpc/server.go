@@ -340,12 +340,11 @@ func (s *Server) GracefulStop() {
 		t.mu.Lock()
 		t.goingAway = true
 		t.out = appendGoAway(t.out, t.lastPeerID, errNo, "")
-		idle := len(t.streams) == 0
+		if len(t.streams) == 0 {
+			t.closeAfterFlush = true
+		}
 		t.mu.Unlock()
 		t.flush()
-		if idle {
-			t.conn.CloseAfterSend()
-		}
 	}
 	if drained != nil {
 		<-drained

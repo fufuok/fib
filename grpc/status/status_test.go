@@ -39,3 +39,24 @@ func TestStatus(t *testing.T) {
 		t.Fatal("codes.String")
 	}
 }
+
+// nilStatusError claims a status and has none.
+type nilStatusError struct{}
+
+func (nilStatusError) Error() string       { return "no status" }
+func (nilStatusError) GRPCStatus() *Status { return nil }
+
+// TestStatusEdges covers an error whose GRPCStatus is nil, which is Unknown
+// rather than OK, and the context errors that are neither deadline nor
+// cancellation.
+func TestStatusEdges(t *testing.T) {
+	if s, ok := FromError(nilStatusError{}); ok || s.Code() != codes.Unknown || s.Message() != "no status" {
+		t.Fatalf("FromError of a nil status = %v, %v", s, ok)
+	}
+	if FromContextError(nil) != nil {
+		t.Fatal("FromContextError(nil)")
+	}
+	if s := FromContextError(errors.New("other")); s.Code() != codes.Unknown {
+		t.Fatalf("FromContextError of another error = %v", s)
+	}
+}

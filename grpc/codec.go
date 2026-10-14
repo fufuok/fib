@@ -160,7 +160,13 @@ func (w *pooledGzipWriter) Close() error {
 func (c *gzipCompressor) Decompress(r io.Reader) (io.Reader, error) {
 	z, ok := c.readers.Get().(*gzip.Reader)
 	if !ok {
-		return gzip.NewReader(r)
+		// A new reader goes into the pool too once drained, or the pool
+		// would never hold one.
+		z, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, err
+		}
+		return &pooledGzipReader{Reader: z, pool: &c.readers}, nil
 	}
 	if err := z.Reset(r); err != nil {
 		c.readers.Put(z)

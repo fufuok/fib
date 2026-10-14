@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -33,5 +34,41 @@ func TestMetadata(t *testing.T) {
 	got["k"][0] = "changed"
 	if fmt.Sprint(ValueFromIncomingContext(in, "K")) != "[v]" {
 		t.Fatal("FromIncomingContext did not copy")
+	}
+}
+
+// TestMetadataEdges covers what the common paths skip: setting or appending
+// no values changes nothing, a context without metadata has none, a key it
+// lacks has no values, and odd pairs panic rather than drop a value.
+func TestMetadataEdges(t *testing.T) {
+	md := Pairs("k", "v")
+	md.Set("k")
+	md.Append("k")
+	if md.Len() != 1 || fmt.Sprint(md["k"]) != "[v]" {
+		t.Fatalf("md = %v", md)
+	}
+	ctx := context.Background()
+	if got, ok := FromIncomingContext(ctx); ok || got != nil {
+		t.Fatalf("FromIncomingContext of a bare context = %v, %v", got, ok)
+	}
+	if ValueFromIncomingContext(ctx, "k") != nil {
+		t.Fatal("ValueFromIncomingContext of a bare context")
+	}
+	if ValueFromIncomingContext(NewIncomingContext(ctx, md), "missing") != nil {
+		t.Fatal("ValueFromIncomingContext of a missing key")
+	}
+	odd := strings.Fields("k")
+	for name, f := range map[string]func(){
+		"Pairs":                   func() { Pairs(odd...) },
+		"AppendToOutgoingContext": func() { AppendToOutgoingContext(ctx, odd...) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s of an odd count did not panic", name)
+				}
+			}()
+			f()
+		}()
 	}
 }

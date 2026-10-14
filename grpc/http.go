@@ -341,7 +341,12 @@ func (hs *httpStream) SetTrailer(md metadata.MD) {
 
 // responseHeader sets the fields of the response's header on h.
 func (hs *httpStream) responseHeader(h stdhttp.Header) {
-	h["Content-Type"] = []string{contentType(hs.codec.Name())}
+	// A call that failed for want of a codec has none to name.
+	codecName := "proto"
+	if hs.codec != nil {
+		codecName = hs.codec.Name()
+	}
+	h["Content-Type"] = []string{contentType(codecName)}
 	if hs.sendComp != nil {
 		h["Grpc-Encoding"] = []string{hs.sendComp.Name()}
 	}

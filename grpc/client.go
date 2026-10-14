@@ -216,11 +216,14 @@ func (cc *ClientConn) transport(ctx context.Context, wait bool) (*transport, err
 			}
 			cc.t = nil
 		}
-		if cc.dialing == nil {
-			cc.dialing = make(chan struct{})
+		// Taken before dial, which closes and forgets it at once when the
+		// connect fails at the start.
+		dialing := cc.dialing
+		if dialing == nil {
+			dialing = make(chan struct{})
+			cc.dialing = dialing
 			cc.dial()
 		}
-		dialing := cc.dialing
 		cc.mu.Unlock()
 		select {
 		case <-dialing:
@@ -483,6 +486,9 @@ type clientStream struct {
 	endOnce    sync.Once
 	// received counts the messages of a call whose server does not stream.
 	received int
+	// closeSent records CloseSend, after which SendMsg is the caller's
+	// mistake rather than a call that has ended.
+	closeSent bool
 }
 
 // open opens the call's stream on t. retry reports a connection that turned
@@ -685,6 +691,7 @@ func (cs *clientStream) outcome() error {
 }
 
 func (cs *clientStream) CloseSend() error {
+	cs.closeSent = true
 	s := cs.s
 	t := s.t
 	t.mu.Lock()
@@ -713,7 +720,7 @@ func (cs *clientStream) SendMsg(m any) error {
 		return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", len(data), cs.ci.maxSend)
 	}
 	if err := cs.s.writeMsg(compressed, data); err != nil {
-		if err == errStreamDone && cs.desc.ClientStreams {
+		if err == errStreamDone && cs.closeSent && cs.desc.ClientStreams {
 			return status.Error(codes.Internal, "grpc: SendMsg called after CloseSend")
 		}
 		// The call has ended; RecvMsg says how.
