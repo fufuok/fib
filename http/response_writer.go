@@ -708,6 +708,10 @@ func (c *Context) Finish() error {
 			c.closeAfterResponse()
 		case c.stream != nil:
 			c.stream.abandon()
+		default:
+			if a, ok := c.external.(StreamAbandoner); ok {
+				a.Abandon()
+			}
 		}
 	}
 	return err

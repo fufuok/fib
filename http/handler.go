@@ -252,6 +252,16 @@ type StreamEnder interface {
 	RequestEnded()
 }
 
+// StreamAbandoner is implemented by a Stream that can be given up on when
+// the response its handler began cannot be sent at all: a status or a header
+// the protocol cannot carry, found once the handler is done. Abandon ends the
+// stream, by resetting it, so that the client is not left waiting for an
+// answer that will not come, as a connection of HTTP/1 is closed then. A
+// Stream that does not implement it is left to end some other way.
+type StreamAbandoner interface {
+	Abandon()
+}
+
 // StreamDeadliner is implemented by a Stream whose response, and request
 // body, can be given deadlines of their own, which is what Context's
 // SetWriteDeadline and SetReadDeadline, and so http.ResponseController's,

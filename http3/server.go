@@ -726,10 +726,15 @@ func (sc *serverConn) OnStreamData(s *quic.Stream, data []byte, fin bool) {
 	case nil:
 		if s.Bidirectional() {
 			rs := sc.newRequestStream(s)
-			s.Context = rs
-			if rs != nil {
-				rs.feed(data, fin)
+			if rs == nil {
+				// Refused: what more arrives for it before the reset
+				// takes effect is passed over, and a typed nil here
+				// would be fed as a request stream.
+				s.Context = retiredStream{}
+				return
 			}
+			s.Context = rs
+			rs.feed(data, fin)
 			return
 		}
 		u := newUniStream(&sc.peer, s, sc.fail)
@@ -1689,7 +1694,10 @@ func (rs *requestStream) stopReadTimerLocked() bool {
 	return t.Stop()
 }
 
-var _ fibhttp.StreamDeadliner = (*requestStream)(nil)
+var (
+	_ fibhttp.StreamDeadliner = (*requestStream)(nil)
+	_ fibhttp.StreamAbandoner = (*requestStream)(nil)
+)
 
 // stopWriteTimerLocked stops the write timer, if there is one, and reports
 // whether the caller is to give up the reference it held, which it is to do
@@ -1725,6 +1733,33 @@ func (rs *requestStream) writeTimedOut() {
 	abortStream(rs.s, ErrCodeInternalError)
 	// A handler that has written nothing yet would otherwise keep the
 	// connection holding what it sends for the write it expects.
+	rs.writeDone()
+	rs.sc.untrack(rs)
+}
+
+// Abandon resets a stream whose response cannot be sent, a status or a
+// header HTTP/3 cannot carry found once the handler is done, so that its
+// client is not left waiting; see http.StreamAbandoner.
+func (rs *requestStream) Abandon() {
+	rs.mu.Lock()
+	if rs.closed || rs.responded && !rs.streaming {
+		rs.mu.Unlock()
+		return
+	}
+	rs.closed = true
+	stopped := rs.stopWriteTimerLocked()
+	readStopped := rs.stopReadTimerLocked()
+	rs.mu.Unlock()
+	if stopped {
+		rs.unref()
+	}
+	if readStopped {
+		rs.unref()
+	}
+	rs.failBody(fibhttp.ErrBodyAbandoned)
+	abortStream(rs.s, ErrCodeInternalError)
+	// Nothing will be written for the write the connection holds its
+	// output for.
 	rs.writeDone()
 	rs.sc.untrack(rs)
 }
