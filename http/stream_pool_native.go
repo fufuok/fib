@@ -39,8 +39,9 @@ func NewStreamPool(config StreamPoolConfig) *StreamPool {
 }
 
 // poolFor returns the pool conn's requests run on, looking it up the first
-// time the connection asks and keeping it on gate after that. It is nil once
-// the engine has closed, and the request is then served by its reader.
+// time the connection asks and keeping it on gate after that. Once the
+// engine has closed it is a pool that has stopped, which takes no work, and
+// the request is then served by its reader.
 func (p *StreamPool) poolFor(gate *StreamGate, conn *fib.Connection) *taskpool.TaskPool {
 	if gate.pool == nil {
 		gate.pool = handlerPool(conn)
@@ -159,10 +160,7 @@ func (p *StreamPool) Submit(b *StreamBatch) {
 	if len(b.tasks) == 0 {
 		return
 	}
-	n := 0
-	if b.pool != nil {
-		n = b.pool.GoTasks(b.tasks)
-	}
+	n := b.pool.GoTasks(b.tasks)
 	for _, task := range b.tasks[n:] {
 		// The pool has stopped taking work; the request is served here.
 		task.(*streamTask).run()
@@ -195,7 +193,7 @@ func (p *StreamPool) admit(gate *StreamGate) bool {
 
 // submit hands an admitted request to pool.
 func (p *StreamPool) submit(pool *taskpool.TaskPool, task *streamTask) {
-	if pool == nil || !pool.GoTask(task) {
+	if !pool.GoTask(task) {
 		// The pool has stopped taking work; the request is served here.
 		task.run()
 	}
@@ -249,7 +247,7 @@ func (t *streamTask) run() {
 // it — a connection closing, or a stream reset. Those never
 // get a goroutine of their own.
 func runOnStreams(conn *fib.Connection, fn func()) {
-	if pool := handlerPool(conn); pool == nil || !pool.Go(fn) {
+	if !handlerPool(conn).Go(fn) {
 		fn()
 	}
 }
@@ -258,7 +256,7 @@ func runOnStreams(conn *fib.Connection, fn func()) {
 // may take, on the pool conn's request handlers run on, or on a goroutine of
 // its own once that pool has stopped taking work: never here.
 func cancelElsewhere(conn *fib.Connection, fn func()) {
-	if pool := handlerPool(conn); pool == nil || !pool.Go(fn) {
+	if !handlerPool(conn).Go(fn) {
 		go fn()
 	}
 }

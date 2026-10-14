@@ -883,7 +883,9 @@ func (sc *h2ServerConn) handleTrailers(st *h2ServerStream, fields []hpack.Header
 	if remoteDone {
 		return &H2StreamError{StreamID: st.id, Code: H2StreamClosed}
 	}
-	if !endStream || st.req == nil {
+	if !endStream || st.req == nil || st.tunnel != nil {
+		// An extended CONNECT's stream carries DATA alone after its header
+		// (RFC 9113 section 8.5), whether or not its tunnel was accepted.
 		return &H2StreamError{StreamID: st.id, Code: H2ProtocolError}
 	}
 	if tooLarge {
@@ -1040,14 +1042,13 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 	if st.declared >= 0 && st.declared != int64(len(st.body)) {
 		return &H2StreamError{StreamID: st.id, Code: H2ProtocolError}
 	}
+	// The stream's response has not all gone: one that has is forgotten by
+	// then, unless it is a tunnel's, whose DATA and trailers never get here.
 	sc.mu.Lock()
 	st.remoteDone = true
-	done := st.localDone
-	if done {
-		sc.forgetLocked(st)
-	}
 	sc.mu.Unlock()
-	if done || st.req == nil {
+	if st.req == nil {
+		// Rejected with its header: the answer has been sent.
 		return nil
 	}
 	// The body goes to the Context, which gives its buffer back to the pool
@@ -1389,6 +1390,18 @@ func (sc *h2ServerConn) resetStream(id uint32, code H2ErrorCode) {
 	sc.sendLocked(h2AppendRSTStream(nil, id, code))
 	sc.mu.Unlock()
 	sc.closeIfDone()
+}
+
+// abandon resets a stream whose response could not be sent, unless it has
+// ended already, so that its client hears of it rather than waiting on it.
+func (st *h2ServerStream) abandon() {
+	sc := st.sc
+	sc.mu.Lock()
+	live := !sc.closed && !st.reset && sc.streams[st.id] == st
+	sc.mu.Unlock()
+	if live {
+		sc.resetStream(st.id, H2InternalError)
+	}
 }
 
 // closeIfDone closes a connection that is going away once its last stream

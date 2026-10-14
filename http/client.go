@@ -1057,7 +1057,7 @@ func (cc *clientConn) sendBody(r *clientRequest) {
 			} else {
 				err = cc.conn.Send(p)
 			}
-			if err == nil && outputwait.Wait != nil {
+			if err == nil {
 				err = outputwait.Wait(cc.conn, uploadQueued)
 			}
 			return err

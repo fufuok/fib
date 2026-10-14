@@ -698,12 +698,17 @@ func (c *Context) Finish() error {
 	}
 	w.finished = true
 	err := c.finish(w)
-	if err != nil && c.isHTTP1() && !c.wrote {
-		// Nothing can answer the request now, and a connection kept open
-		// would leave its client waiting, or reading the response to the
-		// next request it pipelined as this one's.
-		c.closing = true
-		c.closeAfterResponse()
+	if err != nil && !c.wrote {
+		// Nothing can answer the request now. A connection kept open would
+		// leave its client waiting, or reading the response to the next
+		// request it pipelined as this one's, and so would a stream.
+		switch {
+		case c.isHTTP1():
+			c.closing = true
+			c.closeAfterResponse()
+		case c.stream != nil:
+			c.stream.abandon()
+		}
 	}
 	return err
 }

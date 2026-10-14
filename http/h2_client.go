@@ -218,10 +218,7 @@ func (hc *h2ClientConn) sendBody(st *h2ClientStream) {
 			if !live {
 				return errStreamGone
 			}
-			if outputwait.Wait != nil {
-				return outputwait.Wait(hc.cc.conn, uploadQueued)
-			}
-			return nil
+			return outputwait.Wait(hc.cc.conn, uploadQueued)
 		})
 	}
 	if err == nil {
