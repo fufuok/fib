@@ -11,7 +11,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/arpc"
@@ -26,9 +29,26 @@ type Math struct{}
 
 func (Math) Sum(ctx context.Context, req *SumReq, rsp *SumRsp) { rsp.Sum = req.A + req.B }
 
+// fatal reports a startup error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8888", "listen address")
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, nil); err != nil {
+		fatal(err)
+	}
+}
+
+// run serves until ctx ends. ready, if not nil, is told the address once the
+// server is listening.
+func run(ctx context.Context, args []string, out io.Writer, ready func(addr string)) error {
+	flags := flag.NewFlagSet("server", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:8888", "listen address")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	server := arpc.NewServer()
 	// Handlers run on the engine's handler pool unless told otherwise; an
@@ -42,7 +62,7 @@ func main() {
 		ctx.Write(s)
 	}, false)
 	if err := server.Handler.Register("Math", Math{}); err != nil {
-		example.Fatal(err)
+		return err
 	}
 	server.Handler.HandleStream("/upper", func(s *arpc.Stream) {
 		defer s.CloseSend()
@@ -50,7 +70,7 @@ func main() {
 			var msg string
 			if err := s.Recv(&msg); err != nil {
 				if err != io.EOF {
-					fmt.Println("stream:", err)
+					fmt.Fprintln(out, "stream:", err)
 				}
 				return
 			}
@@ -60,14 +80,14 @@ func main() {
 		}
 	})
 	server.Handler.HandleConnected(func(c *arpc.Client) {
-		fmt.Printf("connected: %s\n", c.Conn().RemoteAddr())
+		fmt.Fprintf(out, "connected: %s\n", c.Conn().RemoteAddr())
 	})
 
 	config := fib.DefaultConfig()
 	config.Addr = *addr
 	engine, err := fib.Bind(config, server)
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	example.Serve(engine, fmt.Sprintf("arpc server listening on %s", *addr))
+	return example.Serve(ctx, out, ready, "arpc server listening on %s", engine)
 }

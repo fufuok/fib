@@ -10,17 +10,35 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"time"
 
 	"github.com/lesismal/fib/examples/example"
 	"github.com/lesismal/fib/websocket"
 )
 
+// fatal reports an error and exits; a test replaces it.
+var fatal = example.Fatal
+
+// echoTimeout bounds the wait for each echo; a test shortens it.
+var echoTimeout = 5 * time.Second
+
 func main() {
-	url := flag.String("url", "ws://127.0.0.1:8081/ws", "server URL")
-	count := flag.Int("n", 5, "messages to send")
-	compress := flag.Bool("compress", false, "offer permessage-deflate compression")
-	flag.Parse()
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fatal(err)
+	}
+}
+
+func run(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("client", flag.ContinueOnError)
+	flags.SetOutput(out)
+	url := flags.String("url", "ws://127.0.0.1:8081/ws", "server URL")
+	count := flags.Int("n", 5, "messages to send")
+	compress := flags.Bool("compress", false, "offer permessage-deflate compression")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	engine, stop := example.ClientEngine()
 	defer stop()
@@ -40,28 +58,29 @@ func main() {
 	// Wait blocks this goroutine until it is done.
 	conn, resp, err := dialer.Go(*url, nil, handler).Wait()
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	fmt.Printf("connected: %s\n", resp.Status)
+	fmt.Fprintf(out, "connected: %s\n", resp.Status)
 
 	for i := 1; i <= *count; i++ {
 		if err := conn.WriteText(example.Message(i)); err != nil {
-			example.Fatal(err)
+			return err
 		}
 		select {
 		case echo := <-messages:
-			fmt.Printf("echo: %s\n", echo)
+			fmt.Fprintf(out, "echo: %s\n", echo)
 		case err := <-closed:
-			example.Fatal(fmt.Errorf("connection closed: %v", err))
-		case <-time.After(5 * time.Second):
-			example.Fatal(errors.New("timed out waiting for the echo"))
+			return fmt.Errorf("connection closed: %v", err)
+		case <-time.After(echoTimeout):
+			return errors.New("timed out waiting for the echo")
 		}
 	}
 	// Close runs the closing handshake; OnClose reports its outcome.
 	_ = conn.Close(websocket.CloseNormal, "done")
 	select {
 	case err := <-closed:
-		fmt.Println("closed:", err)
+		fmt.Fprintln(out, "closed:", err)
 	case <-time.After(3 * time.Second):
 	}
+	return nil
 }

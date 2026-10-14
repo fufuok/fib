@@ -21,9 +21,12 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -35,16 +38,40 @@ import (
 	"github.com/lesismal/fib/websocket"
 )
 
+// How long the client waits for a whole response, a WebSocket dial, an echo
+// and a close; a test shortens them.
+var (
+	responseTimeout = 30 * time.Second
+	dialTimeout     = 10 * time.Second
+	echoTimeout     = 10 * time.Second
+	closeTimeout    = 5 * time.Second
+)
+
+// fatal reports an error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8446", "gateway TLS address")
-	plainAddr := flag.String("plain-addr", "127.0.0.1:8081", "gateway cleartext address; empty to skip the ws:// check")
-	size := flag.Int64("size", 8<<20, "bytes to download")
-	certFlags := certs.ClientFlagsWithCA(flag.CommandLine, certs.GatewayCertFile)
-	flag.Parse()
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fatal(err)
+	}
+}
+
+// run drives the gateway, printing the outcome of each check to out, and
+// fails if any check does.
+func run(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("client", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:8446", "gateway TLS address")
+	plainAddr := flags.String("plain-addr", "127.0.0.1:8081", "gateway cleartext address; empty to skip the ws:// check")
+	size := flags.Int64("size", 8<<20, "bytes to download")
+	certFlags := certs.ClientFlagsWithCA(flags, certs.GatewayCertFile)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	tlsConfig, err := certFlags.Config()
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	engine, stop := example.ClientEngine()
 	defer stop()
@@ -62,9 +89,9 @@ func main() {
 		for _, upstream := range []string{"h1", "h2", "h3"} {
 			base := "https://" + *addr + "/" + upstream
 			label := fmt.Sprintf("%-8s -> gateway -> %s", client.name, upstream)
-			failed += check(label, echo(client.doer, base))
-			failed += check(label, download(client.doer, base, *size))
-			failed += check(label, stream(client.doer, base))
+			failed += check(out, label, echo(client.doer, base))
+			failed += check(out, label, download(client.doer, base, *size))
+			failed += check(out, label, stream(client.doer, base))
 		}
 	}
 	dialer := func(secure bool) *websocket.Dialer {
@@ -76,23 +103,24 @@ func main() {
 	}
 	for _, upstream := range []string{"h1", "h2", "h3"} {
 		if *plainAddr != "" {
-			failed += check("ws://  -> gateway -> "+upstream, relay(dialer(false), "ws://"+*plainAddr+"/"+upstream+"/ws"))
+			failed += check(out, "ws://  -> gateway -> "+upstream, relay(dialer(false), "ws://"+*plainAddr+"/"+upstream+"/ws"))
 		}
-		failed += check("wss:// -> gateway -> "+upstream, relay(dialer(true), "wss://"+*addr+"/"+upstream+"/ws"))
+		failed += check(out, "wss:// -> gateway -> "+upstream, relay(dialer(true), "wss://"+*addr+"/"+upstream+"/ws"))
 	}
 	if failed > 0 {
-		example.Fatal(fmt.Errorf("%d checks failed", failed))
+		return fmt.Errorf("%d checks failed", failed)
 	}
-	fmt.Println("all checks passed")
+	fmt.Fprintln(out, "all checks passed")
+	return nil
 }
 
 // check prints the outcome of one exchange, and counts a failure.
-func check(label string, outcome outcome) int {
+func check(out io.Writer, label string, outcome outcome) int {
 	if outcome.err != nil {
-		fmt.Printf("FAIL %s %s: %v\n", label, outcome.what, outcome.err)
+		fmt.Fprintf(out, "FAIL %s %s: %v\n", label, outcome.what, outcome.err)
 		return 1
 	}
-	fmt.Printf("ok   %s %s: %s\n", label, outcome.what, outcome.detail)
+	fmt.Fprintf(out, "ok   %s %s: %s\n", label, outcome.what, outcome.detail)
 	return 0
 }
 
@@ -174,10 +202,11 @@ func fetch(d doer, req *http.Request, keep bool, onPiece func(offset int64, piec
 	})
 	select {
 	case <-done:
-	case <-time.After(30 * time.Second):
-		r.err = fmt.Errorf("timed out")
+		return r
+	case <-time.After(responseTimeout):
+		// The callbacks still own r, and may yet write to it.
+		return reply{err: errors.New("timed out")}
 	}
-	return r
 }
 
 func echo(d doer, base string) outcome {
@@ -273,7 +302,7 @@ func relay(dialer *websocket.Dialer, url string) outcome {
 			return out
 		}
 		conn = d.conn
-	case <-time.After(10 * time.Second):
+	case <-time.After(dialTimeout):
 		out.err = fmt.Errorf("dial timed out")
 		return out
 	}
@@ -284,7 +313,7 @@ func relay(dialer *websocket.Dialer, url string) outcome {
 				return fmt.Errorf("echoed %d bytes, want %d", len(got), len(want))
 			}
 			return nil
-		case <-time.After(10 * time.Second):
+		case <-time.After(echoTimeout):
 			return fmt.Errorf("no echo")
 		}
 	}
@@ -305,7 +334,7 @@ func relay(dialer *websocket.Dialer, url string) outcome {
 	select {
 	case how := <-closed:
 		out.detail = fmt.Sprintf("subprotocol %q, text and %d KiB binary echoed, closed %s", conn.Subprotocol(), len(big)>>10, how)
-	case <-time.After(5 * time.Second):
+	case <-time.After(closeTimeout):
 		out.err = fmt.Errorf("never closed")
 	}
 	return out

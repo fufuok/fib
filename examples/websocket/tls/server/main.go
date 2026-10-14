@@ -9,9 +9,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io"
 	stdhttp "net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/examples/certs"
@@ -20,33 +25,50 @@ import (
 	"github.com/lesismal/fib/websocket"
 )
 
+// fatal reports a startup error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8444", "listen address")
-	compress := flag.Bool("compress", false, "accept permessage-deflate compression")
-	certFlags := certs.RegisterServerFlags()
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, nil); err != nil {
+		fatal(err)
+	}
+}
+
+// run serves until ctx ends. ready, if not nil, is told the address once the
+// server is listening.
+func run(ctx context.Context, args []string, out io.Writer, ready func(addr string)) error {
+	flags := flag.NewFlagSet("server", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:8444", "listen address")
+	compress := flags.Bool("compress", false, "accept permessage-deflate compression")
+	certFlags := certs.ServerFlagsOn(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	tlsConfig, err := certFlags.Config()
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	config := fib.DefaultConfig()
 	config.Addr = *addr
 	// The WebSocket handler is the same one the plain server uses:
 	// fibtls.NewServer decrypts in front of it and encrypts what it sends.
-	engine, err := fib.Bind(config, fibtls.NewServer(tlsConfig, echo(*compress)))
+	engine, err := fib.Bind(config, fibtls.NewServer(tlsConfig, echo(out, *compress)))
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	example.Serve(engine, fmt.Sprintf("WebSocket echo server listening on wss://%s", *addr))
+	return example.Serve(ctx, out, ready, "WebSocket echo server listening on wss://%s", engine)
 }
 
-func echo(compress bool) fib.Handler {
+func echo(out io.Writer, compress bool) fib.Handler {
 	config := websocket.DefaultConfig()
 	config.EnableCompression = compress
 	return websocket.NewHandlerWithConfig(config, websocket.HandlerFuncs{
 		Open: func(_ *websocket.Connection, r *stdhttp.Request) {
-			fmt.Printf("%s: open %s\n", r.RemoteAddr, r.URL.Path)
+			fmt.Fprintf(out, "%s: open %s\n", r.RemoteAddr, r.URL.Path)
 		},
 		Message: func(c *websocket.Connection, opcode websocket.Opcode, data []byte) {
 			if err := c.WriteMessage(opcode, data); err != nil {
@@ -54,7 +76,7 @@ func echo(compress bool) fib.Handler {
 			}
 		},
 		Close: func(_ *websocket.Connection, code uint16, reason string, err error) {
-			fmt.Printf("closed: code=%d reason=%q error=%v\n", code, reason, err)
+			fmt.Fprintf(out, "closed: code=%d reason=%q error=%v\n", code, reason, err)
 		},
 	})
 }

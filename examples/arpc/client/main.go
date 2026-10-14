@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/lesismal/fib/arpc"
@@ -19,16 +20,29 @@ import (
 type SumReq struct{ A, B int }
 type SumRsp struct{ Sum int }
 
+// fatal reports an error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8888", "server address")
-	count := flag.Int("n", 3, "calls to make")
-	flag.Parse()
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fatal(err)
+	}
+}
+
+func run(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("client", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:8888", "server address")
+	count := flags.Int("n", 3, "calls to make")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	engine, stop := example.ClientEngine()
 	defer stop()
 	client, err := arpc.Dial(engine, "tcp", *addr, 3*time.Second, nil)
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	// The client stops before its engine closes.
 	defer client.Stop()
@@ -36,9 +50,9 @@ func main() {
 	for i := 1; i <= *count; i++ {
 		var echo string
 		if err := client.Call("/echo", example.Message(i), &echo, 5*time.Second); err != nil {
-			example.Fatal(err)
+			return err
 		}
-		fmt.Printf("echo: %s\n", echo)
+		fmt.Fprintf(out, "echo: %s\n", echo)
 	}
 
 	done := make(chan struct{})
@@ -48,23 +62,23 @@ func main() {
 		if err == nil {
 			err = ctx.Bind(&echo)
 		}
-		fmt.Printf("async echo: %q, %v\n", echo, err)
+		fmt.Fprintf(out, "async echo: %q, %v\n", echo, err)
 	}, 5*time.Second)
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	<-done
 
 	var sum SumRsp
 	if err := client.Call("Math.Sum", &SumReq{A: 2, B: 3}, &sum, 5*time.Second); err != nil {
-		example.Fatal(err)
+		return err
 	}
-	fmt.Printf("Math.Sum(2, 3) = %d\n", sum.Sum)
+	fmt.Fprintf(out, "Math.Sum(2, 3) = %d\n", sum.Sum)
 
 	stream := client.NewStream("/upper")
 	for _, word := range []string{"fib", "arpc"} {
 		if err := stream.Send(word); err != nil {
-			example.Fatal(err)
+			return err
 		}
 	}
 	stream.CloseSend()
@@ -72,10 +86,11 @@ func main() {
 		var word string
 		if err := stream.Recv(&word); err != nil {
 			if err != io.EOF {
-				example.Fatal(err)
+				return err
 			}
 			break
 		}
-		fmt.Printf("stream: %s\n", word)
+		fmt.Fprintf(out, "stream: %s\n", word)
 	}
+	return nil
 }

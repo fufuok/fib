@@ -10,9 +10,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io"
 	stdhttp "net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/examples/example"
@@ -22,13 +27,30 @@ import (
 	"github.com/lesismal/fib/middleware/requestid"
 )
 
+// fatal reports a startup error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, nil); err != nil {
+		fatal(err)
+	}
+}
+
+// run serves until ctx ends. ready, if not nil, is told the address once the
+// server is listening.
+func run(ctx context.Context, args []string, out io.Writer, ready func(addr string)) error {
+	flags := flag.NewFlagSet("server", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:8080", "listen address")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	r := fibhttp.NewRouter()
 	// Middleware on the root router sees every request, 404s included.
-	r.Use(recover.New(), logger.New())
+	r.Use(recover.New(), logger.New(logger.Config{Output: out}))
 
 	r.Get("/", func(c *fibhttp.Context) {
 		reply(c, "index")
@@ -55,9 +77,9 @@ func main() {
 	config.Addr = *addr
 	engine, err := fib.Bind(config, fibhttp.NewHandler(r))
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	example.Serve(engine, fmt.Sprintf("HTTP router listening on http://%s", *addr))
+	return example.Serve(ctx, out, ready, "HTTP router listening on http://%s", engine)
 }
 
 // api is a router of its own, which routes what is left of the path under

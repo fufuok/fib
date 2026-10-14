@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
+	"os"
 	"strings"
 
 	"github.com/lesismal/fib/examples/certs"
@@ -18,15 +19,28 @@ import (
 	"github.com/lesismal/fib/http3"
 )
 
+// fatal reports an error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	url := flag.String("url", "https://127.0.0.1:8445/echo", "server URL")
-	count := flag.Int("n", 5, "requests to send")
-	certFlags := certs.RegisterClientFlags()
-	flag.Parse()
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fatal(err)
+	}
+}
+
+func run(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("client", flag.ContinueOnError)
+	flags.SetOutput(out)
+	url := flags.String("url", "https://127.0.0.1:8445/echo", "server URL")
+	count := flags.Int("n", 5, "requests to send")
+	certFlags := certs.ClientFlagsOn(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	tlsConfig, err := certFlags.Config()
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	// The client dials UDP through an engine of any kind; this one has no
 	// listener of its own.
@@ -41,13 +55,14 @@ func main() {
 	for i := 1; i <= *count; i++ {
 		req, err := stdhttp.NewRequest(stdhttp.MethodPost, *url, strings.NewReader(example.Message(i)))
 		if err != nil {
-			example.Fatal(err)
+			return err
 		}
 		resp, err := client.Go(req).Wait()
 		if err != nil {
-			example.Fatal(err)
+			return err
 		}
 		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("%s %s: %s\n", resp.Proto, resp.Status, body)
+		fmt.Fprintf(out, "%s %s: %s\n", resp.Proto, resp.Status, body)
 	}
+	return nil
 }

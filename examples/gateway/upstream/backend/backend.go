@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
+	"net"
 	stdhttp "net/http"
 	"strconv"
 	"time"
@@ -31,8 +32,9 @@ func DefaultHandler() fibhttp.HandlerFunc {
 	return Handler(websocket.NewHandlerWithConfig(config, echoWebSocket()))
 }
 
-// NewEngines binds the TLS engine, then the HTTP/3 one, then the cleartext
-// one if plainAddr is not empty. Each is unstarted.
+// NewEngines binds the TLS engine, then the HTTP/3 one on the same port, then
+// the cleartext one if plainAddr is not empty. Each is unstarted. A port of 0
+// in addr has the system choose one for TCP, which UDP then shares.
 func NewEngines(tlsConfig *tls.Config, addr, plainAddr string) ([]*fib.Engine, error) {
 	return NewEnginesFor(DefaultHandler(), tlsConfig, addr, plainAddr)
 }
@@ -50,12 +52,13 @@ func NewEnginesFor(handler fibhttp.Handler, tlsConfig *tls.Config, addr, plainAd
 	}
 	udpConfig := fib.DefaultConfig()
 	udpConfig.Network = "udp"
-	udpConfig.Addr = addr
+	udpConfig.Addr = samePort(addr, tcp)
 	h3Config := http3.DefaultConfig()
 	h3Config.TLSConfig = tlsConfig
 	h3Config.MaxBodyBytes = 256 << 20
 	udp, err := fib.Bind(udpConfig, http3.NewHandlerWithConfig(h3Config, handler))
 	if err != nil {
+		_ = tcp.Close()
 		return nil, err
 	}
 	engines := []*fib.Engine{tcp, udp}
@@ -64,11 +67,21 @@ func NewEnginesFor(handler fibhttp.Handler, tlsConfig *tls.Config, addr, plainAd
 		plainConfig.Addr = plainAddr
 		plain, err := fib.Bind(plainConfig, fibhttp.NewHandlerWithConfig(httpConfig, handler))
 		if err != nil {
+			_ = udp.Close()
+			_ = tcp.Close()
 			return nil, err
 		}
 		engines = append(engines, plain)
 	}
 	return engines, nil
+}
+
+// samePort is addr with the port tcp listens on, which is addr's own unless
+// that was 0: it is where a UDP engine that shares the TCP one's port binds.
+func samePort(addr string, tcp *fib.Engine) string {
+	host, _, _ := net.SplitHostPort(addr)
+	local, _ := tcp.LocalAddr()
+	return net.JoinHostPort(host, strconv.Itoa(local.Port))
 }
 
 func echoWebSocket() websocket.Handler {

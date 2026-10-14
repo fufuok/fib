@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/lesismal/fib/examples/example"
@@ -19,15 +20,28 @@ import (
 	"github.com/lesismal/fib/grpc/status"
 )
 
+// fatal reports an error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:50051", "server address")
-	flag.Parse()
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fatal(err)
+	}
+}
+
+func run(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("client", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:50051", "server address")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	engine, stop := example.ClientEngine()
 	defer stop()
 	conn, err := grpc.NewClient(*addr, grpc.WithEngine(engine))
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	// The connection closes before its engine does.
 	defer conn.Close()
@@ -37,16 +51,16 @@ func main() {
 
 	reply, err := client.SayHello(ctx, &greeter.HelloRequest{Name: "fib"})
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	fmt.Println(reply.Message)
+	fmt.Fprintln(out, reply.Message)
 
 	_, err = client.SayHello(ctx, &greeter.HelloRequest{})
-	fmt.Printf("refused: %s: %s\n", status.Code(err), status.Convert(err).Message())
+	fmt.Fprintf(out, "refused: %s: %s\n", status.Code(err), status.Convert(err).Message())
 
 	stream, err := client.SayHellos(ctx, &greeter.HelloRequest{Name: "stream"})
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	for {
 		reply, err := stream.Recv()
@@ -54,8 +68,9 @@ func main() {
 			break
 		}
 		if err != nil {
-			example.Fatal(err)
+			return err
 		}
-		fmt.Println(reply.Message)
+		fmt.Fprintln(out, reply.Message)
 	}
+	return nil
 }

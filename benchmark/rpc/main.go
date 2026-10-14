@@ -14,6 +14,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -24,6 +25,7 @@ import (
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/arpc"
+	"github.com/lesismal/fib/examples/example"
 	"github.com/lesismal/fib/examples/grpc/greeter"
 	"github.com/lesismal/fib/grpc"
 )
@@ -37,19 +39,34 @@ func (gsrv) SayHellos(*greeter.HelloRequest, grpc.ServerStreamingServer[greeter.
 	return nil
 }
 
-func fatal(err error) { fmt.Fprintln(os.Stderr, "error:", err); os.Exit(1) }
+// fatal reports an error and exits; a test replaces it.
+var fatal = example.Fatal
 
 func main() {
-	proto := flag.String("proto", "arpc", "arpc or grpc")
-	role := flag.String("role", "server", "server or client")
-	addr := flag.String("addr", "127.0.0.1:9100", "address")
-	coalesce := flag.Bool("coalesce", true, "Config.CoalesceWrites of the engine (the server's, and the client's unless -client-coalesce says otherwise)")
-	clientCoalesce := flag.String("client-coalesce", "", `Config.CoalesceWrites of the client's engine, "true" or "false"; empty takes -coalesce`)
-	conns := flag.Int("conns", 16, "client connections")
-	callers := flag.Int("callers", 64, "callers per connection")
-	dur := flag.Duration("dur", 15*time.Second, "duration")
-	size := flag.Int("size", 64, "payload bytes")
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, nil); err != nil {
+		fatal(err)
+	}
+}
+
+// run is the server, which serves until ctx ends and tells ready, if not nil,
+// its address once it is listening, or the client, which prints its result.
+func run(ctx context.Context, args []string, out io.Writer, ready func(addr string)) error {
+	flags := flag.NewFlagSet("rpc", flag.ContinueOnError)
+	flags.SetOutput(out)
+	proto := flags.String("proto", "arpc", "arpc or grpc")
+	role := flags.String("role", "server", "server or client")
+	addr := flags.String("addr", "127.0.0.1:9100", "address")
+	coalesce := flags.Bool("coalesce", true, "Config.CoalesceWrites of the engine (the server's, and the client's unless -client-coalesce says otherwise)")
+	clientCoalesce := flags.String("client-coalesce", "", `Config.CoalesceWrites of the client's engine, "true" or "false"; empty takes -coalesce`)
+	conns := flags.Int("conns", 16, "client connections")
+	callers := flags.Int("callers", 64, "callers per connection")
+	dur := flags.Duration("dur", 15*time.Second, "duration")
+	size := flags.Int("size", 64, "payload bytes")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	config := fib.DefaultConfig()
 	config.CoalesceWrites = *coalesce
@@ -74,19 +91,9 @@ func main() {
 		}
 		engine, err := fib.Bind(config, h)
 		if err != nil {
-			fatal(err)
+			return err
 		}
-		go func() {
-			c := make(chan os.Signal, 1)
-			signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-			<-c
-			engine.Stop()
-		}()
-		fmt.Println("listening", *addr)
-		if err := engine.Run(); err != nil {
-			fatal(err)
-		}
-		return
+		return example.Serve(ctx, out, ready, "listening %s", engine)
 	}
 
 	switch *clientCoalesce {
@@ -94,74 +101,78 @@ func main() {
 	case "true", "false":
 		config.CoalesceWrites = *clientCoalesce == "true"
 	default:
-		fatal(fmt.Errorf("-client-coalesce must be true or false, not %q", *clientCoalesce))
+		return fmt.Errorf("-client-coalesce must be true or false, not %q", *clientCoalesce)
 	}
 	engine, err := fib.NewEngine(config, nil)
 	if err != nil {
-		fatal(err)
+		return err
 	}
-	go engine.Run()
+	stopEngine := example.Start(engine)
+	defer stopEngine()
 	payload := strings.Repeat("x", *size)
+	// calls counts the calls that succeeded, fails those that did not.
 	var calls, fails atomic.Int64
 	var stop atomic.Bool
 	var wg sync.WaitGroup
-	call := make([]func(), 0, *conns)
+	call := make([]func() error, 0, *conns)
 	var closers []func()
+	// The connections close before the engine stops.
+	defer func() {
+		for _, c := range closers {
+			c()
+		}
+	}()
 	for i := 0; i < *conns; i++ {
 		if *proto == "arpc" {
 			c, err := arpc.Dial(engine, "tcp", *addr, 5*time.Second, nil)
 			if err != nil {
-				fatal(err)
+				return err
 			}
 			closers = append(closers, c.Stop)
-			call = append(call, func() {
+			call = append(call, func() error {
 				var rsp string
-				if err := c.Call("/echo", payload, &rsp, 10*time.Second); err != nil {
-					fails.Add(1)
-				}
+				return c.Call("/echo", payload, &rsp, 10*time.Second)
 			})
 		} else {
 			cc, err := grpc.NewClient(*addr, grpc.WithEngine(engine))
 			if err != nil {
-				fatal(err)
+				return err
 			}
 			closers = append(closers, func() { cc.Close() })
 			cl := greeter.NewGreeterClient(cc)
-			call = append(call, func() {
+			call = append(call, func() error {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				if _, err := cl.SayHello(ctx, &greeter.HelloRequest{Name: payload}); err != nil {
-					fails.Add(1)
-				}
+				_, err := cl.SayHello(ctx, &greeter.HelloRequest{Name: payload})
+				return err
 			})
 		}
 	}
 	// warm up
 	for _, f := range call {
-		f()
+		_ = f()
 	}
 	start := time.Now()
 	for _, f := range call {
 		for j := 0; j < *callers; j++ {
 			wg.Add(1)
-			go func(f func()) {
+			go func(f func() error) {
 				defer wg.Done()
 				for !stop.Load() {
-					f()
-					calls.Add(1)
+					if f() != nil {
+						fails.Add(1)
+					} else {
+						calls.Add(1)
+					}
 				}
 			}(f)
 		}
 	}
 	time.Sleep(*dur)
 	stop.Store(true)
-	n := calls.Load()
+	n, f := calls.Load(), fails.Load()
 	el := time.Since(start)
 	wg.Wait()
-	for _, c := range closers {
-		c()
-	}
-	f := fails.Load()
-	fmt.Printf("calls=%d fails=%d rate=%.0f/s\n", n-f, f, float64(n-f)/el.Seconds())
-	engine.Stop()
+	fmt.Fprintf(out, "calls=%d fails=%d rate=%.0f/s\n", n, f, float64(n)/el.Seconds())
+	return nil
 }

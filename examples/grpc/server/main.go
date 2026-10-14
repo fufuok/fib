@@ -9,6 +9,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"syscall"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/examples/example"
@@ -36,9 +40,26 @@ func (server) SayHellos(in *greeter.HelloRequest, stream grpc.ServerStreamingSer
 	return nil
 }
 
+// fatal reports a startup error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:50051", "listen address")
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, nil); err != nil {
+		fatal(err)
+	}
+}
+
+// run serves until ctx ends. ready, if not nil, is told the address once the
+// server is listening.
+func run(ctx context.Context, args []string, out io.Writer, ready func(addr string)) error {
+	flags := flag.NewFlagSet("server", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:50051", "listen address")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	// Every call runs on the engine's handler pool; grpc.TaskPool(pool)
 	// would run them on a pool of the program's own instead.
@@ -49,7 +70,7 @@ func main() {
 	config.Addr = *addr
 	engine, err := fib.Bind(config, s)
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	example.Serve(engine, fmt.Sprintf("gRPC server listening on %s", *addr))
+	return example.Serve(ctx, out, ready, "gRPC server listening on %s", engine)
 }

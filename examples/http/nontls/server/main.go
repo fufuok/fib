@@ -10,22 +10,43 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	stdhttp "net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/examples/example"
 	fibhttp "github.com/lesismal/fib/http"
 )
 
+// fatal reports a startup error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
-	dir := flag.String("dir", "", "directory to serve under /files/")
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, nil); err != nil {
+		fatal(err)
+	}
+}
+
+// run serves until ctx ends. ready, if not nil, is told the address once the
+// server is listening.
+func run(ctx context.Context, args []string, out io.Writer, ready func(addr string)) error {
+	flags := flag.NewFlagSet("server", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:8080", "listen address")
+	dir := flags.String("dir", "", "directory to serve under /files/")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	handler := echo()
 	if *dir != "" {
@@ -35,9 +56,9 @@ func main() {
 	config.Addr = *addr
 	engine, err := fib.Bind(config, fibhttp.NewHandler(handler))
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	example.Serve(engine, fmt.Sprintf("HTTP echo server listening on http://%s", *addr))
+	return example.Serve(ctx, out, ready, "HTTP echo server listening on http://%s", engine)
 }
 
 func echo() fibhttp.HandlerFunc {

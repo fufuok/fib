@@ -11,6 +11,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"time"
 
 	fib "github.com/lesismal/fib"
@@ -19,15 +21,31 @@ import (
 	fibtls "github.com/lesismal/fib/tls"
 )
 
+// fatal reports an error and exits; a test replaces it.
+var fatal = example.Fatal
+
+// echoTimeout bounds the wait for each echo; a test shortens it.
+var echoTimeout = 5 * time.Second
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:9443", "server address")
-	count := flag.Int("n", 5, "messages to send")
-	certFlags := certs.RegisterClientFlags()
-	flag.Parse()
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fatal(err)
+	}
+}
+
+func run(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("client", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:9443", "server address")
+	count := flags.Int("n", 5, "messages to send")
+	certFlags := certs.ClientFlagsOn(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	tlsConfig, err := certFlags.Config()
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	engine, stop := example.ClientEngine()
 	defer stop()
@@ -50,14 +68,15 @@ func main() {
 		err = <-dialed
 	}
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	fmt.Printf("connected to %s\n", conn.RemoteAddr())
+	defer conn.Close()
+	fmt.Fprintf(out, "connected to %s\n", conn.RemoteAddr())
 
 	for i := 1; i <= *count; i++ {
 		msg := example.Message(i)
 		if err := conn.Send([]byte(msg)); err != nil {
-			example.Fatal(err)
+			return err
 		}
 		var echo []byte
 		for len(echo) < len(msg) {
@@ -65,17 +84,17 @@ func main() {
 			case chunk := <-chunks:
 				echo = append(echo, chunk...)
 			case err := <-closed:
-				example.Fatal(fmt.Errorf("connection closed: %v", err))
-			case <-time.After(5 * time.Second):
-				example.Fatal(errors.New("timed out waiting for the echo"))
+				return fmt.Errorf("connection closed: %v", err)
+			case <-time.After(echoTimeout):
+				return errors.New("timed out waiting for the echo")
 			}
 		}
 		if i == 1 {
 			if state, ok := fibtls.ConnectionState(conn); ok {
-				fmt.Printf("TLS %s, %s\n", tls.VersionName(state.Version), tls.CipherSuiteName(state.CipherSuite))
+				fmt.Fprintf(out, "TLS %s, %s\n", tls.VersionName(state.Version), tls.CipherSuiteName(state.CipherSuite))
 			}
 		}
-		fmt.Printf("echo: %s\n", echo)
+		fmt.Fprintf(out, "echo: %s\n", echo)
 	}
-	conn.Close()
+	return nil
 }

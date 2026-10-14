@@ -39,9 +39,6 @@ type ServerFlags struct {
 	certFile, keyFile, certOut *string
 }
 
-// RegisterServerFlags adds -cert, -key and -cert-out to the command line.
-func RegisterServerFlags() ServerFlags { return ServerFlagsOn(flag.CommandLine) }
-
 // ServerFlagsOn adds -cert, -key and -cert-out to flags.
 func ServerFlagsOn(flags *flag.FlagSet) ServerFlags {
 	return ServerFlagsWithOut(flags, DefaultCertFile)
@@ -86,9 +83,6 @@ type ClientFlags struct {
 	caFile   *string
 	insecure *bool
 }
-
-// RegisterClientFlags adds -ca and -insecure to the command line.
-func RegisterClientFlags() ClientFlags { return ClientFlagsOn(flag.CommandLine) }
 
 // ClientFlagsOn adds -ca and -insecure to flags.
 func ClientFlagsOn(flags *flag.FlagSet) ClientFlags {

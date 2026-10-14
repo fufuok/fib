@@ -15,11 +15,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	stdhttp "net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/examples/certs"
@@ -28,11 +32,28 @@ import (
 	fibtls "github.com/lesismal/fib/tls"
 )
 
+// fatal reports a startup error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
-	useTLS := flag.Bool("tls", false, "serve HTTP/2 over TLS (h2) instead of cleartext (h2c)")
-	certFlags := certs.RegisterServerFlags()
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, nil); err != nil {
+		fatal(err)
+	}
+}
+
+// run serves until ctx ends. ready, if not nil, is told the address once the
+// server is listening.
+func run(ctx context.Context, args []string, out io.Writer, ready func(addr string)) error {
+	flags := flag.NewFlagSet("server", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:8080", "listen address")
+	useTLS := flags.Bool("tls", false, "serve HTTP/2 over TLS (h2) instead of cleartext (h2c)")
+	certFlags := certs.ServerFlagsOn(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	httpConfig := fibhttp.DefaultConfig()
 	httpConfig.HTTP2Only = true
@@ -46,16 +67,16 @@ func main() {
 		scheme = "https"
 		tlsConfig, cfgErr := certFlags.Config()
 		if cfgErr != nil {
-			example.Fatal(cfgErr)
+			return cfgErr
 		}
 		engine, err = fib.Bind(config, fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), handler))
 	} else {
 		engine, err = fib.Bind(config, handler)
 	}
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	example.Serve(engine, fmt.Sprintf("HTTP/2-only echo server listening on %s://%s", scheme, *addr))
+	return example.Serve(ctx, out, ready, "HTTP/2-only echo server listening on "+scheme+"://%s", engine)
 }
 
 func echo() fibhttp.HandlerFunc {

@@ -10,6 +10,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"time"
 
 	"github.com/lesismal/fib/examples/certs"
@@ -17,16 +19,32 @@ import (
 	"github.com/lesismal/fib/websocket"
 )
 
+// fatal reports an error and exits; a test replaces it.
+var fatal = example.Fatal
+
+// echoTimeout bounds the wait for each echo; a test shortens it.
+var echoTimeout = 5 * time.Second
+
 func main() {
-	url := flag.String("url", "wss://127.0.0.1:8444/ws", "server URL")
-	count := flag.Int("n", 5, "messages to send")
-	compress := flag.Bool("compress", false, "offer permessage-deflate compression")
-	certFlags := certs.RegisterClientFlags()
-	flag.Parse()
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fatal(err)
+	}
+}
+
+func run(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("client", flag.ContinueOnError)
+	flags.SetOutput(out)
+	url := flags.String("url", "wss://127.0.0.1:8444/ws", "server URL")
+	count := flags.Int("n", 5, "messages to send")
+	compress := flags.Bool("compress", false, "offer permessage-deflate compression")
+	certFlags := certs.ClientFlagsOn(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	tlsConfig, err := certFlags.Config()
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	engine, stop := example.ClientEngine()
 	defer stop()
@@ -46,27 +64,28 @@ func main() {
 	}
 	conn, resp, err := dialer.Go(*url, nil, handler).Wait()
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	fmt.Printf("connected: %s\n", resp.Status)
+	fmt.Fprintf(out, "connected: %s\n", resp.Status)
 
 	for i := 1; i <= *count; i++ {
 		if err := conn.WriteText(example.Message(i)); err != nil {
-			example.Fatal(err)
+			return err
 		}
 		select {
 		case echo := <-messages:
-			fmt.Printf("echo: %s\n", echo)
+			fmt.Fprintf(out, "echo: %s\n", echo)
 		case err := <-closed:
-			example.Fatal(fmt.Errorf("connection closed: %v", err))
-		case <-time.After(5 * time.Second):
-			example.Fatal(errors.New("timed out waiting for the echo"))
+			return fmt.Errorf("connection closed: %v", err)
+		case <-time.After(echoTimeout):
+			return errors.New("timed out waiting for the echo")
 		}
 	}
 	_ = conn.Close(websocket.CloseNormal, "done")
 	select {
 	case err := <-closed:
-		fmt.Println("closed:", err)
+		fmt.Fprintln(out, "closed:", err)
 	case <-time.After(3 * time.Second):
 	}
+	return nil
 }

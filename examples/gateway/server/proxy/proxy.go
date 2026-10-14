@@ -198,6 +198,11 @@ func (g *Gateway) Attach(engine *fib.Engine) {
 	g.h3 = http3.NewClient(engine, h3Config)
 }
 
+// SetAltSvc sets Config.AltSvc, for a server that learns the port it
+// announces only once it is listening. Like Attach, it has to be called
+// before the engines run.
+func (g *Gateway) SetAltSvc(value string) { g.config.AltSvc = value }
+
 // Close stops the upstream clients. Close them before the engine.
 func (g *Gateway) Close() {
 	if g.h1 != nil {

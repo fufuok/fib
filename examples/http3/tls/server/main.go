@@ -14,12 +14,16 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	stdhttp "net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/examples/certs"
@@ -29,18 +33,35 @@ import (
 	fibtls "github.com/lesismal/fib/tls"
 )
 
+// fatal reports a startup error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8445", "listen address, UDP for HTTP/3 and TCP for HTTPS")
-	certFlags := certs.RegisterServerFlags()
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, nil); err != nil {
+		fatal(err)
+	}
+}
+
+// run serves until ctx ends. ready, if not nil, is told the address once the
+// server is listening.
+func run(ctx context.Context, args []string, out io.Writer, ready func(addr string)) error {
+	flags := flag.NewFlagSet("server", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:8445", "listen address, UDP for HTTP/3 and TCP for HTTPS")
+	certFlags := certs.ServerFlagsOn(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	tlsConfig, err := certFlags.Config()
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	_, port, err := net.SplitHostPort(*addr)
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	portNum, _ := strconv.Atoi(port)
 	handler := echo(http3.AltSvc(portNum))
@@ -52,24 +73,18 @@ func main() {
 	udpConfig.Addr = *addr
 	udp, err := fib.Bind(udpConfig, http3.NewHandler(tlsConfig, handler))
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	go func() {
-		if err := udp.Run(); err != nil {
-			example.Fatal(err)
-		}
-	}()
-	defer udp.Close()
-	defer udp.Stop()
 
 	// HTTPS over TCP, for clients that do not know yet that HTTP/3 is here.
 	tcpConfig := fib.DefaultConfig()
 	tcpConfig.Addr = *addr
 	tcp, err := fib.Bind(tcpConfig, fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(handler)))
 	if err != nil {
-		example.Fatal(err)
+		_ = udp.Close()
+		return err
 	}
-	example.Serve(tcp, fmt.Sprintf("HTTP/3 echo server listening on https://%s (UDP), HTTPS on the same TCP port", *addr))
+	return example.Serve(ctx, out, ready, "HTTP/3 echo server listening on https://%s (UDP), HTTPS on the same TCP port", udp, tcp)
 }
 
 func echo(altSvc string) fibhttp.HandlerFunc {

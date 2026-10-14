@@ -30,9 +30,12 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -65,17 +68,34 @@ func (r *routeFlags) Set(spec string) error {
 	return nil
 }
 
+// fatal reports a startup error and exits; a test replaces it.
+var fatal = example.Fatal
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8446", "listen address: TCP for HTTPS (HTTP/2 and HTTP/1.1), UDP for HTTP/3")
-	plainAddr := flag.String("plain-addr", "127.0.0.1:8081", "listen address for cleartext HTTP/1.1, h2c and ws://; empty to disable")
-	timeout := flag.Duration("timeout", 5*time.Minute, "longest an upstream request may take, body included; 0 for no limit")
-	subprotocols := flag.String("subprotocols", "chat,superchat", "WebSocket subprotocols to accept from clients and ask the upstream for")
-	maxBody := flag.Int64("max-request-body", 64<<20, "largest request body to forward")
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, nil); err != nil {
+		fatal(err)
+	}
+}
+
+// run serves until ctx ends. ready, if not nil, is told the TLS address once
+// the gateway is listening.
+func run(ctx context.Context, args []string, out io.Writer, ready func(addr string)) error {
+	flags := flag.NewFlagSet("server", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:8446", "listen address: TCP for HTTPS (HTTP/2 and HTTP/1.1), UDP for HTTP/3")
+	plainAddr := flags.String("plain-addr", "127.0.0.1:8081", "listen address for cleartext HTTP/1.1, h2c and ws://; empty to disable")
+	timeout := flags.Duration("timeout", 5*time.Minute, "longest an upstream request may take, body included; 0 for no limit")
+	subprotocols := flags.String("subprotocols", "chat,superchat", "WebSocket subprotocols to accept from clients and ask the upstream for")
+	maxBody := flags.Int64("max-request-body", 64<<20, "largest request body to forward")
 	var routes routeFlags
-	flag.Var(&routes, "route", "prefix=target, repeatable (default: /h1, /h2 and /h3 to the upstream example)")
-	serverCerts := certs.ServerFlagsWithOut(flag.CommandLine, certs.GatewayCertFile)
-	upstreamCerts := certs.RegisterClientFlags()
-	flag.Parse()
+	flags.Var(&routes, "route", "prefix=target, repeatable (default: /h1, /h2 and /h3 to the upstream example)")
+	serverCerts := certs.ServerFlagsWithOut(flags, certs.GatewayCertFile)
+	upstreamCerts := certs.ClientFlagsOn(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	if len(routes) == 0 {
 		for _, spec := range []string{
@@ -89,17 +109,12 @@ func main() {
 	}
 	tlsConfig, err := serverCerts.Config()
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	upstreamTLS, err := upstreamCerts.Config()
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
-	_, port, err := net.SplitHostPort(*addr)
-	if err != nil {
-		example.Fatal(err)
-	}
-	portNum, _ := strconv.Atoi(port)
 
 	gateway, err := proxy.New(proxy.Config{
 		Routes:         routes,
@@ -107,20 +122,27 @@ func main() {
 		Timeout:        *timeout,
 		MaxRequestBody: *maxBody,
 		Subprotocols:   strings.FieldsFunc(*subprotocols, func(r rune) bool { return r == ',' || r == ' ' }),
-		AltSvc:         http3.AltSvc(portNum),
 		Logf:           log.Printf,
 	})
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
 	engines, err := newEngines(gateway, tlsConfig, *addr, *plainAddr)
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
+	// HTTP/3 is on the port the HTTPS engine got, which is what Alt-Svc
+	// announces.
+	tlsAddr, _ := engines[0].LocalAddr()
+	gateway.SetAltSvc(http3.AltSvc(tlsAddr.Port))
 	// The upstream clients dial through the first engine, the HTTPS one.
 	gateway.Attach(engines[0])
-	run(gateway, engines, fmt.Sprintf("gateway listening on https://%s (HTTP/2, HTTP/1.1; HTTP/3 on UDP)%s",
-		*addr, plainBanner(*plainAddr)))
+	plain := ""
+	if len(engines) > 2 {
+		plain = example.Addr(engines[2])
+	}
+	return serve(ctx, gateway, engines, out, ready,
+		fmt.Sprintf("gateway listening on https://%s (HTTP/2, HTTP/1.1; HTTP/3 on UDP)%s", tlsAddr, plainBanner(plain)))
 }
 
 func plainBanner(plainAddr string) string {
@@ -147,12 +169,16 @@ func newEngines(gateway *proxy.Gateway, tlsConfig *tls.Config, addr, plainAddr s
 	}
 	engines := []*fib.Engine{tcp}
 
-	// HTTP/3: a UDP engine whose handler is http3's.
+	// HTTP/3: a UDP engine whose handler is http3's, on the port the HTTPS
+	// one got, which is addr's own unless that was 0.
+	host, _, _ := net.SplitHostPort(addr)
+	tcpAddr, _ := tcp.LocalAddr()
 	udpConfig := fib.DefaultConfig()
 	udpConfig.Network = "udp"
-	udpConfig.Addr = addr
+	udpConfig.Addr = net.JoinHostPort(host, strconv.Itoa(tcpAddr.Port))
 	udp, err := fib.Bind(udpConfig, http3.NewHandlerWithConfig(gateway.HTTP3Config(tlsConfig), handler))
 	if err != nil {
+		closeAll(engines)
 		return nil, err
 	}
 	engines = append(engines, udp)
@@ -162,6 +188,7 @@ func newEngines(gateway *proxy.Gateway, tlsConfig *tls.Config, addr, plainAddr s
 		plainConfig.Addr = plainAddr
 		plain, err := fib.Bind(plainConfig, fibhttp.NewHandlerWithConfig(httpConfig, handler))
 		if err != nil {
+			closeAll(engines)
 			return nil, err
 		}
 		engines = append(engines, plain)
@@ -169,22 +196,34 @@ func newEngines(gateway *proxy.Gateway, tlsConfig *tls.Config, addr, plainAddr s
 	return engines, nil
 }
 
-// run serves until Ctrl-C, then closes the upstream clients, which has to be
-// done before the engines.
-func run(gateway *proxy.Gateway, engines []*fib.Engine, banner string) {
+func closeAll(engines []*fib.Engine) {
+	for _, engine := range engines {
+		_ = engine.Close()
+	}
+}
+
+// serve runs the engines until ctx ends, or one of them stops on its own,
+// which it reports. Then it closes the upstream clients, which has to be done
+// before the engines.
+func serve(ctx context.Context, gateway *proxy.Gateway, engines []*fib.Engine, out io.Writer, ready func(addr string), banner string) error {
 	done := make(chan error, len(engines))
 	for _, engine := range engines {
 		go func() { done <- engine.Run() }()
 	}
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
-	fmt.Println(banner)
+	fmt.Fprintln(out, banner)
+	if ready != nil {
+		ready(example.Addr(engines[0]))
+	}
 	running := len(engines)
+	var failed error
 	select {
-	case <-interrupt:
+	case <-ctx.Done():
 	case err := <-done:
 		running--
-		fmt.Fprintln(os.Stderr, "error:", err)
+		if err == nil {
+			err = errors.New("stopped")
+		}
+		failed = fmt.Errorf("an engine stopped serving: %w", err)
 	}
 	gateway.Close()
 	for _, engine := range engines {
@@ -193,7 +232,6 @@ func run(gateway *proxy.Gateway, engines []*fib.Engine, banner string) {
 	for ; running > 0; running-- {
 		<-done
 	}
-	for _, engine := range engines {
-		_ = engine.Close()
-	}
+	closeAll(engines)
+	return failed
 }

@@ -10,16 +10,34 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"time"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/examples/example"
 )
 
+// fatal reports an error and exits; a test replaces it.
+var fatal = example.Fatal
+
+// echoTimeout bounds the wait for each echo; a test shortens it.
+var echoTimeout = 3 * time.Second
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:9001", "server address")
-	count := flag.Int("n", 5, "datagrams to send")
-	flag.Parse()
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		fatal(err)
+	}
+}
+
+func run(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("client", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:9001", "server address")
+	count := flags.Int("n", 5, "datagrams to send")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	engine, stop := example.ClientEngine()
 	defer stop()
@@ -42,24 +60,25 @@ func main() {
 		err = <-dialed
 	}
 	if err != nil {
-		example.Fatal(err)
+		return err
 	}
+	defer conn.Close()
 
 	for i := 1; i <= *count; i++ {
 		if err := conn.Send([]byte(example.Message(i))); err != nil {
-			example.Fatal(err)
+			return err
 		}
 		// UDP keeps message boundaries, so one datagram is one whole echo.
 		select {
 		case echo := <-datagrams:
-			fmt.Printf("echo: %s\n", echo)
+			fmt.Fprintf(out, "echo: %s\n", echo)
 		case err := <-closed:
 			// Nothing listening at the server's port shows up here as a
 			// refusal.
-			example.Fatal(fmt.Errorf("connection closed: %v", err))
-		case <-time.After(3 * time.Second):
-			example.Fatal(errors.New("no echo: UDP does not retransmit, is the server running?"))
+			return fmt.Errorf("connection closed: %v", err)
+		case <-time.After(echoTimeout):
+			return errors.New("no echo: UDP does not retransmit, is the server running?")
 		}
 	}
-	conn.Close()
+	return nil
 }
