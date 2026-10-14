@@ -451,3 +451,109 @@ func TestH2SetReadDeadline(t *testing.T) {
 		t.Fatalf("a request after the deadline: %q", body)
 	}
 }
+
+// A write deadline already past fails an HTTP/1 response at the first Flush,
+// which would send its header and the event Write held back with it, so the
+// client gets nothing; and once it has failed, every Write and Flush after
+// it reports the same error, so a loop that checks either one stops (issue
+// #5).
+func TestPastWriteDeadlineFailsTheFirstFlush(t *testing.T) {
+	results := make(chan string, 1)
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		rc := stdhttp.NewResponseController(c)
+		out := fmt.Sprintf("set=%v", rc.SetWriteDeadline(time.Now().Add(-time.Second)))
+		c.Header().Set("Content-Type", "text/event-stream")
+		c.WriteHeader(stdhttp.StatusOK)
+		for i := 0; i < 3; i++ {
+			_, w := fmt.Fprintf(c, "data: %d\n\n", i)
+			out += fmt.Sprintf(" | write%d=%v flush%d=%v", i, w, i, rc.Flush())
+		}
+		results <- out
+	})))
+	conn := dialRaw(t, addr)
+	conn.send("GET /events HTTP/1.1\r\nHost: test\r\n\r\n")
+	got, _ := io.ReadAll(conn.r)
+	if len(got) != 0 {
+		t.Fatalf("the client got %q from a response past its deadline", got)
+	}
+	timeout := os.ErrDeadlineExceeded
+	want := fmt.Sprintf("set=<nil> | write0=<nil> flush0=%v | write1=%v flush1=%v | write2=%v flush2=%v",
+		timeout, timeout, timeout, timeout, timeout)
+	if out := <-results; out != want {
+		t.Fatalf("got  %s\nwant %s", out, want)
+	}
+}
+
+// Config.WriteTimeout refuses an HTTP/1 response that only begins to stream
+// once it has passed, from the Flush that would send its header. One sent
+// whole as the handler returns is still sent.
+func TestWriteTimeoutRefusesALateStreamingResponse(t *testing.T) {
+	config := DefaultConfig()
+	config.WriteTimeout = 150 * time.Millisecond
+	errs := make(chan error, 1)
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		time.Sleep(300 * time.Millisecond)
+		if c.Request.URL.Path == "/whole" {
+			errs <- c.Respond(stdhttp.StatusOK, "text/plain", []byte("late but whole"))
+			return
+		}
+		_, _ = c.WriteString("late")
+		errs <- c.FlushError()
+	})))
+	conn := dialRaw(t, addr)
+	conn.send("GET /streaming HTTP/1.1\r\nHost: test\r\n\r\n")
+	if got, _ := io.ReadAll(conn.r); len(got) != 0 {
+		t.Fatalf("the client got %q from a response that began past WriteTimeout", got)
+	}
+	if err := waitErr(t, errs); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("the late Flush reported %v, want %v", err, os.ErrDeadlineExceeded)
+	}
+	conn = dialRaw(t, addr)
+	conn.send("GET /whole HTTP/1.1\r\nHost: test\r\n\r\n")
+	if _, body := conn.response(stdhttp.MethodGet); body != "late but whole" {
+		t.Fatalf("whole: %q", body)
+	}
+	if err := waitErr(t, errs); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// On HTTP/2 a Flush made once WriteTimeout has reset the stream reports it,
+// even with nothing written in between, and so does every Write and Flush
+// after it.
+func TestH2FlushReportsAResetStream(t *testing.T) {
+	config := DefaultConfig()
+	config.WriteTimeout = 200 * time.Millisecond
+	results := make(chan [3]error, 1)
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		_, _ = c.WriteString("first")
+		if err := c.FlushError(); err != nil {
+			results <- [3]error{err}
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+		flush := c.FlushError()
+		_, write := c.WriteString(strings.Repeat("x", 32<<10))
+		results <- [3]error{flush, write, c.FlushError()}
+	})))
+	tc := dialH2(t, addr)
+	tc.headers(1, true, get("/events")...)
+	st := tc.stream(1)
+	for !st.done {
+		tc.read()
+	}
+	if !st.resetSet || st.reset != H2InternalError {
+		t.Fatalf("the stream ended with reset %v (%v), want %v", st.resetSet, st.reset, H2InternalError)
+	}
+	var errs [3]error
+	select {
+	case errs = <-results:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler never finished")
+	}
+	for i, err := range errs {
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("call %d after the reset reported %v, want %v", i, err, os.ErrDeadlineExceeded)
+		}
+	}
+}

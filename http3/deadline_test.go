@@ -182,3 +182,34 @@ func TestSetReadDeadline(t *testing.T) {
 	}
 	whole()
 }
+
+// A Flush made once WriteTimeout has reset the stream reports it, even with
+// nothing written in between, and so does every Write and Flush after it.
+func TestFlushReportsAResetStream(t *testing.T) {
+	results := make(chan [3]error, 1)
+	base := startServer(t, Config{WriteTimeout: 200 * time.Millisecond}, func(c *fibhttp.Context) {
+		_, _ = c.WriteString("first")
+		if err := c.FlushError(); err != nil {
+			results <- [3]error{err}
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+		flush := c.FlushError()
+		_, write := c.WriteString(strings.Repeat("x", 32<<10))
+		results <- [3]error{flush, write, c.FlushError()}
+	})
+	w := dialH3Wire(t, nil, base)
+	id := w.send(t, h3Request{path: "/events"}, false)
+	w.await(id, "reset", func(st *h3WireStream) bool { return st.done })
+	var errs [3]error
+	select {
+	case errs = <-results:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler never finished")
+	}
+	for i, err := range errs {
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("call %d after the reset reported %v, want %v", i, err, os.ErrDeadlineExceeded)
+		}
+	}
+}

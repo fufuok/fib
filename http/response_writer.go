@@ -76,6 +76,10 @@ type responseWriter struct {
 	closeAfter bool
 	trailers   []string
 	finished   bool
+	// err is the first error sending the response met, which every Write
+	// and Flush after it reports, as net/http's do: the response it broke
+	// cannot be carried on.
+	err error
 	// hooks are what OnHeader, OnResponse and OnFinish registered, which
 	// live here rather than in Context so that a Context, which HTTP/3
 	// allocates with each request, costs no more for a feature few use.
@@ -114,6 +118,15 @@ func (c *Context) writer() *responseWriter {
 // writerPool holds the writers of recycled Contexts, cleared, for the
 // requests that need one next.
 var writerPool = sync.Pool{New: func() any { return &responseWriter{declared: -1} }}
+
+// fail records err as what broke the response, unless something did
+// before, and returns it.
+func (w *responseWriter) fail(err error) error {
+	if w.err == nil {
+		w.err = err
+	}
+	return err
+}
 
 // reset clears the writer for its Context's next request. Of what it held
 // it keeps only its hooks' storage, emptied, for that request's hooks.
@@ -194,6 +207,9 @@ func (c *Context) Write(p []byte) (int, error) {
 		return 0, ErrResponseWritten
 	}
 	w := c.writer()
+	if w.err != nil {
+		return 0, w.err
+	}
 	if w.status == 0 {
 		c.WriteHeader(stdhttp.StatusOK)
 	}
@@ -229,11 +245,11 @@ func (c *Context) Write(p []byte) (int, error) {
 	}
 	if !w.committed {
 		if err := c.commit(false); err != nil {
-			return 0, err
+			return 0, w.fail(err)
 		}
 	}
 	if err := c.sendBody(p); err != nil {
-		return 0, err
+		return 0, w.fail(err)
 	}
 	return len(p), nil
 }
@@ -248,15 +264,30 @@ func (c *Context) WriteString(s string) (int, error) { return c.Write([]byte(s))
 func (c *Context) Flush() { _ = c.FlushError() }
 
 // FlushError is Flush reporting what went wrong, which is what
-// http.ResponseController looks for. A response an OnResponse hook needs
-// whole is held until the handler is done, so Flush does nothing for it, nor
-// on a stream served outside this package that cannot send a response as it
-// is written (see ResponseStreamer).
+// http.ResponseController looks for: once sending the response has failed,
+// it reports that, as every Write does, and once the connection or the
+// stream has gone under the response, why it went (see Err), so that a
+// handler streaming in a loop stops when its client can no longer be
+// reached, whichever of the two it checks. A response an OnResponse hook
+// needs whole is held until the handler is done, so Flush does nothing for
+// it, nor on a stream served outside this package that cannot send a
+// response as it is written (see ResponseStreamer).
 func (c *Context) FlushError() error {
 	if c.wrote {
 		return ErrResponseWritten
 	}
 	w := c.writer()
+	if w.err != nil {
+		return w.err
+	}
+	if ctxState(c.word.Load()) == ctxCancelled {
+		// The connection, or the stream, went under the response: a write
+		// timeout, a reset, a hangup. Nothing flushed would reach the
+		// client.
+		if err := c.Err(); err != nil {
+			return err
+		}
+	}
 	if w.status == 0 {
 		c.WriteHeader(stdhttp.StatusOK)
 	}
@@ -265,27 +296,37 @@ func (c *Context) FlushError() error {
 	}
 	if !w.committed {
 		if err := c.commit(false); err != nil {
-			return err
+			return w.fail(err)
 		}
 	}
 	if !c.isHTTP1() {
 		// The stream sends what it is given without being asked.
 		return nil
 	}
-	return c.Conn.Flush()
+	if err := c.Conn.Flush(); err != nil {
+		return w.fail(err)
+	}
+	return nil
 }
 
 // SetWriteDeadline replaces the deadline Config.WriteTimeout puts on the
 // response, for this response alone, as http.ResponseController's does: a
 // zero t lifts it, which is how a handler that streams for as long as its
 // client listens (server-sent events, a long download) keeps WriteTimeout
-// from cutting it off, and a t in the past ends the response at once. It
-// sets one too when Config.WriteTimeout does not. What passing it does is
-// what passing WriteTimeout does: on HTTP/1 the connection is closed if
-// output is still queued for the client, and a Write made after it fails;
-// on HTTP/2 and HTTP/3 the stream is reset. It reports ErrResponseWritten
-// once the response is finished, and http.ErrNotSupported on a stream
-// served outside this package that is not a StreamDeadliner.
+// from cutting it off. It sets one too when Config.WriteTimeout does not.
+// What passing it does is what passing WriteTimeout does. On HTTP/1 the
+// connection is closed if output is still queued for the client, and a
+// streaming response fails with os.ErrDeadlineExceeded the next time it
+// sends anything, its header and what Write held back with it included, so
+// a t already past fails the first Flush; as net/http's buffered writes do,
+// a Write that is only held back succeeds. A response sent whole as the
+// handler finishes is not refused. On HTTP/2 and HTTP/3 the stream is
+// reset, at once for a t already past. Once sending the response has
+// failed, every Write and Flush after it reports the same error.
+//
+// It reports ErrResponseWritten once the response is finished, and
+// http.ErrNotSupported on a stream served outside this package that is not
+// a StreamDeadliner.
 func (c *Context) SetWriteDeadline(t time.Time) error {
 	if c.wrote {
 		return ErrResponseWritten
@@ -371,22 +412,27 @@ func (c *Context) ReadFrom(src io.Reader) (int64, error) {
 		}
 		c.WriteHeader(stdhttp.StatusOK)
 	}
+	if w.err != nil {
+		return 0, w.err
+	}
 	if !w.committed {
 		if err := c.commit(false); err != nil {
-			return 0, err
+			return 0, w.fail(err)
 		}
+	} else if c.h1WriteExpired() {
+		return 0, w.fail(os.ErrDeadlineExceeded)
 	}
 	if w.chunked {
 		if err := c.Conn.SendOwned(fmt.Appendf(nil, "%x\r\n", file.size)); err != nil {
-			return 0, err
+			return 0, w.fail(err)
 		}
 	}
 	if err := c.Conn.SendFile(file.f, file.offset, file.size); err != nil {
-		return 0, err
+		return 0, w.fail(err)
 	}
 	if w.chunked {
 		if err := c.Conn.Send(crlf); err != nil {
-			return 0, err
+			return 0, w.fail(err)
 		}
 	}
 	w.written += file.size
@@ -487,6 +533,12 @@ func statusHasBody(status int) bool {
 func (c *Context) commit(final bool) error {
 	if !c.isHTTP1() {
 		return c.commitStream()
+	}
+	if !final && c.h1WriteExpired() {
+		// A response that begins to stream after its write deadline is
+		// refused from its first byte, as each part after it is; see
+		// sendBody. One sent whole as the handler finishes is not.
+		return os.ErrDeadlineExceeded
 	}
 	w := c.w
 	req := c.Request
@@ -589,8 +641,7 @@ func (c *Context) sendBody(p []byte) error {
 		return c.streamer().WriteBody(p, !c.onReader())
 	}
 	for len(p) > 0 {
-		if c.parser != nil && !c.parser.writeDeadline.IsZero() && time.Now().After(c.parser.writeDeadline) {
-			c.Conn.CloseWithError(os.ErrDeadlineExceeded)
+		if c.h1WriteExpired() {
 			return os.ErrDeadlineExceeded
 		}
 		part := p[:min(len(p), h1MaxPendingOutput)]
@@ -611,6 +662,18 @@ func (c *Context) sendBody(p []byte) error {
 		}
 	}
 	return nil
+}
+
+// h1WriteExpired reports whether the HTTP/1 response's write deadline,
+// Config.WriteTimeout's or the one its handler set, has passed, and closes
+// the connection when it has: a response it cut short cannot be carried on.
+func (c *Context) h1WriteExpired() bool {
+	p := c.parser
+	if p == nil || p.writeDeadline.IsZero() || time.Now().Before(p.writeDeadline) {
+		return false
+	}
+	c.Conn.CloseWithError(os.ErrDeadlineExceeded)
+	return true
 }
 
 func appendChunk(out, p []byte) []byte {
