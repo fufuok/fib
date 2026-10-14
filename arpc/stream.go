@@ -85,6 +85,12 @@ func (c *Client) onStreamMessage(msg *Message) {
 	sr, ok := c.Handler.streams[msg.method()]
 	if !ok || local {
 		logger().Warn("arpc: no stream handler for method", "method", msg.Method(), "remote", c.remoteAddr())
+		if !local {
+			// End the opener's receiving half, or its Recv would wait for
+			// good. The EOF goes without the local bit, so the opener
+			// takes it for its own Stream and never answers it.
+			_ = c.sendData(header{cmd: CmdStream | HeaderStreamEOFBit, method: msg.method(), seq: id}, nil, nil)
+		}
 		c.Handler.OnMessageDone(c, msg)
 		return
 	}

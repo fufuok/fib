@@ -53,6 +53,14 @@ func (sub *sfAsyncSub) fire(ctx *Context, err error) {
 	}
 }
 
+// expire is fire at the follower's timeout. It runs on the timer, so it must
+// not read sub.timer, whose assignment it may race.
+func (sub *sfAsyncSub) expire() {
+	if sub.fired.CompareAndSwap(false, true) {
+		safeCall("async call handler", func() { sub.handler(nil, ErrTimeout) })
+	}
+}
+
 type singleflightGroup struct {
 	mu    sync.Mutex
 	calls map[sfKey]*sfCall
@@ -205,7 +213,7 @@ func (c *Client) callAsyncSingleflight(method string, req any, handler AsyncHand
 		return nil
 	}
 	sub := &sfAsyncSub{handler: handler}
-	sub.timer = time.AfterFunc(timeout, func() { sub.fire(nil, ErrTimeout) })
+	sub.timer = time.AfterFunc(timeout, sub.expire)
 	if !c.sfGroup.addSub(call, sub) {
 		sub.timer.Stop()
 		return c.callAsyncOnce(method, req, handler, timeout, values)

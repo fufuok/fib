@@ -364,11 +364,12 @@ func (c *Client) CheckState() error {
 }
 
 func (c *Client) liveConn() (*fib.Connection, error) {
-	if conn := c.conn.Load(); conn != nil {
-		return conn, nil
-	}
+	// Stop leaves conn to OnClose, which the event loop runs later.
 	if clientState(c.state.Load()) == stateStopped {
 		return nil, ErrClientStopped
+	}
+	if conn := c.conn.Load(); conn != nil {
+		return conn, nil
 	}
 	return nil, ErrClientReconnecting
 }
