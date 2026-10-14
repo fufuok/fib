@@ -1364,3 +1364,23 @@ func usingMultipathTCP(syscall.Handle) bool { return false }
 func (c *Connection) File() (*os.File, error) {
 	return nil, os.NewSyscallError("dup", syscall.EWINDOWS)
 }
+
+// pauseStateChangedLocked reports whether queued output has crossed a watermark
+// so that the backend's read registration no longer matches it, where reads do
+// not pause in place. It mirrors the decision refreshConnection makes, so that
+// a refresh is only requested when the event loop actually has a change to
+// make. Callers hold c.mu.
+func (c *Connection) pauseStateChangedLocked() bool {
+	c.foldCorkedLocked()
+	pause, _ := c.pauseDecision(c.readPaused)
+	return pause != c.readPaused
+}
+
+// drainWake answers a wake-up by running the commands it announced, for a
+// loop that has no settle step and so stays asleep between wake-ups, as far
+// as notify can tell.
+func (e *Engine) drainWake() {
+	e.ackWake()
+	e.wakePending.Store(false)
+	e.drainCommands()
+}

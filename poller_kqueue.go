@@ -234,3 +234,12 @@ const pausesInPlace = true
 
 // setReadPaused does nothing; see pausesInPlace.
 func (e *Engine) setReadPaused(*Connection, bool) error { return nil }
+
+func (e *Engine) isListener(fd int) bool {
+	for _, listenFD := range e.listenFDs {
+		if listenFD == fd {
+			return true
+		}
+	}
+	return false
+}

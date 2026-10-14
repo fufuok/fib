@@ -473,15 +473,6 @@ func (e *Engine) trackConnection(fd int, c *Connection) {
 	e.connections[page][fd&connPageMask] = c
 }
 
-func (e *Engine) isListener(fd int) bool {
-	for _, listenFD := range e.listenFDs {
-		if listenFD == fd {
-			return true
-		}
-	}
-	return false
-}
-
 // ListenAddrs returns the address of every listener, in configured order,
 // whatever its network: a *net.TCPAddr, *net.UnixAddr or *net.UDPAddr. Ports
 // left at zero report the port the kernel chose.

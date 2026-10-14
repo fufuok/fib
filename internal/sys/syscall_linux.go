@@ -23,23 +23,23 @@ var (
 // rather than refuse it, so the client learns nothing until its SYN-ACK
 // retransmission timer fires a second later.
 func DefaultBacklog() int {
-	backlogOnce.Do(func() {
-		backlogValue = syscall.SOMAXCONN
-		data, err := os.ReadFile("/proc/sys/net/core/somaxconn")
-		if err != nil {
-			return
-		}
-		limit, err := strconv.Atoi(strings.TrimSpace(string(data)))
-		if err != nil || limit <= 0 {
-			return
-		}
-		// Above this the value no longer fits the kernel's backlog field.
-		if limit > 1<<16-1 {
-			limit = 1<<16 - 1
-		}
-		backlogValue = limit
-	})
+	backlogOnce.Do(func() { backlogValue = readBacklog("/proc/sys/net/core/somaxconn") })
 	return backlogValue
+}
+
+// readBacklog reads the somaxconn limit from path, falling back to SOMAXCONN
+// where it cannot be read.
+func readBacklog(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return syscall.SOMAXCONN
+	}
+	limit, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || limit <= 0 {
+		return syscall.SOMAXCONN
+	}
+	// Above this the value no longer fits the kernel's backlog field.
+	return min(limit, 1<<16-1)
 }
 
 func EventFD() (int, error) {

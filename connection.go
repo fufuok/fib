@@ -598,17 +598,6 @@ func (c *Connection) queueOwnedLocked(data []byte) {
 	c.pushLocked(sendItem{data: data})
 }
 
-// pauseStateChangedLocked reports whether queued output has crossed a watermark
-// so that the backend's read registration no longer matches it, where reads do
-// not pause in place. It mirrors the decision refreshConnection makes, so that
-// a refresh is only requested when the event loop actually has a change to
-// make. Callers hold c.mu.
-func (c *Connection) pauseStateChangedLocked() bool {
-	c.foldCorkedLocked()
-	pause, _ := c.pauseDecision(c.readPaused)
-	return pause != c.readPaused
-}
-
 // settlePauseLocked brings the pause up to date with the backlog wherever
 // it runs, and hands a read the connection is owed back to the round that is
 // running, and reports whether the event loop has to settle the rest. owed
@@ -817,14 +806,6 @@ const (
 	sendOwned
 	sendPooled
 )
-
-// sendClosed reports whether the connection has stopped accepting sends.
-func (c *Connection) sendClosed() bool {
-	c.mu.Lock()
-	closed := c.closing || c.closed || c.closeAfterSend || c.writeShut
-	c.mu.Unlock()
-	return closed
-}
 
 func (c *Connection) send(data []byte, mode sendMode) error {
 	if c.udp != nil {

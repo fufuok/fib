@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -20,8 +22,9 @@ import (
 // child's part there instead of the tests. The mode and the address travel
 // in the environment, which the children inherit.
 const (
-	modeEnv = "PREFORK_TEST_MODE"
-	addrEnv = "PREFORK_TEST_ADDR"
+	modeEnv  = "PREFORK_TEST_MODE"
+	addrEnv  = "PREFORK_TEST_ADDR"
+	readyEnv = "PREFORK_TEST_READY"
 )
 
 func TestMain(m *testing.M) {
@@ -36,8 +39,28 @@ func TestMain(m *testing.M) {
 // second child fails at once instead.
 func runChild() int {
 	err := prefork.Run(prefork.Config{}, func(ctx context.Context) error {
-		if os.Getenv(modeEnv) == "fail" && prefork.Child() == 2 {
-			return errors.New("child failed on purpose")
+		switch os.Getenv(modeEnv) {
+		case "fail":
+			if prefork.Child() == 2 {
+				return errors.New("child failed on purpose")
+			}
+		case "exit":
+			return nil
+		case "stopfail":
+			announceReady()
+			<-ctx.Done()
+			return errors.New("child failed to stop on purpose")
+		case "hang":
+			announceReady()
+			time.Sleep(time.Minute)
+			return nil
+		case "sigterm":
+			// SIGTERM's default action ends the child, as it would a
+			// program that never asks to be told of it.
+			signal.Reset(syscall.SIGTERM)
+			announceReady()
+			time.Sleep(time.Minute)
+			return nil
 		}
 		config := fib.DefaultConfig()
 		config.Addr = os.Getenv(addrEnv)
@@ -64,6 +87,15 @@ func runChild() int {
 		return 1
 	}
 	return 0
+}
+
+// announceReady tells the test that this child is running serve, and so
+// past the start-up a signal would end it in, by connecting to the address
+// the test listens on.
+func announceReady() {
+	if conn, err := net.Dial("tcp", os.Getenv(readyEnv)); err == nil {
+		_ = conn.Close()
+	}
 }
 
 // freeAddr returns a loopback address with a port nothing listens on.
@@ -150,5 +182,89 @@ func TestAChildThatFailsStopsTheOthers(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("the master did not stop after a child failed")
+	}
+}
+
+// runUntilReady runs the master in mode with config, waits for its n
+// children to announce that they are serving, then cancels its context,
+// and returns what RunContext returned.
+func runUntilReady(t *testing.T, mode string, n int, config prefork.Config) error {
+	t.Helper()
+	ready, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ready.Close()
+	t.Setenv(readyEnv, ready.Addr().String())
+	t.Setenv(modeEnv, mode)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- prefork.RunContext(ctx, config, func(context.Context) error {
+			return errors.New("serve ran in the master")
+		})
+	}()
+	for range n {
+		_ = ready.(*net.TCPListener).SetDeadline(time.Now().Add(15 * time.Second))
+		conn, err := ready.Accept()
+		if err != nil {
+			t.Fatalf("a child never announced itself: %v", err)
+		}
+		_ = conn.Close()
+	}
+	cancel()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(15 * time.Second):
+		t.Fatal("the master did not return")
+		return nil
+	}
+}
+
+// A child that fails as it is asked to stop fails the master, which reports
+// it although stopping was what the master wanted.
+func TestAChildThatFailsToStopIsReported(t *testing.T) {
+	err := runUntilReady(t, "stopfail", 1, prefork.Config{Children: 1, ProcsPerChild: 1})
+	if err == nil || !strings.Contains(err.Error(), "child 1") {
+		t.Fatalf("RunContext = %v, want child 1's failure", err)
+	}
+}
+
+// A child still running ShutdownTimeout after it was asked to stop is killed,
+// and the master says so.
+func TestAChildThatIgnoresStopIsKilled(t *testing.T) {
+	err := runUntilReady(t, "hang", 1, prefork.Config{Children: 1, ProcsPerChild: 1, ShutdownTimeout: 100 * time.Millisecond})
+	if err == nil || !strings.Contains(err.Error(), "killed") {
+		t.Fatalf("RunContext = %v, want the children killed", err)
+	}
+}
+
+// A child that SIGTERM ends outright, rather than asking serve to return, has
+// stopped as asked.
+func TestAChildEndedBySIGTERMStoppedAsAsked(t *testing.T) {
+	if err := runUntilReady(t, "sigterm", 1, prefork.Config{Children: 1, ProcsPerChild: 1}); err != nil {
+		t.Fatalf("RunContext = %v", err)
+	}
+}
+
+// A child that returns before it was asked to stop, even without an error,
+// ends the run: the master cannot serve with fewer children than it started.
+// The default sizing starts at least one.
+func TestAChildThatExitsEarlyStopsTheMaster(t *testing.T) {
+	t.Setenv(modeEnv, "exit")
+	result := make(chan error, 1)
+	go func() {
+		result <- prefork.RunContext(context.Background(), prefork.Config{},
+			func(context.Context) error { return errors.New("serve ran in the master") })
+	}()
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "before it was asked to stop") {
+			t.Fatalf("RunContext = %v, want a child that exited early", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the master did not stop after a child exited")
 	}
 }

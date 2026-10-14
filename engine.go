@@ -672,15 +672,6 @@ func (e *Engine) commandsQueued() bool {
 	return queued
 }
 
-// drainWake answers a wake-up by running the commands it announced, for a
-// loop that has no settle step and so stays asleep between wake-ups, as far
-// as notify can tell.
-func (e *Engine) drainWake() {
-	e.ackWake()
-	e.wakePending.Store(false)
-	e.drainCommands()
-}
-
 // noteEvent folds readiness into the connection and reports whether it needs
 // to be scheduled. Actual submission happens once per round in Run.
 func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
