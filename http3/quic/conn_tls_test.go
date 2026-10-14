@@ -451,7 +451,8 @@ func TestRetry(t *testing.T) {
 }
 
 // Loss recovery at the edges of the handshake: a space with nothing
-// acknowledged has nothing to declare lost, a probe takes handshake data
+// acknowledged has nothing to declare lost, a probe timeout with nothing in
+// flight prompts the server in the Initial space, a probe takes handshake data
 // still to send with it, a probe timeout with nothing in flight prompts
 // the server in the Handshake space once there are keys for it, and a
 // space already discarded is not discarded again.
@@ -462,6 +463,21 @@ func TestRecoveryHandshakeEdges(t *testing.T) {
 	now := time.Now()
 	hs := &c.spaces[spaceHandshake]
 	c.detectLost(spaceHandshake, now)
+	// With nothing in flight and no Handshake keys yet, the probe is an
+	// Initial one.
+	initial := &c.spaces[spaceInitial]
+	for i := range c.spaces {
+		c.spaces[i].ackElicitingInFlight = 0
+		c.spaces[i].lossTime = time.Time{}
+	}
+	if _, space := c.ptoTimeSpace(now); space != spaceInitial {
+		t.Fatalf("probe timeout for space %d", space)
+	}
+	c.onLossDetectionTimeout(now)
+	if initial.probes != 1 {
+		t.Fatalf("%d initial probes", initial.probes)
+	}
+	initial.probes = 0
 	hs.tx, _ = initialKeys([]byte("handshake"), true)
 	hs.cryptoSend.write([]byte("finished"))
 	c.probe(spaceInitial)
@@ -472,6 +488,9 @@ func TestRecoveryHandshakeEdges(t *testing.T) {
 		c.spaces[i].probes = 0
 		c.spaces[i].ackElicitingInFlight = 0
 		c.spaces[i].lossTime = time.Time{}
+	}
+	if _, space := c.ptoTimeSpace(now); space != spaceHandshake {
+		t.Fatalf("probe timeout for space %d", space)
 	}
 	c.onLossDetectionTimeout(now)
 	if hs.probes != 1 || c.spaces[spaceInitial].probes != 0 {

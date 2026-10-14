@@ -372,12 +372,12 @@ func TestClientClosesOnProtocolViolations(t *testing.T) {
 				_ = us.Write([]byte{streamPush, 0}, false)
 			}
 		}, ErrCodeIDError, false},
-		// The SETTINGS frame opening the control stream goes out with the
-		// flush that ends this call; reset before that, it would be
-		// discarded, and the client would see a reset stream of no type.
+		// The control stream is reset once the client has its SETTINGS,
+		// which a response answered before on the connection proves (see
+		// below): reset before they went out, they would be discarded, and
+		// the client would see a reset stream of no type.
 		"/reset-control": {func(s *quic.Stream) {
-			control := server.control("/reset-control")
-			time.AfterFunc(50*time.Millisecond, func() { control.Reset(uint64(ErrCodeNoError)) })
+			server.control("/reset-control").Reset(uint64(ErrCodeNoError))
 		}, ErrCodeClosedCriticalStream, false},
 		"/end-control": {func(s *quic.Stream) {
 			_ = server.control("/end-control").Write(nil, true)
@@ -389,6 +389,13 @@ func TestClientClosesOnProtocolViolations(t *testing.T) {
 	}
 	client := newClient(t, nil)
 	for path, c := range cases {
+		if path == "/reset-control" {
+			// The SETTINGS go out before this response, on the connection
+			// the case's request takes.
+			if _, err := client.Go(mustRequest(t, stdhttp.MethodGet, base+"/", nil)).Wait(); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if _, err := client.Go(mustRequest(t, stdhttp.MethodGet, base+path, nil)).Wait(); err == nil && !c.answered {
 			t.Fatalf("%s: the request succeeded", path)
 		}

@@ -294,7 +294,7 @@ func TestClientServerFinished12(t *testing.T) {
 
 	// The ticket joins the transcript, so the server's Finished, made
 	// without it, is not checked here.
-	cli, _, toClient := setup(t, nil)
+	cli, _, _ := setup(t, nil)
 	in := appendRecord(nil, recordTypeHandshake, 0x0303, hsMsg(hsNewSessionTicket, []byte{0, 0, 0, 1, 0, 0}))
 	before := len(cli.transcript)
 	if _, _, done, herr := cli.process(in); herr != nil || done || len(cli.transcript) != before+10 {
@@ -314,7 +314,7 @@ func TestClientServerFinished12(t *testing.T) {
 	_, _, _, herr = cli.process(rec)
 	wantAlert(t, "a Finished that does not verify", herr, alertDecryptError)
 
-	cli, _, toClient = setup(t, nil)
+	cli, _, toClient := setup(t, nil)
 	toClient[len(toClient)-1] ^= 1
 	_, _, _, herr = cli.process(toClient)
 	wantAlert(t, "a Finished that does not authenticate", herr, alertBadRecordMAC)
