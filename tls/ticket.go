@@ -66,8 +66,9 @@ type ticketKeys struct {
 }
 
 // maxUsedTickets bounds the register; when it is full of live tickets no
-// more early data is accepted, which costs a round trip and nothing else.
-const maxUsedTickets = 1 << 20
+// more early data is accepted, which costs a round trip and nothing else. It
+// is a variable so that a test can fill it without a million entries.
+var maxUsedTickets = 1 << 20
 
 // firstUse reports whether ticket has not carried early data before, and
 // records that it does now.
