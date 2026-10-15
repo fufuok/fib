@@ -90,6 +90,44 @@ func Prefix(prefixes ...string) Matcher {
 	}
 }
 
+// SOCKS5 matches a SOCKS5 client's greeting: version 5 and a count of the
+// authentication methods it offers, which is never zero.
+func SOCKS5() Matcher {
+	return func(input []byte) Result {
+		if input[0] != 5 {
+			return NoMatch
+		}
+		if len(input) < 2 {
+			return NeedMore
+		}
+		if input[1] == 0 {
+			return NoMatch
+		}
+		return Match
+	}
+}
+
+// SOCKS4 matches a SOCKS4 or SOCKS4a request: version 4 and a CONNECT (1)
+// or a BIND (2).
+func SOCKS4() Matcher {
+	return func(input []byte) Result {
+		if input[0] != 4 {
+			return NoMatch
+		}
+		if len(input) < 2 {
+			return NeedMore
+		}
+		if input[1] != 1 && input[1] != 2 {
+			return NoMatch
+		}
+		return Match
+	}
+}
+
+// SOCKS matches SOCKS5, SOCKS4 and SOCKS4a, which a socks.Server serves
+// all of.
+func SOCKS() Matcher { return AnyOf(SOCKS5(), SOCKS4()) }
+
 // AnyOf matches what any of matchers does. It needs more as long as one of
 // them does and none has matched.
 func AnyOf(matchers ...Matcher) Matcher {

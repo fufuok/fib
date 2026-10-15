@@ -178,6 +178,12 @@ type DialOptions struct {
 	// SessionCache and EarlyData are Handler's.
 	SessionCache QUICSessionCache
 	EarlyData    bool
+	// Dial opens the connection the handshake runs over, in place of
+	// engine.DialWithHandler, with the same arguments and the same contract;
+	// a socks.Dialer's Dial reaches the server through a proxy. Nil dials
+	// directly.
+	Dial func(engine *fib.Engine, network, addr string, timeout time.Duration,
+		handler fib.Handler, done func(*fib.Connection, error)) error
 }
 
 // DialWithOptions is Dial with options.
@@ -202,6 +208,9 @@ func DialWithOptions(engine *fib.Engine, network, addr string, timeout time.Dura
 	client := NewClient(config, handler)
 	client.Blocking, client.HandshakeTimeout = options.Blocking, options.HandshakeTimeout
 	client.SessionCache, client.EarlyData = options.SessionCache, options.EarlyData
+	if options.Dial != nil {
+		return options.Dial(engine, network, addr, timeout, client, done)
+	}
 	return engine.DialWithHandler(network, addr, timeout, client, done)
 }
 

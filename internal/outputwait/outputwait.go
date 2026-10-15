@@ -9,3 +9,8 @@ package outputwait
 // write to it has failed. Package fib sets it when it is initialized; it is
 // nil on a platform fib serves through the portable backend.
 var Wait func(c any, limit int64) error
+
+// Pending reports how many bytes of what c, a *fib.Connection, was sent are
+// still queued for its socket, without waiting. It is set and nil where Wait
+// is.
+var Pending func(c any) int64

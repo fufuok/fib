@@ -43,6 +43,7 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
 | HTTP/3 + QUIC | ✓ | ✓ | QUIC 和 QPACK 基于 `crypto/tls.QUICConn` 自行实现，不依赖 quic-go 或 x/net |
 | WebSocket | ✓ | ✓ | RFC 6455、permessage-deflate，可经 HTTP/1.1、HTTP/2（RFC 8441）、HTTP/3（RFC 9220）升级；CI 跑 Autobahn |
 | arpc | ✓ | ✓ | 与 [lesismal/arpc](https://github.com/lesismal/arpc) 相同的协议格式和 API：双向调用、notify、异步调用、stream、广播、中间件、断线重连 |
+| SOCKS5 / SOCKS4 / 4a | ✓ | ✓（异步拨号） | CONNECT、BIND 与 UDP ASSOCIATE，用户名/密码认证；HTTP、WebSocket 与 TLS 客户端可经它拨号 |
 | gRPC | ✓ h2 和 h2c | ✓ | unary 与双向 streaming、metadata、deadline、拦截器、gzip；可直接用 protoc-gen-go-grpc 生成的代码，与 grpc-go 互通 |
 
 ### 引擎
@@ -265,6 +266,26 @@ engine, err := fib.Bind(config, fibhttp.NewHandler(r))
 流式发送的调用，尤其是双向流，需要设置 `Config.StreamRequestBody`，让调用在请求开始到达时就
 运行，而不是等请求完整到达。
 
+### SOCKS
+
+```go
+server := socks.NewServer(socks.Config{Authenticate: check}) // Authenticate 为 nil 时无需登录
+config.Bindings = []fib.Binding{
+	{Addr: ":1080", Handler: server},
+	{Network: "udp", Addr: ":1080", Handler: server}, // UDP ASSOCIATE
+}
+engine, err := fib.Bind(config, nil) // 或在共用端口上用 mux.Route{Match: mux.SOCKS(), Handler: server}
+
+proxy, err := socks.ParseURL("socks5h://user:pass@127.0.0.1:1080")
+clientConfig := fibhttp.DefaultClientConfig()
+clientConfig.Dial = proxy.Dial // websocket.DialerConfig.Dial 与 fibtls.DialOptions.Dial 同理
+err = proxy.Dial(clientEngine, "tcp", "example.com:443", 5*time.Second, handler, done)
+```
+
+服务端在回调之间直接转发 CONNECT 的数据，中间不经过 goroutine；较慢一侧排队的数据超过
+`Config.MaxQueuedBytes` 时暂停读取较快的一侧。`Config.Allow` 审核每个请求，`Config.Dial` 可把
+代理串到另一个代理上。经 `Dialer` 拨号从不阻塞：连接代理、协商和 DNS 解析都在 engine 及其客户端池上进行。
+
 ### 裸 TCP
 
 ```go
@@ -326,6 +347,7 @@ go run ./examples/http/router
 go run ./examples/websocket/nontls/server
 go run ./examples/arpc/server
 go run ./examples/grpc/server
+go run ./examples/socks/server        # SOCKS5/4/4a 代理；examples/socks/client 经它抓取一个 URL
 go run ./examples/http3/tls/server
 go run ./examples/gateway/upstream    # 反向代理 / 网关：HTTP/1.1、HTTP/2、HTTP/3、WebSocket，全部异步回调
 go run ./examples/gateway/server      # 依次启动 upstream、gateway、client（见 server 的文件头注释）
@@ -618,6 +640,7 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) 服务端和客户端，协议兼容 |
 | [`grpc`](grpc) | gRPC 服务端和客户端，自带 HTTP/2 传输层，与 grpc-go 及其生成代码兼容 |
 | [`middleware`](middleware) | 中间件链和常用中间件 |
+| [`socks`](socks) | SOCKS5、SOCKS4 与 SOCKS4a 代理服务端及非阻塞拨号器 |
 | [`mux`](mux) | 按客户端最先发送的字节识别协议，多种协议共用一个端口 |
 | [`prefork`](prefork) | 一个程序由多个共享端口的进程服务（Linux） |
 

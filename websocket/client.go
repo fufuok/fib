@@ -63,6 +63,11 @@ type DialerConfig struct {
 	// TLSConfig is used for wss:// URLs. Nil means the defaults; either way a
 	// config naming no server gets the URL's host.
 	TLSConfig *tls.Config
+	// Dial opens the connection, in place of the engine's DialWithHandler,
+	// with the same arguments and the same contract: a socks.Dialer's Dial
+	// reaches the server through a SOCKS proxy. Nil dials directly.
+	Dial func(engine *fib.Engine, network, addr string, timeout time.Duration,
+		handler fib.Handler, done func(*fib.Connection, error)) error
 }
 
 func DefaultDialerConfig() DialerConfig {
@@ -144,9 +149,13 @@ func (d *Dialer) Dial(rawURL string, header stdhttp.Header, handler Handler,
 	}
 	if secure {
 		err = fibtls.DialWithOptions(d.engine, "tcp", addr, d.config.HandshakeTimeout, d.config.TLSConfig,
-			fibtls.DialOptions{Blocking: d.config.BlockingTLSHandshake}, cc, connected)
+			fibtls.DialOptions{Blocking: d.config.BlockingTLSHandshake, Dial: d.config.Dial}, cc, connected)
 	} else {
-		err = d.engine.DialWithHandler("tcp", addr, d.config.HandshakeTimeout, cc, connected)
+		dial := d.config.Dial
+		if dial == nil {
+			dial = (*fib.Engine).DialWithHandler
+		}
+		err = dial(d.engine, "tcp", addr, d.config.HandshakeTimeout, cc, connected)
 	}
 	if err != nil {
 		cc.fail(nil, err, false)

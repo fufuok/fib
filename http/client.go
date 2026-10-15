@@ -49,6 +49,12 @@ type ClientConfig struct {
 	Timeout time.Duration
 	// DialTimeout bounds one connect. Zero leaves it to the operating system.
 	DialTimeout time.Duration
+	// Dial opens the client's connections, in place of the engine's
+	// DialWithHandler, with the same arguments and the same contract: a
+	// socks.Dialer's Dial sends every request through a SOCKS proxy. Nil
+	// dials directly.
+	Dial func(engine *fib.Engine, network, addr string, timeout time.Duration,
+		handler fib.Handler, done func(*fib.Connection, error)) error
 	// MaxConnsPerHost caps the connections open or dialing to one host:port.
 	// Requests beyond it wait for one of them. Zero or less means no cap.
 	MaxConnsPerHost int
@@ -599,7 +605,7 @@ func (c *Client) dial(h *hostPool) {
 			}
 		}
 		err = fibtls.DialWithOptions(c.engine, "tcp", h.target.addr, c.config.DialTimeout, c.tlsConfig,
-			fibtls.DialOptions{Blocking: c.config.BlockingTLSHandshake}, cc, done)
+			fibtls.DialOptions{Blocking: c.config.BlockingTLSHandshake, Dial: c.config.Dial}, cc, done)
 	} else {
 		if c.config.UnencryptedHTTP2 {
 			done = func(_ *fib.Connection, err error) {
@@ -609,7 +615,11 @@ func (c *Client) dial(h *hostPool) {
 				c.dialed(cc, err)
 			}
 		}
-		err = c.engine.DialWithHandler("tcp", h.target.addr, c.config.DialTimeout, cc, done)
+		dial := c.config.Dial
+		if dial == nil {
+			dial = (*fib.Engine).DialWithHandler
+		}
+		err = dial(c.engine, "tcp", h.target.addr, c.config.DialTimeout, cc, done)
 	}
 	if err != nil {
 		c.dialed(cc, err)

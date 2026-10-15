@@ -1261,6 +1261,7 @@ func (c *Connection) noteWritableLocked() {
 
 func init() {
 	outputwait.Wait = func(c any, limit int64) error { return c.(*Connection).waitOutput(limit) }
+	outputwait.Pending = func(c any) int64 { return c.(*Connection).pendingBytes.Load() }
 }
 
 // waitOutput waits while more than limit bytes of what Send accepted are

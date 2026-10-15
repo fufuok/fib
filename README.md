@@ -44,6 +44,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 | HTTP/3 + QUIC | ✓ | ✓ | QUIC and QPACK written from scratch on `crypto/tls.QUICConn`, with no quic-go or x/net dependency |
 | WebSocket | ✓ | ✓ | RFC 6455 and permessage-deflate, over HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220); Autobahn in CI |
 | arpc | ✓ | ✓ | [lesismal/arpc](https://github.com/lesismal/arpc)'s wire format and API: two-way calls, notify, async calls, streams, broadcast, middleware, reconnect |
+| SOCKS5 / SOCKS4 / 4a | ✓ | ✓ (async dial) | CONNECT, BIND and UDP ASSOCIATE, username/password; the HTTP, WebSocket and TLS clients dial through it |
 | gRPC | ✓ h2 and h2c | ✓ | unary and streaming both ways, metadata, deadlines, interceptors, gzip; works with protoc-gen-go-grpc code and talks to grpc-go |
 
 ### Engine
@@ -277,6 +278,27 @@ streams reach the client message by message. A call whose client streams, a bidi
 above all, needs `Config.StreamRequestBody`, so that the call starts as its request starts
 arriving rather than once it has arrived whole.
 
+### SOCKS
+
+```go
+server := socks.NewServer(socks.Config{Authenticate: check}) // nil Authenticate: no login
+config.Bindings = []fib.Binding{
+	{Addr: ":1080", Handler: server},
+	{Network: "udp", Addr: ":1080", Handler: server}, // UDP ASSOCIATE
+}
+engine, err := fib.Bind(config, nil) // or mux.Route{Match: mux.SOCKS(), Handler: server} on a shared port
+
+proxy, err := socks.ParseURL("socks5h://user:pass@127.0.0.1:1080")
+clientConfig := fibhttp.DefaultClientConfig()
+clientConfig.Dial = proxy.Dial // also websocket.DialerConfig.Dial and fibtls.DialOptions.Dial
+err = proxy.Dial(clientEngine, "tcp", "example.com:443", 5*time.Second, handler, done)
+```
+
+The server relays a CONNECT from callback to callback with no goroutine in between, holding the
+faster side's reads while the slower side's queue is over `Config.MaxQueuedBytes`. `Config.Allow`
+sees every request, `Config.Dial` chains the proxy to another, and a dial through the `Dialer`
+never blocks: the connect, the negotiation and any DNS lookup run on the engine and its client pool.
+
 ### Raw TCP
 
 ```go
@@ -344,6 +366,7 @@ go run ./examples/websocket/nontls/server
 go run ./examples/http3/tls/server
 go run ./examples/arpc/server
 go run ./examples/grpc/server
+go run ./examples/socks/server        # a SOCKS5/4/4a proxy; examples/socks/client fetches a URL through it
 go run ./examples/gateway/upstream     # a reverse proxy / gateway for HTTP/1.1, HTTP/2, HTTP/3 and WebSocket:
 go run ./examples/gateway/server       # upstream, gateway and client, all callback-based (see its server's doc comment)
 go run ./examples/gateway/client
@@ -663,6 +686,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) server and client, wire compatible |
 | [`grpc`](grpc) | gRPC server and client over an HTTP/2 transport of its own, compatible with grpc-go and its generated code |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
+| [`socks`](socks) | SOCKS5, SOCKS4 and SOCKS4a proxy server and non-blocking dialer |
 | [`mux`](mux) | Several protocols on one port, told apart by the first bytes a client sends |
 | [`prefork`](prefork) | One program served from several processes sharing its ports (Linux) |
 

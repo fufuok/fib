@@ -9,6 +9,7 @@
 //	engine, err := fib.Bind(config, mux.New(
 //		mux.Route{Match: mux.TLS(), Handler: tlsHandler},
 //		mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(web)}, // HTTP/1.x and h2c
+//		mux.Route{Match: mux.SOCKS(), Handler: socks.NewServer(socks.Config{})},
 //		mux.Route{Match: mux.Prefix("PING"), Handler: pinger},
 //	))
 //
