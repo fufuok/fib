@@ -77,7 +77,10 @@ func (wouldBlockError) Temporary() bool { return true }
 // answers, costs the connection's memory and a timer, and no goroutine;
 // thousands of handshakes can be in flight at once. GetCertificate and
 // GetClientCertificate, which may block, run on a worker of the handshake pool
-// for as long as they take, and the handshake goes on from there (auth.go). A server serves TLS 1.3
+// for as long as they take, and the handshake goes on from there (auth.go); so
+// do a client's verification of the server's chain, VerifyPeerCertificate and
+// VerifyConnection. A worker the pool cannot take on at once, with its queue
+// full, is not waited for: the connection is closed. A server serves TLS 1.3
 // and 1.2 that way and hands the clients it cannot serve (older versions,
 // 0-RTT, suites or groups it does not implement, a hello that does not parse)
 // to crypto/tls, before it has sent anything, so they see no difference; it
@@ -259,7 +262,7 @@ func (h *Handler) startBlocking(t *layer, initial []byte) {
 		timeout = DefaultHandshakeTimeout
 	}
 	inner := h.inner()
-	if !sidepool.Handshake().Go(func() { t.handshake(inner, timeout) }) {
+	if !sidepool.Handshake().TryGo(func() { t.handshake(inner, timeout) }) {
 		t.mu.Lock()
 		t.handshaking = false
 		t.mu.Unlock()
@@ -314,6 +317,7 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 			}
 		}
 		chs.pick.async = t.async(h.inner())
+		chs.check.async = chs.pick.async
 		hs, hello = chs, chs.hello()
 		if chs.earlyActive {
 			t.early = &earlyWrites{keys: chs.earlyTx, max: chs.session.maxEarly, active: true}
@@ -931,8 +935,9 @@ func (t *layer) Close() error {
 var errHandshakeTimeout = errors.New("fib: tls handshake timed out")
 
 // errNoHandshakeWorker closes a connection whose handshake the handshake pool
-// refused to run.
-var errNoHandshakeWorker = errors.New("fib: tls handshake pool has stopped")
+// refused to run: it has stopped, or its queue is full, which the goroutine
+// that hands it work, often an event loop, does not wait out.
+var errNoHandshakeWorker = errors.New("fib: tls handshake pool is full or has stopped")
 
 func (t *layer) LocalAddr() net.Addr { return addr{} }
 
@@ -1019,7 +1024,7 @@ func (t *layer) feedNative(handler fib.Handler, hs nativeHandshake, data []byte)
 // with whatever has arrived meanwhile, as OnData would have.
 func (t *layer) async(handler fib.Handler) func(call func()) bool {
 	return func(call func()) bool {
-		return sidepool.Handshake().Go(func() {
+		return sidepool.Handshake().TryGo(func() {
 			call()
 			t.readMu.Lock()
 			defer t.readMu.Unlock()

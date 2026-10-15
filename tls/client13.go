@@ -195,13 +195,14 @@ func suites12(config *stdtls.Config) []uint16 {
 // version, since a server that answers with one cannot be continued with, and
 // is not retried on this connection. It must not ask for what clientHS does
 // not do either: crypto/tls's session resumption, encrypted client hello,
-// renegotiation, certificates whose keys cannot sign by themselves, a set of
-// groups or suites it cannot offer.
+// renegotiation, a set of groups or suites it cannot offer. A certificate whose
+// key cannot sign by itself is not one to answer a CertificateRequest with,
+// for clientHS as for crypto/tls, so it is no reason either.
 func nativeClient(config *stdtls.Config) bool {
 	if config == nil || config.Renegotiation != stdtls.RenegotiateNever {
 		return false
 	}
-	if config.ClientSessionCache != nil || config.EncryptedClientHelloConfigList != nil || !signingCertificates(config) {
+	if config.ClientSessionCache != nil || config.EncryptedClientHelloConfigList != nil {
 		return false
 	}
 	versions := clientVersions(config)
@@ -218,17 +219,6 @@ func nativeClient(config *stdtls.Config) bool {
 			}
 		}
 		return false
-	}
-	return true
-}
-
-// signingCertificates reports whether the Config's certificates, if it has
-// any, have keys that sign by themselves.
-func signingCertificates(config *stdtls.Config) bool {
-	for i := range config.Certificates {
-		if _, ok := config.Certificates[i].PrivateKey.(crypto.Signer); !ok && len(config.Certificates[i].Certificate) != 0 {
-			return false
-		}
 	}
 	return true
 }
@@ -330,6 +320,10 @@ type clientHS struct {
 	reqCAs  [][]byte
 	own     *stdtls.Certificate
 	pick    certCall
+	// check is the verification of the server's certificate, and then
+	// VerifyConnection, each run off the goroutine that drives the handshake
+	// (see checkThen).
+	check certCall
 
 	// TLS 1.2: the server's random, whether the master secret is the
 	// extended one, the server's key exchange parameters, and our Finished,
@@ -780,13 +774,14 @@ func (r *reader) empty() bool   { return r.ok && len(r.b) == 0 }
 // application keys, and are left to the caller.
 //
 // in is overwritten, since records are decrypted where they lie. While
-// GetClientCertificate has not answered, it consumes nothing; once it has, a
-// call goes on from where the handshake stopped, with more of in or none.
+// GetClientCertificate, or a check of the server's (see checkThen), has not
+// answered, it consumes nothing; once it has, a call goes on from where the
+// handshake stopped, with more of in or none.
 func (h *clientHS) process(in []byte) (consumed int, out []byte, done bool, err *hsError) {
-	if waiting, herr := h.pick.proceed(&out); waiting || herr != nil {
+	if waiting, herr := h.proceed(&out); waiting || herr != nil {
 		return 0, out, false, herr
 	}
-	for h.state != hsDone && !h.pick.waiting() && len(in)-consumed >= recordHeaderLen {
+	for h.state != hsDone && !h.waiting() && len(in)-consumed >= recordHeaderLen {
 		rec := in[consumed:]
 		length := int(rec[3])<<8 | int(rec[4])
 		limit := maxCiphertext13
@@ -908,6 +903,11 @@ func (h *clientHS) handshakeData(data []byte, out *[]byte) *hsError {
 			// may run across the end.
 			return fail(alertUnexpectedMessage, "handshake data after the last message of a flight")
 		}
+		if h.waiting() {
+			// The messages behind it wait with it, and are handled once
+			// it goes on.
+			return nil
+		}
 	}
 	if len(h.hsBuf) == 0 {
 		h.hsBuf = nil
@@ -924,13 +924,13 @@ func (h *clientHS) message(msg []byte, out *[]byte) *hsError {
 	case h.state == hsExpectCertificateOrRequest && typ == hsCertificateRequest:
 		return h.certificateRequest(msg)
 	case (h.state == hsExpectCertificateOrRequest || h.state == hsExpectCertificate) && typ == hsCertificate:
-		return h.certificate(msg)
+		return h.certificate(msg, out)
 	case h.state == hsExpectCertificateVerify && typ == hsCertificateVerify:
 		return h.certificateVerify(msg)
 	case h.state == hsExpectFinished && typ == hsFinished:
 		return h.finished(msg, out)
 	case h.state == hs12ExpectCertificate && typ == hsCertificate:
-		return h.certificate12(msg)
+		return h.certificate12(msg, out)
 	case h.state == hs12ExpectServerKeyExchange && typ == hsServerKeyExchange:
 		return h.serverKeyExchange(msg)
 	case h.state == hs12ExpectCertificateRequestOrDone && typ == hsCertificateRequest:
@@ -943,7 +943,7 @@ func (h *clientHS) message(msg []byte, out *[]byte) *hsError {
 		h.transcript = append(h.transcript, msg...)
 		return nil
 	case h.state == hs12ExpectFinished && typ == hsFinished:
-		return h.finished12(msg)
+		return h.finished12(msg, out)
 	}
 	return fail(alertUnexpectedMessage, "unexpected handshake message %d", msg[0])
 }
@@ -1358,7 +1358,7 @@ func (h *clientHS) certificateRequest(msg []byte) *hsError {
 	return nil
 }
 
-func (h *clientHS) certificate(msg []byte) *hsError {
+func (h *clientHS) certificate(msg []byte, out *[]byte) *hsError {
 	r := newReader(msg[4:])
 	ctx := r.vec8()
 	list := newReader(r.vec24())
@@ -1374,28 +1374,38 @@ func (h *clientHS) certificate(msg []byte) *hsError {
 		}
 		ders = append(ders, der)
 	}
-	if herr := h.acceptCertificates(ders); herr != nil {
-		return herr
-	}
 	h.transcript = append(h.transcript, msg...)
 	h.state = hsExpectCertificateVerify
-	return nil
+	return h.acceptCertificates(ders, out)
 }
 
-// acceptCertificates parses the server's chain, verifies it unless the Config
-// says not to, and gives VerifyPeerCertificate its say.
-func (h *clientHS) acceptCertificates(ders [][]byte) *hsError {
+// acceptCertificates parses the server's chain, and has it verified unless
+// the Config says not to, and VerifyPeerCertificate given its say (see
+// checkThen); until they have, the handshake waits.
+func (h *clientHS) acceptCertificates(ders [][]byte, out *[]byte) *hsError {
 	for _, der := range ders {
-		cert, err := x509.ParseCertificate(der)
+		// A copy, since a parsed certificate keeps what it was parsed from,
+		// and the messages are read where they arrived.
+		raw := bytes.Clone(der)
+		cert, err := x509.ParseCertificate(raw)
 		if err != nil {
 			return fail(alertBadCertificate, "failed to parse certificate from server: %v", err)
 		}
 		h.certs = append(h.certs, cert)
-		h.rawCerts = append(h.rawCerts, bytes.Clone(der))
+		h.rawCerts = append(h.rawCerts, raw)
 	}
 	if len(h.certs) == 0 {
 		return fail(alertDecodeError, "server sent an empty certificate chain")
 	}
+	if h.config.InsecureSkipVerify && h.config.VerifyPeerCertificate == nil {
+		return nil
+	}
+	return h.checkThen(h.verifyServer, nil, out)
+}
+
+// verifyServer verifies the server's chain unless the Config says not to, and
+// gives VerifyPeerCertificate its say.
+func (h *clientHS) verifyServer() *hsError {
 	if !h.config.InsecureSkipVerify {
 		now := time.Now()
 		if h.config.Time != nil {
@@ -1498,7 +1508,81 @@ func (h *clientHS) finished(msg []byte, out *[]byte) *hsError {
 	if h.exporter, err = deriveSecret(f, h.master, "exp master", t); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
-	return h.clientFlight(out, h.finish13)
+	if h.config.VerifyConnection == nil {
+		return h.clientFlight(out, h.finish13)
+	}
+	// VerifyConnection has its say before the client's last flight, as with
+	// crypto/tls, so that a connection it turns down gets no Finished, and a
+	// QUIC one no application keys.
+	h.flightEnd = true
+	return h.checkThen(h.verifyConnection, func(out *[]byte) *hsError { return h.clientFlight(out, h.finish13) }, out)
+}
+
+// verifyConnection gives Config.VerifyConnection its say.
+func (h *clientHS) verifyConnection() *hsError {
+	if err := h.config.VerifyConnection(h.connectionState()); err != nil {
+		return &hsError{alert: alertBadCertificate, err: err}
+	}
+	return nil
+}
+
+// waiting reports whether the handshake has set its rest aside until a
+// callback has answered: GetClientCertificate, or a check of the server's.
+func (h *clientHS) waiting() bool { return h.pick.waiting() || h.check.waiting() }
+
+// proceed goes on with what the handshake set aside, if its callback has
+// answered, and reports whether it still waits.
+func (h *clientHS) proceed(out *[]byte) (bool, *hsError) {
+	if h.check.waiting() {
+		return h.check.proceed(out)
+	}
+	return h.pick.proceed(out)
+}
+
+// checkThen runs check, a check of the server's: the verification of its
+// certificate, VerifyPeerCertificate or VerifyConnection, and then rest, if
+// there is one, unless check failed. Verifying a chain takes a while, longer
+// where the platform's verifier does it, and the callbacks are the user's and
+// may block, so check runs where GetClientCertificate does (see auth.go): on a
+// worker of the handshake pool, with the handshake set aside until it has
+// returned, and the messages that came behind the one being handled handled
+// after rest.
+func (h *clientHS) checkThen(check func() *hsError, rest func(out *[]byte) *hsError, out *[]byte) *hsError {
+	if _, ok := h.check.ask(func() (*stdtls.Certificate, error) {
+		if herr := check(); herr != nil {
+			return nil, herr
+		}
+		return nil, nil
+	}); !ok {
+		h.check.wait(func(out *[]byte) *hsError {
+			herr := h.checked()
+			if herr == nil && rest != nil {
+				herr = rest(out)
+			}
+			if herr == nil && !h.waiting() {
+				herr = h.handshakeData(nil, out)
+			}
+			return herr
+		})
+		return nil
+	}
+	if herr := h.checked(); herr != nil || rest == nil {
+		return herr
+	}
+	return rest(out)
+}
+
+// checked is what the check answered, with the call made ready for the next.
+func (h *clientHS) checked() *hsError {
+	a := h.check.answer.Load()
+	h.check.reset()
+	if a.err == nil {
+		return nil
+	}
+	if herr, ok := a.err.(*hsError); ok {
+		return herr
+	}
+	return &hsError{alert: alertInternalError, err: a.err}
 }
 
 // finish13 sends the client's last flight of TLS 1.3: its certificate if the
@@ -1564,12 +1648,6 @@ func (h *clientHS) finish13(out *[]byte) *hsError {
 	h.keyLog("CLIENT_TRAFFIC_SECRET_0", h.appClient)
 	h.keyLog("SERVER_TRAFFIC_SECRET_0", h.appServer)
 	h.keyLog("EXPORTER_SECRET", h.exporter)
-
-	if verify := h.config.VerifyConnection; verify != nil {
-		if err := verify(h.connectionState()); err != nil {
-			return &hsError{alert: alertBadCertificate, err: err}
-		}
-	}
 	h.state = hsDone
 	h.flightEnd = true
 	return nil

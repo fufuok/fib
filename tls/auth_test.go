@@ -589,3 +589,243 @@ func TestQUICClientAuthRefused(t *testing.T) {
 		t.Fatalf("got %v, want the certificate_required alert", err)
 	}
 }
+
+// A client's checks of the server, the verification of its chain,
+// VerifyPeerCertificate and VerifyConnection, run off the goroutine that drives
+// the handshake: while one takes its time for one connection, the connections
+// of the same loop and worker go on, in TLS 1.3 and 1.2, without a worker for
+// their handshake. One that fails closes the connection with its error, and
+// the server gets no Finished.
+func TestNativeClientChecksDoNotBlock(t *testing.T) {
+	started := countNative(t)
+	fellBack := countFallbacks(t)
+	ca := newTestCA(t, "server CA")
+	serverConfig := &stdtls.Config{Certificates: []stdtls.Certificate{ca.issue(t, "ecdsa-p256", "localhost", false)}}
+	addr, _ := stdStateServer(t, serverConfig)
+	// One loop and one worker: a check that blocked them would stall every
+	// other handshake.
+	engineConfig := fib.DefaultConfig()
+	engineConfig.IOPollers, engineConfig.WorkerCount, engineConfig.SharedTaskPool = false, 1, false
+	client, _ := startEchoServer(t, engineConfig, nil)
+
+	dial := func(t *testing.T, config *stdtls.Config, msg string) *collector {
+		t.Helper()
+		h := newCollector()
+		err := Dial(client, "tcp", addr, 5*time.Second, config, h, func(c *fib.Connection, err error) {
+			if err == nil {
+				_ = c.Send([]byte(msg))
+			}
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	type check struct {
+		name string
+		set  func(c *stdtls.Config, run func() error)
+	}
+	checks := []check{
+		{"VerifyPeerCertificate", func(c *stdtls.Config, run func() error) {
+			c.VerifyPeerCertificate = func(raw [][]byte, chains [][]*x509.Certificate) error {
+				if len(raw) != 1 || len(chains) != 1 {
+					return fmt.Errorf("%d certificates, %d chains", len(raw), len(chains))
+				}
+				return run()
+			}
+		}},
+		{"VerifyConnection", func(c *stdtls.Config, run func() error) {
+			c.VerifyConnection = func(state stdtls.ConnectionState) error {
+				if len(state.PeerCertificates) != 1 || len(state.VerifiedChains) != 1 || state.ServerName != "localhost" {
+					return fmt.Errorf("state %+v", state)
+				}
+				return run()
+			}
+		}},
+		{"insecure VerifyPeerCertificate", func(c *stdtls.Config, run func() error) {
+			c.InsecureSkipVerify, c.RootCAs = true, nil
+			c.VerifyPeerCertificate = func(raw [][]byte, chains [][]*x509.Certificate) error {
+				if len(raw) != 1 || len(chains) != 0 {
+					return fmt.Errorf("%d certificates, %d chains", len(raw), len(chains))
+				}
+				return run()
+			}
+		}},
+	}
+	handshakes := int64(0)
+	for _, version := range []uint16{stdtls.VersionTLS13, stdtls.VersionTLS12} {
+		config := func(set func(*stdtls.Config)) *stdtls.Config {
+			c := &stdtls.Config{RootCAs: ca.pool, ServerName: "localhost", MinVersion: version, MaxVersion: version}
+			if set != nil {
+				set(c)
+			}
+			return c
+		}
+		for _, ck := range checks {
+			t.Run(stdtls.VersionName(version)+"/"+ck.name, func(t *testing.T) {
+				release := make(chan struct{})
+				slow := dial(t, config(func(c *stdtls.Config) {
+					ck.set(c, func() error { <-release; return nil })
+				}), "slow")
+				time.Sleep(50 * time.Millisecond)
+				// The same check that does not wait, and none at all.
+				quick := dial(t, config(func(c *stdtls.Config) { ck.set(c, func() error { return nil }) }), "quick")
+				if got := quick.waitFor(t, 5); string(got) != "quick" {
+					t.Fatalf("echo %q", got)
+				}
+				plain := dial(t, config(nil), "plain")
+				if got := plain.waitFor(t, 5); string(got) != "plain" {
+					t.Fatalf("echo %q", got)
+				}
+				slow.mu.Lock()
+				shaken := slow.shaken
+				slow.mu.Unlock()
+				if shaken {
+					t.Fatal("the slow handshake finished before its check returned")
+				}
+				close(release)
+				if got := slow.waitFor(t, 4); string(got) != "slow" {
+					t.Fatalf("echo %q", got)
+				}
+			})
+			t.Run(stdtls.VersionName(version)+"/"+ck.name+" fails", func(t *testing.T) {
+				addr, server := stdStateServer(t, serverConfig)
+				h := newCollector()
+				c := config(func(c *stdtls.Config) {
+					ck.set(c, func() error { time.Sleep(10 * time.Millisecond); return errors.New("not this server") })
+				})
+				if err := Dial(client, "tcp", addr, 5*time.Second, c, h, nil); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case err := <-h.closed:
+					if err == nil || !strings.Contains(err.Error(), "not this server") {
+						t.Fatalf("closed with %v", err)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatal("the connection never closed")
+				}
+				// In TLS 1.2 the client's Finished goes first, and
+				// VerifyConnection has its say after the server's.
+				if r := server.next(t); r.err == nil && (version == stdtls.VersionTLS13 || ck.name != "VerifyConnection") {
+					t.Fatal("the server finished the handshake")
+				}
+			})
+			handshakes += 4
+		}
+	}
+	if n, f := started.Load(), fellBack.Load(); n != handshakes || f != 0 {
+		t.Fatalf("%d of %d handshakes began without a worker, %d fell back", n, handshakes, f)
+	}
+}
+
+// A client certificate whose key cannot sign by itself is passed over, as
+// crypto/tls passes it over, by a handshake that runs without a worker: a
+// server that asks for a certificate without requiring one gets none, and one
+// that requires one turns the client away.
+func TestNativeClientCertificateThatCannotSign(t *testing.T) {
+	started := countNative(t)
+	serverCA, clientCA := newTestCA(t, "server CA"), newTestCA(t, "client CA")
+	unsigned := clientCA.issue(t, "ecdsa-p256", "alice", true)
+	unsigned.PrivateKey = struct{ crypto.PublicKey }{unsigned.PrivateKey.(crypto.Signer).Public()}
+	client, _ := startEchoServer(t, fib.DefaultConfig(), nil)
+	for _, version := range []uint16{stdtls.VersionTLS13, stdtls.VersionTLS12} {
+		for _, auth := range []stdtls.ClientAuthType{stdtls.RequestClientCert, stdtls.RequireAnyClientCert} {
+			t.Run(fmt.Sprintf("%s/%v", stdtls.VersionName(version), auth), func(t *testing.T) {
+				before := started.Load()
+				addr, server := stdStateServer(t, &stdtls.Config{
+					Certificates: []stdtls.Certificate{serverCA.issue(t, "ecdsa-p256", "localhost", false)},
+					ClientAuth:   auth, ClientCAs: clientCA.pool,
+				})
+				config := &stdtls.Config{RootCAs: serverCA.pool, ServerName: "localhost", MinVersion: version, MaxVersion: version,
+					Certificates: []stdtls.Certificate{unsigned}}
+				h := newCollector()
+				if err := Dial(client, "tcp", addr, 5*time.Second, config, h, func(c *fib.Connection, err error) {
+					if err == nil {
+						_ = c.Send([]byte("ping"))
+					}
+				}); err != nil {
+					t.Fatal(err)
+				}
+				r := server.next(t)
+				if auth == stdtls.RequestClientCert {
+					if r.err != nil || len(r.state.PeerCertificates) != 0 {
+						t.Fatalf("server: %v, %d certificates", r.err, len(r.state.PeerCertificates))
+					}
+					if got := h.waitFor(t, 4); string(got) != "ping" {
+						t.Fatalf("echo %q", got)
+					}
+				} else if r.err == nil {
+					t.Fatal("the server took a client without a certificate")
+				}
+				if n := started.Load() - before; n != 1 {
+					t.Fatalf("%d handshakes began without a worker", n)
+				}
+			})
+		}
+	}
+}
+
+// Over QUIC too, a client's checks of the server run on a worker once the
+// layer can be woken, and the handshake goes on from there when they return;
+// one that fails fails the handshake, before the client's Finished.
+func TestQUICClientChecks(t *testing.T) {
+	ca := newTestCA(t, "server CA")
+	serverCert := ca.issue(t, "ecdsa-p256", "localhost", false)
+	for _, tc := range []struct {
+		name string
+		set  func(c *stdtls.Config, run func() error)
+	}{
+		{"VerifyPeerCertificate", func(c *stdtls.Config, run func() error) {
+			c.VerifyPeerCertificate = func(raw [][]byte, chains [][]*x509.Certificate) error { return run() }
+		}},
+		{"VerifyConnection", func(c *stdtls.Config, run func() error) {
+			c.VerifyConnection = func(state stdtls.ConnectionState) error {
+				if state.NegotiatedProtocol != "h3test" || len(state.VerifiedChains) != 1 {
+					return fmt.Errorf("state %+v", state)
+				}
+				return run()
+			}
+		}},
+	} {
+		for _, fails := range []bool{false, true} {
+			name := tc.name
+			if fails {
+				name += " fails"
+			}
+			t.Run(name, func(t *testing.T) {
+				var calls atomic.Int64
+				client := ourClient(t, quicClientConfig(ca.pool, func(c *stdtls.Config) {
+					tc.set(c, func() error {
+						calls.Add(1)
+						time.Sleep(10 * time.Millisecond)
+						if fails {
+							return errors.New("not this server")
+						}
+						return nil
+					})
+				}))
+				wake := make(chan struct{}, 1)
+				client.SetWake(func() { wake <- struct{}{} })
+				server := stdServer(quicServerConfig(serverCert, nil))
+				cli, srv, err := quicRunWith(t, client, server, 1000, quicRunOptions{wakes: []chan struct{}{wake}, clientErrors: true})
+				if fails {
+					if err == nil || !strings.Contains(err.Error(), "not this server") {
+						t.Fatalf("got %v", err)
+					}
+					if srv.done {
+						t.Fatal("the server finished the handshake")
+					}
+				} else {
+					if err != nil {
+						t.Fatal(err)
+					}
+					quicCheck(t, cli, srv)
+				}
+				if n := calls.Load(); n != 1 {
+					t.Fatalf("the check ran %d times", n)
+				}
+			})
+		}
+	}
+}

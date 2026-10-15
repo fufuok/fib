@@ -159,6 +159,28 @@ func (p *chanAdaptivePool) submit(task Task) bool {
 	return true
 }
 
+// trySubmit is submit for a caller that does not wait: it reports false when
+// the queue is full.
+func (p *chanAdaptivePool) trySubmit(task Task) bool {
+	p.submitting.Add(1)
+	defer p.submitting.Add(-1)
+	if p.stopped.Load() {
+		return false
+	}
+	select {
+	case p.tasks <- task:
+	default:
+		p.grow()
+		select {
+		case p.tasks <- task:
+		default:
+			return false
+		}
+	}
+	p.grow()
+	return true
+}
+
 func (p *chanAdaptivePool) submitBatch(tasks []Task) int {
 	p.submitting.Add(1)
 	defer p.submitting.Add(-1)

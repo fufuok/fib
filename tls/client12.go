@@ -96,7 +96,7 @@ func (h *clientHS) serverHello12(msg []byte, random, sessionID []byte, cipherSui
 	return nil
 }
 
-func (h *clientHS) certificate12(msg []byte) *hsError {
+func (h *clientHS) certificate12(msg []byte, out *[]byte) *hsError {
 	r := newReader(msg[4:])
 	list := newReader(r.vec24())
 	if !r.empty() || !list.ok {
@@ -110,12 +110,9 @@ func (h *clientHS) certificate12(msg []byte) *hsError {
 		}
 		ders = append(ders, der)
 	}
-	if herr := h.acceptCertificates(ders); herr != nil {
-		return herr
-	}
 	h.transcript = append(h.transcript, msg...)
 	h.state = hs12ExpectServerKeyExchange
-	return nil
+	return h.acceptCertificates(ders, out)
 }
 
 // serverKeyExchange checks the ECDHE parameters the server signed.
@@ -303,17 +300,20 @@ func (h *clientHS) serverChangeCipherSpec(body []byte) *hsError {
 	return nil
 }
 
-func (h *clientHS) finished12(msg []byte) *hsError {
+func (h *clientHS) finished12(msg []byte, out *[]byte) *hsError {
 	want := prf12(h.suite.hash, h.master, "server finished", h.transcriptHash(), 12)
 	if !hmac.Equal(want, msg[4:]) {
 		return fail(alertDecryptError, "invalid server finished hash")
 	}
-	if verify := h.config.VerifyConnection; verify != nil {
-		if err := verify(h.connectionState()); err != nil {
-			return &hsError{alert: alertBadCertificate, err: err}
-		}
-	}
-	h.state = hsDone
 	h.flightEnd = true
-	return nil
+	if h.config.VerifyConnection == nil {
+		h.state = hsDone
+		return nil
+	}
+	// After the server's Finished, since the connection's tls-unique is the
+	// client's Finished, sent before it.
+	return h.checkThen(h.verifyConnection, func(*[]byte) *hsError {
+		h.state = hsDone
+		return nil
+	}, out)
 }

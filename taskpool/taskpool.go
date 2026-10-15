@@ -77,6 +77,12 @@ type backend interface {
 	attrs() []any
 }
 
+// trySubmitter is a backend that can turn a task away when its queue is full
+// rather than wait for room; see TaskPool.TryGo.
+type trySubmitter interface {
+	trySubmit(Task) bool
+}
+
 // executor runs a pool's tasks, and knows which pool it runs them for so
 // that what it logs says so.
 type executor struct {
@@ -203,6 +209,20 @@ func (tp *TaskPool) GoTask(task Task) bool {
 		return true
 	}
 	return tp.backend.submit(task)
+}
+
+// TryGo is Go for a caller that must not wait for room in the queue, such as
+// an event loop: it reports false, and f does not run, when the queue is full
+// as well as when the pool has stopped. A ModeAdaptive or ModeAdaptiveChan
+// pool turns f away; one of another mode waits for room as Go does.
+func (tp *TaskPool) TryGo(f func()) bool {
+	if f == nil {
+		return true
+	}
+	if t, ok := tp.backend.(trySubmitter); ok {
+		return t.trySubmit(taskFunc(f))
+	}
+	return tp.backend.submit(taskFunc(f))
 }
 
 // GoTasks submits tasks in order and returns how many were accepted. Tasks

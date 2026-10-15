@@ -34,7 +34,9 @@ const (
 	// workers again once the handshakes are over.
 	handshakeWorkers = 1 << 16
 	// queueSize bounds what waits for a worker in either pool, once it is at
-	// its ceiling. A submission that finds the queue full waits for room.
+	// its ceiling. A submission to the client pool that finds the queue full
+	// waits for room; package tls submits to the handshake pool with TryGo,
+	// and closes the connection instead, since it submits from an event loop.
 	queueSize = 10000
 )
 

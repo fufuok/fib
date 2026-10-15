@@ -29,7 +29,9 @@ import (
 // machines run on whatever goroutine drives them, an engine's loop or worker
 // for TCP, or a QUIC connection's datagram handler holding its lock, where a
 // call that blocks stalls every connection that goroutine serves. So a
-// callback is not called there: it is handed to a worker of the handshake
+// callback is not called there, and neither is a client's verification of
+// the server's certificate, nor its VerifyPeerCertificate and VerifyConnection
+// (see clientHS.checkThen): it is handed to a worker of the handshake
 // pool, the handshake sets the rest aside, and once the callback returns the
 // worker drives the handshake on (see certCall). The cost is a hop to the pool
 // and back for the full handshakes that need a callback, which is small next
@@ -100,6 +102,13 @@ func (c *certCall) wait(rest func(out *[]byte) *hsError) { c.resume = rest }
 
 // waiting reports whether the handshake has something set aside.
 func (c *certCall) waiting() bool { return c.resume != nil }
+
+// reset makes the call ready to be asked again, once its answer is taken.
+func (c *certCall) reset() {
+	c.asked = false
+	c.answer.Store(nil)
+	c.resume = nil
+}
 
 // proceed runs what was set aside if the answer has come, and reports
 // whether the handshake still waits.

@@ -478,7 +478,10 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
     ALPN、SNI、扩展主密钥、降级检测、按 `RootCAs` / `InsecureSkipVerify` 校验服务端证书并验证签名（ECDSA、RSA-PSS、
     RSA PKCS#1、Ed25519）、`VerifyPeerCertificate` / `VerifyConnection`、`KeyLogWriter`、`Config.CipherSuites`。服务端要求
     客户端证书时，和 `crypto/tls` 一样出示 `GetClientCertificate` 返回的证书，或 `Certificates` 里第一张符合服务端 CA 列表和签名方案的证书
-    （都没有就回空 Certificate），并用 CertificateVerify 证明持有私钥。`MinVersion` 设成 TLS 1.0 / 1.1 的配置仍走 `crypto/tls`。
+    （都没有就回空 Certificate），并用 CertificateVerify 证明持有私钥。私钥不是 `crypto.Signer` 的证书和 `crypto/tls` 一样被跳过，
+    不再因此回退。校验服务端证书链（平台验证器可能较慢）、`VerifyPeerCertificate`、`VerifyConnection` 和 `GetClientCertificate` 一样
+    交给握手池的 worker，不在驱动握手的协程上执行；TLS 1.3 的 `VerifyConnection` 在客户端发出 Finished 之前调用，和 `crypto/tls` 一致。
+    `MinVersion` 设成 TLS 1.0 / 1.1 的配置仍走 `crypto/tls`。
   - **服务端**（`tls/server13.go`、`tls/server12.go`）：`Config` 有证书（`Certificates` 或 `GetCertificate`）、没有
     `GetConfigForClient` 时，TLS 1.3 和 TLS 1.2 的握手都走状态机；客户端认证（`ClientAuth` 的各个模式、`ClientCAs`、
     `VerifyPeerCertificate`）也在状态机里做，结果和 `crypto/tls` 一致，`ConnectionState` 带 `PeerCertificates` / `VerifiedChains`，

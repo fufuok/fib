@@ -444,7 +444,7 @@ func TestNativeClientQualification(t *testing.T) {
 		{"capped below the minimum", &stdtls.Config{MinVersion: stdtls.VersionTLS13, MaxVersion: stdtls.VersionTLS12}, false},
 		{"client certificates", &stdtls.Config{MinVersion: stdtls.VersionTLS13, Certificates: []stdtls.Certificate{{}}}, true},
 		{"GetClientCertificate", &stdtls.Config{GetClientCertificate: func(*stdtls.CertificateRequestInfo) (*stdtls.Certificate, error) { return nil, nil }}, true},
-		{"a client certificate whose key cannot sign", &stdtls.Config{Certificates: []stdtls.Certificate{{Certificate: [][]byte{{1}}, PrivateKey: "no"}}}, false},
+		{"a client certificate whose key cannot sign", &stdtls.Config{Certificates: []stdtls.Certificate{{Certificate: [][]byte{{1}}, PrivateKey: "no"}}}, true},
 		{"session cache", &stdtls.Config{MinVersion: stdtls.VersionTLS13, ClientSessionCache: stdtls.NewLRUClientSessionCache(1)}, false},
 		{"known curves", &stdtls.Config{MinVersion: stdtls.VersionTLS13, CurvePreferences: []stdtls.CurveID{stdtls.CurveP256}}, true},
 		{"unknown curves", &stdtls.Config{MinVersion: stdtls.VersionTLS13, CurvePreferences: []stdtls.CurveID{stdtls.CurveP521}}, false},

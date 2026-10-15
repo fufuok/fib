@@ -124,11 +124,6 @@ func (h *clientHS) finishQUIC(exporter []byte) *hsError {
 	h.keyLog("EXPORTER_SECRET", exporter)
 	h.quic.setRead(stdtls.QUICEncryptionLevelApplication, h.suiteID, h.appServer)
 	h.quic.setWrite(stdtls.QUICEncryptionLevelApplication, h.suiteID, h.appClient)
-	if verify := h.config.VerifyConnection; verify != nil {
-		if err := verify(h.connectionState()); err != nil {
-			return &hsError{alert: alertBadCertificate, err: err}
-		}
-	}
 	h.state = hsDone
 	h.flightEnd = true
 	h.quic.done()
@@ -225,7 +220,7 @@ func nativeQUICClient(config *stdtls.Config) bool {
 	if config.MaxVersion != 0 && config.MaxVersion < stdtls.VersionTLS13 || config.MinVersion > stdtls.VersionTLS13 {
 		return false
 	}
-	if config.ClientSessionCache != nil || config.EncryptedClientHelloConfigList != nil || !signingCertificates(config) {
+	if config.ClientSessionCache != nil || config.EncryptedClientHelloConfigList != nil {
 		return false
 	}
 	if len(config.CurvePreferences) != 0 {
@@ -312,11 +307,13 @@ func (s *QUICServer) NewConn() *QUICConn {
 
 // SetWake lets the handshake call the certificate callbacks of the Config,
 // GetCertificate and GetClientCertificate, which may block, on a goroutine of
-// their own: the handshake then waits, with no events to read, until one has
-// returned, and calls wake from that goroutine, after which the QUIC layer
-// reads the events that follow from NextEvent, as it does after HandleData,
-// under whatever lock it holds for that. Without it, the callbacks are called
-// from HandleData, as crypto/tls's QUICConn does. It is set before Start.
+// their own, and a client verify the server's certificate and call
+// VerifyPeerCertificate and VerifyConnection there too: the handshake then
+// waits, with no events to read, until one has returned, and calls wake from
+// that goroutine, after which the QUIC layer reads the events that follow from
+// NextEvent, as it does after HandleData, under whatever lock it holds for
+// that. Without it, the callbacks are called from HandleData, as crypto/tls's
+// QUICConn does. It is set before Start.
 func (c *QUICConn) SetWake(wake func()) {
 	c.wake = wake
 	if c.server != nil {
@@ -333,7 +330,7 @@ func (c *QUICConn) async() func(call func()) bool {
 		return nil
 	}
 	return func(call func()) bool {
-		return sidepool.Handshake().Go(func() {
+		return sidepool.Handshake().TryGo(func() {
 			call()
 			wake()
 		})
@@ -368,6 +365,7 @@ func (c *QUICConn) Start(ctx context.Context) error {
 	}
 	c.client = h
 	h.pick.async = c.async()
+	h.check.async = h.pick.async
 	if c.suites != nil {
 		h.suites = c.suites
 	}
@@ -471,9 +469,10 @@ func (c *QUICConn) resumePending() {
 	}
 }
 
-// waiting reports whether the handshake waits for a certificate callback.
+// waiting reports whether the handshake waits for a certificate callback, or
+// a client for a check of the server's.
 func (c *QUICConn) waiting() bool {
-	return c.server != nil && c.server.pick.waiting() || c.client != nil && c.client.pick.waiting()
+	return c.server != nil && c.server.pick.waiting() || c.client != nil && c.client.waiting()
 }
 
 // resumePicked goes on with a handshake that waited for a certificate
@@ -483,13 +482,13 @@ func (c *QUICConn) resumePicked() {
 	if c.err != nil || !c.waiting() {
 		return
 	}
-	var pick *certCall
+	var waiting bool
+	var herr *hsError
 	if c.server != nil {
-		pick = &c.server.pick
+		waiting, herr = c.server.pick.proceed(nil)
 	} else {
-		pick = &c.client.pick
+		waiting, herr = c.client.proceed(nil)
 	}
-	waiting, herr := pick.proceed(nil)
 	if waiting {
 		return
 	}

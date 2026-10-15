@@ -47,6 +47,10 @@ type quicSide struct {
 	resumed  *stdtls.SessionState
 	rejected bool
 	decline  bool
+	// keepErr has an error event kept in err, for the run to return,
+	// rather than fail the test.
+	keepErr bool
+	err     error
 }
 
 func newQuicSide(conn quicEnd) *quicSide {
@@ -101,7 +105,12 @@ func (s *quicSide) events(t *testing.T) {
 		case stdtls.QUICRejectedEarlyData:
 			s.rejected = true
 		case stdtls.QUICErrorEvent:
-			t.Fatalf("error event: %v", e.Err)
+			if !s.keepErr {
+				t.Fatalf("error event: %v", e.Err)
+			}
+			if s.err == nil {
+				s.err = e.Err
+			}
 		}
 	}
 }
@@ -123,6 +132,8 @@ type quicRunOptions struct {
 	// wakes are where the ends that SetWake was given are woken, for the
 	// run to wait on when neither has anything to say.
 	wakes []chan struct{}
+	// clientErrors has the run return the client's error event.
+	clientErrors bool
 }
 
 func quicRunWith(t *testing.T, client, server quicEnd, chunk int, opts quicRunOptions) (*quicSide, *quicSide, error) {
@@ -130,6 +141,7 @@ func quicRunWith(t *testing.T, client, server quicEnd, chunk int, opts quicRunOp
 	cli, srv := newQuicSide(client), newQuicSide(server)
 	srv.decline = opts.serverDeclines
 	cli.decline = opts.clientDeclines
+	cli.keepErr = opts.clientErrors
 	client.SetTransportParameters([]byte("client parameters"))
 	server.SetTransportParameters([]byte("server parameters"))
 	if err := client.Start(context.Background()); err != nil {
@@ -142,6 +154,9 @@ func quicRunWith(t *testing.T, client, server quicEnd, chunk int, opts quicRunOp
 	for step := 0; step < 10000; step++ {
 		cli.events(t)
 		srv.events(t)
+		if cli.err != nil {
+			return cli, srv, cli.err
+		}
 		moved := false
 		for _, pair := range []struct{ from, to *quicSide }{{cli, srv}, {srv, cli}} {
 			// The lowest level that has anything, and no higher one until it
@@ -176,6 +191,9 @@ func quicRunWith(t *testing.T, client, server quicEnd, chunk int, opts quicRunOp
 		if !moved {
 			cli.events(t)
 			srv.events(t)
+			if cli.err != nil {
+				return cli, srv, cli.err
+			}
 			if !cli.pending() && !srv.pending() && !(cli.done && srv.done) && len(opts.wakes) > 0 {
 				// An end waits for a certificate callback on another
 				// goroutine.
@@ -474,8 +492,8 @@ func TestQUICQualification(t *testing.T) {
 	if NewQUICClient(&stdtls.Config{ServerName: "a", Certificates: []stdtls.Certificate{cert}}) == nil {
 		t.Error("a client with certificates does not qualify")
 	}
-	if NewQUICClient(&stdtls.Config{ServerName: "a", Certificates: []stdtls.Certificate{{Certificate: [][]byte{{1}}, PrivateKey: "no"}}}) != nil {
-		t.Error("a client with a key that cannot sign qualifies")
+	if NewQUICClient(&stdtls.Config{ServerName: "a", Certificates: []stdtls.Certificate{{Certificate: [][]byte{{1}}, PrivateKey: "no"}}}) == nil {
+		t.Error("a client with a key that cannot sign does not qualify")
 	}
 	if NewQUICClient(&stdtls.Config{ServerName: "a"}) == nil {
 		t.Error("an ordinary client does not qualify")

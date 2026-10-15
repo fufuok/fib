@@ -139,6 +139,8 @@ func (b *adaptiveBackend) pick() *adaptivePool {
 
 func (b *adaptiveBackend) submit(task Task) bool { return b.pick().submit(task) }
 
+func (b *adaptiveBackend) trySubmit(task Task) bool { return b.pick().trySubmit(task) }
+
 func (b *adaptiveBackend) submitBatch(tasks []Task) int { return b.pick().submitBatch(tasks) }
 
 func (b *adaptiveBackend) stop() {
@@ -654,6 +656,18 @@ func (p *adaptivePool) submit(task Task) bool {
 		return false
 	}
 	if !p.ring.push(task) && !p.pushSlow(task) {
+		return false
+	}
+	p.kick()
+	return true
+}
+
+// trySubmit is submit for a caller that does not wait: it reports false when
+// the queue is full.
+func (p *adaptivePool) trySubmit(task Task) bool {
+	p.submitting.Add(1)
+	defer p.submitting.Add(-1)
+	if p.stopped.Load() || !p.ring.push(task) {
 		return false
 	}
 	p.kick()
