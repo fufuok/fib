@@ -911,8 +911,11 @@ func (e *Engine) markClosedLocked(c *Connection, closeErr error) {
 	c.wakeOutputWaitLocked()
 	// Record why, so a Read or Write that comes back to the connection is
 	// told what happened rather than only that it is closed, and drop the
-	// deadline timers, which have nothing left to close.
-	c.setCloseReasonLocked(closeErr)
+	// deadline timers, which have nothing left to close. A reason
+	// CloseWithError gave stands.
+	if !c.flags.has(flagCloseReason) {
+		c.setCloseReasonLocked(closeErr)
+	}
 	c.stopDeadlinesLocked()
 	// Buffers the kernel is still sending from cannot go back to the pool: the
 	// next connection to take one would overwrite bytes still on their way out.

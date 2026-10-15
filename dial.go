@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/internal/netaddr"
+	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/sidepool"
 )
 
@@ -137,7 +138,7 @@ func (d *dialRequest) fail(err error) {
 // opError wraps a dial failure the way net.Dial does.
 func (d *dialRequest) opError(err error) error {
 	if errno, ok := err.(syscall.Errno); ok {
-		err = os.NewSyscallError("connect", errno)
+		err = os.NewSyscallError("connect", sys.PortableErrno(errno))
 	}
 	opErr := &net.OpError{Op: "dial", Net: d.network, Err: err}
 	if netaddr.IsUnix(d.network) {

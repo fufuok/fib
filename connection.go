@@ -168,6 +168,11 @@ const (
 	// flagNoWriteBackpressure records SetWriteBackpressure(false): the
 	// connection's own backlog does not pause its reads.
 	flagNoWriteBackpressure
+	// flagCloseReason marks a reason CloseWithError recorded when it asked
+	// for the close, which the close reports over whatever the event loop
+	// meets before carrying it out: a layer that answers a failed handshake
+	// with an alert has the peer hang up in reply, often before then.
+	flagCloseReason
 )
 
 // attachSeq is the unit of the sequence count kept in the upper half of
@@ -407,6 +412,10 @@ func (c *Connection) closeWithError(err error) {
 	c.mu.Lock()
 	request := !c.closing && !c.closed
 	c.closing = true
+	if request && err != nil {
+		c.setCloseReasonLocked(err)
+		c.flags.set(flagCloseReason, true)
+	}
 	c.wakeOutputWaitLocked()
 	c.mu.Unlock()
 	if request {
@@ -1753,7 +1762,9 @@ func (c *Connection) SetWriteBuffer(bytes int) error {
 // connection, which goes on sending until it is closed. Only a stream,
 // TCP or Unix, has a side to shut; on a UDP connection it does nothing.
 func (c *Connection) CloseRead() error {
-	if c.udp != nil {
+	// A repeat does nothing, even once the connection has closed: shutting
+	// both sides raises a hangup, which closes it.
+	if c.udp != nil || c.flags.has(flagReadShut) {
 		return nil
 	}
 	return c.control("shutdown", func(s rawSocket) error {
@@ -1771,6 +1782,13 @@ func (c *Connection) CloseRead() error {
 // close_notify, it does not send. On a UDP connection it does nothing.
 func (c *Connection) CloseWrite() error {
 	if c.udp != nil {
+		return nil
+	}
+	// A repeat does nothing, as CloseRead's does.
+	c.mu.Lock()
+	shut := c.writeShut
+	c.mu.Unlock()
+	if shut {
 		return nil
 	}
 	return c.control("shutdown", func(s rawSocket) error {

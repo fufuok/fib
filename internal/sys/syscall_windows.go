@@ -168,3 +168,51 @@ func WSABufs(bufs []syscall.WSABuf, data ...[]byte) int {
 // maxWSABufLen keeps one buffer's length within WSABUF's 32-bit field. A
 // longer slice is simply sent in more than one call.
 const MaxWSABufLen = 1 << 30
+
+// The codes a refused or unroutable connect fails with: ConnectEx reports
+// the ERROR_ ones, a plain connect the WSAE ones.
+const (
+	errorConnectionRefused  = syscall.Errno(1225)
+	errorNetworkUnreachable = syscall.Errno(1231)
+	errorHostUnreachable    = syscall.Errno(1232)
+	wsaeNetUnreach          = syscall.Errno(10051)
+	wsaeConnRefused         = syscall.Errno(10061)
+	wsaeHostUnreach         = syscall.Errno(10065)
+)
+
+// PortableErrno is errno as a failed connect reports it. A code Windows
+// names its own way is wrapped so that errors.Is also matches the error
+// package syscall names it by on every platform, as the Unix engines report
+// it: a caller checking for syscall.ECONNREFUSED hears of a refused connect
+// on Windows too, where net's dial has it match only the Windows code. The
+// Windows code is still what it unwraps to.
+func PortableErrno(errno syscall.Errno) error {
+	var portable syscall.Errno
+	switch errno {
+	case errorConnectionRefused, wsaeConnRefused:
+		portable = syscall.ECONNREFUSED
+	case errorNetworkUnreachable, wsaeNetUnreach:
+		portable = syscall.ENETUNREACH
+	case errorHostUnreachable, wsaeHostUnreach:
+		portable = syscall.EHOSTUNREACH
+	default:
+		return errno
+	}
+	return &connectErrno{errno: errno, portable: portable}
+}
+
+// connectErrno is a Windows code that also matches its portable error.
+type connectErrno struct {
+	errno, portable syscall.Errno
+}
+
+func (e *connectErrno) Error() string { return e.errno.Error() }
+
+func (e *connectErrno) Unwrap() error { return e.errno }
+
+func (e *connectErrno) Is(target error) bool { return target == e.portable }
+
+// Timeout and Temporary are errno's, for a caller asking net.Error.
+func (e *connectErrno) Timeout() bool { return e.errno.Timeout() }
+
+func (e *connectErrno) Temporary() bool { return e.errno.Temporary() }
