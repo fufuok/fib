@@ -165,6 +165,9 @@ const (
 	// whose write side is shut: what still arrives is read and dropped, never
 	// handed to OnData, until the peer ends its side or the linger runs out.
 	flagLingering
+	// flagNoWriteBackpressure records SetWriteBackpressure(false): the
+	// connection's own backlog does not pause its reads.
+	flagNoWriteBackpressure
 )
 
 // attachSeq is the unit of the sequence count kept in the upper half of
@@ -662,7 +665,7 @@ func (c *Connection) pauseDecision(readPaused bool) (pause, byBudget bool) {
 	if e.maxPendingBytes > 0 && e.pendingTotal.Load() >= e.maxPendingBytes {
 		return true, true
 	}
-	if e.writeHighWatermark <= 0 {
+	if e.writeHighWatermark <= 0 || c.flags.has(flagNoWriteBackpressure) {
 		return false, false
 	}
 	pendingBytes := c.pendingBytes.Load()
@@ -1070,7 +1073,8 @@ func (c *Connection) process() {
 				alive = closeErr == nil
 			}
 			if alive && events&evIn != 0 {
-				if c.hasQueuedOutput() && (c.engine.writeHighWatermark <= 0 || c.readShouldStop()) {
+				if c.hasQueuedOutput() && (c.engine.writeHighWatermark <= 0 && !c.flags.has(flagNoWriteBackpressure) ||
+					c.readShouldStop()) {
 					// The output queued already fills the connection's budget, or
 					// the handler holds reads, or there is no watermark and the
 					// queue is all that bounds this connection's buffering. Queued
@@ -1103,8 +1107,16 @@ func (c *Connection) process() {
 			closeErr = c.socketError()
 			alive = false
 		} else if alive && events&(evHup|evRdHup)&^deferred != 0 {
-			closeErr = io.EOF
-			alive = false
+			if c.flags.has(flagReadHeld) {
+				// The handler holds reads, so what the peer sent before it
+				// ended is still in the socket, behind the end. The read the
+				// release hands back takes it and then the end, which closes
+				// the connection as it would have here.
+				c.stallRead()
+			} else {
+				closeErr = io.EOF
+				alive = false
+			}
 		}
 		if !alive {
 			c.closeWithError(closeErr)
@@ -1398,6 +1410,26 @@ func (c *Connection) HoldReads(hold bool) {
 
 // ReadsHeld reports whether HoldReads is currently holding reads back.
 func (c *Connection) ReadsHeld() bool { return c.flags.has(flagReadHeld) }
+
+// SetWriteBackpressure says whether the connection's own backlog paces its
+// reads, which it does by default: while more than
+// Config.WriteBufferHighWatermark of what it was sent waits for its socket,
+// it stops reading, so that a peer that sends faster than it reads the
+// replies is held back by TCP rather than by memory here.
+//
+// A relay, which passes what one connection reads on to another, turns it
+// off on both and paces each by the other's backlog instead, with HoldReads.
+// Left on, a connection whose writes to its peer back up would stop reading
+// that peer's answers, and a peer that answers as it reads, waiting to send
+// before it reads more, would then wait for it forever. Holds and the
+// server-wide MaxPendingBytes still pause it. It may be called from any
+// goroutine, and takes effect from the next read.
+func (c *Connection) SetWriteBackpressure(on bool) {
+	if c.flags.set(flagNoWriteBackpressure, !on) == !on {
+		return
+	}
+	c.engine.request(command{kind: commandRefresh, connection: c})
+}
 
 // readShouldStop reports whether this round should stop reading: either queued
 // output has reached the budget that bounds how much this connection, or the

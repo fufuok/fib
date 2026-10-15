@@ -1352,3 +1352,109 @@ func TestSetCoalesceWritesOverridesEngine(t *testing.T) {
 		}
 	}
 }
+
+// TestHoldReadsKeepsWhatCameBeforeTheEnd checks that a peer that ends its
+// side while reads are held loses nothing: the end comes behind what it sent,
+// so releasing the hold delivers all of that and then closes the connection,
+// rather than the hangup closing it with the bytes still in the socket. A
+// peer that ends without sending anything closes the connection once the
+// hold is released too.
+func TestHoldReadsKeepsWhatCameBeforeTheEnd(t *testing.T) {
+	const payload = 4 << 20
+	var (
+		mu       sync.Mutex
+		received int
+		holder   atomic.Pointer[Connection]
+	)
+	got := make(chan struct{}, 1)
+	closed := make(chan error, 2)
+	handler := HandlerFuncs{
+		Open: func(c *Connection) {
+			holder.Store(c)
+			c.HoldReads(true)
+		},
+		Data: func(c *Connection, data []byte) {
+			mu.Lock()
+			received += len(data)
+			mu.Unlock()
+			select {
+			case got <- struct{}{}:
+			default:
+			}
+		},
+		Close: func(_ *Connection, err error) { closed <- err },
+	}
+	_, addr := startEchoServer(t, DefaultConfig(), handler)
+
+	for _, size := range []int{payload, 0} {
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+		go func() {
+			_, _ = conn.Write(make([]byte, size))
+			_ = conn.(*net.TCPConn).CloseWrite()
+		}()
+		// Long enough for the end to reach the server under the hold.
+		time.Sleep(300 * time.Millisecond)
+		select {
+		case err := <-closed:
+			t.Fatalf("closed under the hold: %v", err)
+		default:
+		}
+		for holder.Load() == nil {
+			time.Sleep(time.Millisecond)
+		}
+		holder.Swap(nil).HoldReads(false)
+		select {
+		case err := <-closed:
+			if err != nil && err != io.EOF {
+				t.Fatalf("closed with %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the connection stayed open after the hold was released")
+		}
+		mu.Lock()
+		n := received
+		received = 0
+		mu.Unlock()
+		if n != size {
+			t.Fatalf("%d of %d bytes arrived", n, size)
+		}
+		_ = conn.Close()
+	}
+}
+
+// TestSetWriteBackpressure checks that a connection whose own backlog has
+// grown past the watermark, its peer reading none of it, stops reading that
+// peer by default, and goes on reading with SetWriteBackpressure(false).
+func TestSetWriteBackpressure(t *testing.T) {
+	const sent = 1 << 20
+	for _, on := range []bool{true, false} {
+		var received atomic.Int64
+		handler := HandlerFuncs{
+			Open: func(c *Connection) { c.SetWriteBackpressure(on) },
+			Data: func(c *Connection, data []byte) {
+				received.Add(int64(len(data)))
+				// Answer every byte with sixteen, which the peer never reads.
+				_ = c.Send(make([]byte, 16*len(data)))
+			},
+		}
+		_, addr := startEchoServer(t, DefaultConfig(), handler)
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+		go func() { _, _ = conn.Write(make([]byte, sent)) }()
+		deadline := time.Now().Add(3 * time.Second)
+		for received.Load() < sent && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := received.Load() == sent; got == on {
+			t.Errorf("backpressure %v: the connection read %d of %d bytes", on, received.Load(), sent)
+		}
+		_ = conn.Close()
+	}
+}

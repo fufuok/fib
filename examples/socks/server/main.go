@@ -1,16 +1,20 @@
 //go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
-// Command server is a SOCKS proxy: SOCKS5, with UDP ASSOCIATE on the UDP
-// port of the same number, and SOCKS4 and SOCKS4a.
+// Command server is a proxy: SOCKS5, with UDP ASSOCIATE on the UDP port of
+// the same number, SOCKS4 and SOCKS4a, and on the same TCP port an HTTP
+// proxy for CONNECT, which package mux tells apart by the first bytes a
+// client sends.
 //
 //	go run ./examples/socks/server
 //	curl --socks5-hostname 127.0.0.1:1080 https://example.com/
+//	curl --proxy http://127.0.0.1:1080 https://example.com/
 //
-// With -user and -pass it asks SOCKS5 clients to log in, and turns SOCKS4
-// clients, which have no password to give, away:
+// With -user and -pass it asks SOCKS5 and HTTP clients to log in, and turns
+// SOCKS4 clients, which have no password to give, away:
 //
 //	go run ./examples/socks/server -user me -pass secret
 //	curl --proxy socks5h://me:secret@127.0.0.1:1080 https://example.com/
+//	curl --proxy http://me:secret@127.0.0.1:1080 https://example.com/
 package main
 
 import (
@@ -18,12 +22,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	stdhttp "net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/examples/example"
+	fibhttp "github.com/lesismal/fib/http"
+	"github.com/lesismal/fib/mux"
 	"github.com/lesismal/fib/socks"
 )
 
@@ -51,22 +58,31 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	}
 
 	var config socks.Config
+	var connect fibhttp.ConnectProxyConfig
 	if *user != "" || *pass != "" {
 		config.Authenticate = func(u, p string) bool { return u == *user && p == *pass }
+		connect.Authenticate = config.Authenticate
 	}
 	config.Allow = func(r *socks.Request) error {
 		fmt.Fprintf(out, "%s %s %s from %s\n", r.Version, r.Command, r.Addr, r.Conn.RemoteAddr())
 		return nil
 	}
+	connect.Allow = func(r *stdhttp.Request) error {
+		fmt.Fprintf(out, "%s CONNECT %s from %s\n", r.Proto, r.Host, r.RemoteAddr)
+		return nil
+	}
 	server := socks.NewServer(config)
 	engineConfig := fib.DefaultConfig()
 	engineConfig.Bindings = []fib.Binding{
-		{Addr: *addr, Handler: server},
+		{Addr: *addr, Handler: mux.New(
+			mux.Route{Match: mux.SOCKS(), Handler: server},
+			mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(fibhttp.NewConnectProxy(connect))},
+		)},
 		{Network: "udp", Addr: *addr, Handler: server},
 	}
 	engine, err := fib.Bind(engineConfig, nil)
 	if err != nil {
 		return err
 	}
-	return example.Serve(ctx, out, ready, "SOCKS proxy listening on %s", engine)
+	return example.Serve(ctx, out, ready, "SOCKS and HTTP proxy listening on %s", engine)
 }

@@ -10,6 +10,7 @@ import (
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/outputwait"
 )
 
 // A Tunnel is what Context.Upgrade switches a request to: a stream of bytes
@@ -291,13 +292,74 @@ func (f *TunnelFeed) Shutdown() {
 }
 
 // StreamUpgrader is implemented by a Stream whose request can become a tunnel:
-// an extended CONNECT on a protocol served outside this package.
+// a CONNECT on a protocol served outside this package.
 type StreamUpgrader interface {
-	// Upgrade accepts req's extended CONNECT for protocol with a 200 carrying
-	// header, leaving the stream open, and returns the stream's tunnel, which
-	// the Context then opens. It reports ErrNotUpgradable when req is not an
-	// extended CONNECT for protocol.
+	// Upgrade accepts req's extended CONNECT for protocol, or with protocol
+	// empty req's CONNECT to a host and port, with a 200 carrying header,
+	// leaving the stream open, and returns the stream's tunnel, which the
+	// Context then opens. It reports ErrNotUpgradable when req is not such a
+	// CONNECT.
 	Upgrade(req *stdhttp.Request, protocol string, header stdhttp.Header) (*Tunnel, error)
+}
+
+// TunnelPacer is implemented by a TunnelWriter that can pace its tunnel, as
+// those of HTTP/2 and HTTP/3 do; see Tunnel.HoldReads, Tunnel.Unsent and
+// Tunnel.WaitSendable, which call it.
+type TunnelPacer interface {
+	HoldReads(hold bool)
+	Unsent() int
+	WaitSendable(limit int) error
+}
+
+// HoldReads stops or resumes taking what the peer sends through the tunnel,
+// so that a handler that passes it on to something slower paces the peer by
+// flow control rather than by memory here: over HTTP/1.1 the connection
+// stops reading its socket, and over HTTP/2 and HTTP/3 the stream stops
+// giving the peer room for more, so that at most what its window allowed
+// already still arrives. Holds do not nest: the last call wins. It may be
+// called from any goroutine, OnTunnelData included, and does nothing on a
+// tunnel whose writer cannot pace it.
+func (t *Tunnel) HoldReads(hold bool) {
+	switch w := t.w.(type) {
+	case *fib.Connection:
+		w.HoldReads(hold)
+	case TunnelPacer:
+		w.HoldReads(hold)
+	}
+}
+
+// Unsent reports how many bytes sent through the tunnel are still waiting
+// to go to the peer: queued for the connection's socket over HTTP/1.1, and
+// held back by the peer's flow control or the connection's over HTTP/2 and
+// HTTP/3. It is zero on a tunnel whose writer cannot tell.
+func (t *Tunnel) Unsent() int {
+	switch w := t.w.(type) {
+	case *fib.Connection:
+		if outputwait.Pending != nil {
+			return int(outputwait.Pending(w))
+		}
+	case TunnelPacer:
+		return w.Unsent()
+	}
+	return 0
+}
+
+// WaitSendable waits while more than limit bytes sent through the tunnel are
+// still waiting to go, and reports an error once the tunnel has ended. What
+// it waits for is the peer reading, which the connection's own callbacks
+// carry, so it must not be called from OnTunnelData, nor from anything else
+// the connection runs; a goroutine of the caller's is the place. It returns
+// at once on a tunnel whose writer cannot pace it.
+func (t *Tunnel) WaitSendable(limit int) error {
+	switch w := t.w.(type) {
+	case *fib.Connection:
+		if outputwait.Wait != nil {
+			return outputwait.Wait(w, int64(limit))
+		}
+	case TunnelPacer:
+		return w.WaitSendable(limit)
+	}
+	return nil
 }
 
 // Upgrade switches the request to protocol, whose data handler then takes,
@@ -320,10 +382,38 @@ func (c *Context) Upgrade(protocol string, header stdhttp.Header, handler Tunnel
 	if handler == nil || protocol == "" || !validHeaderValue(protocol) {
 		return nil, errors.New("http: invalid upgrade")
 	}
+	return c.switchTunnel(protocol, header, handler)
+}
+
+// Connect accepts a CONNECT request (RFC 9110 section 9.3.6), which asks
+// the server to open a tunnel to the host and port in Request.Host, and
+// returns the tunnel it runs through, as Upgrade does for a protocol: header
+// goes out with the 200 that accepts it, the OnHeader and OnFinish hooks run
+// for that response, and handler takes what the client sends through it.
+// Reaching the host and carrying the bytes there and back is the handler's;
+// ConnectProxy does both.
+//
+// On HTTP/1.x the whole connection switches, and whatever the client sent
+// after the request is the tunnel's first data. On HTTP/2 and HTTP/3 the
+// request is a CONNECT that names no :protocol (RFC 9113 section 8.5, RFC
+// 9114 section 4.4), and only its stream switches. Connect reports
+// ErrNotUpgradable for any other request, and like Upgrade it is called by
+// the handler before it returns and before it has written any of the
+// response.
+func (c *Context) Connect(header stdhttp.Header, handler TunnelHandler) (*Tunnel, error) {
+	if handler == nil {
+		return nil, errors.New("http: invalid upgrade")
+	}
+	return c.switchTunnel("", header, handler)
+}
+
+// switchTunnel switches the request to a tunnel: for protocol, or for a
+// CONNECT to a host and port when protocol is empty.
+func (c *Context) switchTunnel(protocol string, header stdhttp.Header, handler TunnelHandler) (*Tunnel, error) {
 	if c.begun() {
 		return nil, ErrResponseWritten
 	}
-	if !c.handling() {
+	if !c.handling() || protocol == "" && c.Request.Method != stdhttp.MethodConnect {
 		return nil, ErrNotUpgradable
 	}
 	upgrader, _ := c.external.(StreamUpgrader)
@@ -333,7 +423,7 @@ func (c *Context) Upgrade(protocol string, header stdhttp.Header, handler Tunnel
 		return nil, ErrNotUpgradable
 	}
 	status := stdhttp.StatusOK
-	if c.external == nil && c.stream == nil {
+	if c.external == nil && c.stream == nil && protocol != "" {
 		status = stdhttp.StatusSwitchingProtocols
 	}
 	if hooks := c.hooked(); hooks != nil {
@@ -351,6 +441,8 @@ func (c *Context) Upgrade(protocol string, header stdhttp.Header, handler Tunnel
 		t, err = upgrader.Upgrade(c.Request, protocol, header)
 	case c.stream != nil:
 		t, err = c.stream.upgrade(c.Request, protocol, header)
+	case protocol == "":
+		t, err = c.connectHTTP1(header)
 	default:
 		t, err = c.upgradeHTTP1(protocol, header)
 	}
@@ -392,8 +484,38 @@ func (c *Context) upgradeHTTP1(protocol string, header stdhttp.Header) (*Tunnel,
 		return nil, err
 	}
 	out = append(out, crlf...)
+	return c.switchHTTP1(out)
+}
+
+// connectHTTP1 accepts a CONNECT on HTTP/1.x, which has no content (RFC 9110
+// section 9.3.6): what follows its header is the tunnel's.
+func (c *Context) connectHTTP1(header stdhttp.Header) (*Tunnel, error) {
+	parser, server := c.parser, c.server
+	request := c.Request
+	if parser == nil || server == nil || parser.stream != nil || request.ContentLength != 0 ||
+		len(request.TransferEncoding) > 0 {
+		return nil, ErrNotUpgradable
+	}
+	out := make([]byte, 0, headCapacity(header)+32)
+	out = append(out, "HTTP/1.1 200 OK\r\n"...)
+	// A 2xx answer to CONNECT has no content, and says nothing of its length
+	// (RFC 9110 section 8.6).
+	out, err := appendHeaderLines(out, header, func(key string) bool {
+		return key == "Content-Length" || key == "Transfer-Encoding"
+	})
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, crlf...)
+	return c.switchHTTP1(out)
+}
+
+// switchHTTP1 sends head, the response that switches an HTTP/1 connection,
+// and makes the connection the tunnel's.
+func (c *Context) switchHTTP1(head []byte) (*Tunnel, error) {
+	parser, server := c.parser, c.server
 	conn := c.Conn
-	if err := conn.SendOwned(out); err != nil {
+	if err := conn.SendOwned(head); err != nil {
 		return nil, err
 	}
 	// The connection is the tunnel's from here on; see drive.

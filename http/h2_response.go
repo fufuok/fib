@@ -211,4 +211,9 @@ func (st *h2ServerStream) wakeWritersLocked() {
 	if o := st.out; o != nil && o.waiting > 0 && len(st.pending) <= h2MaxPendingOutput/2 {
 		o.room.Broadcast()
 	}
+	// A tunnel's waiters each wait for a limit of their own, which they
+	// check again.
+	if t := st.tunnel; t != nil && t.waiting > 0 {
+		t.room.Broadcast()
+	}
 }

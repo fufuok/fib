@@ -7,13 +7,15 @@ import (
 	"net"
 	stdhttp "net/http"
 	"strings"
+	"sync"
 
 	"github.com/lesismal/fib/bufferpool"
 )
 
-// Extended CONNECT over HTTP/2 (RFC 8441): a request whose :protocol names
-// what it wants to speak, such as WebSocket, opens a stream that its handler
-// may switch to a tunnel with Context.Upgrade. The stream then carries the
+// CONNECT over HTTP/2: an extended CONNECT (RFC 8441), whose :protocol names
+// what it wants to speak, such as WebSocket, or a CONNECT to a host and port
+// (RFC 9113 section 8.5), opens a stream that its handler may switch to a
+// tunnel with Context.Upgrade or Context.Connect. The stream then carries the
 // tunnel's bytes in DATA frames both ways, under the stream's flow control,
 // until each side ends it with END_STREAM or either resets it.
 
@@ -25,12 +27,19 @@ import (
 // told it has ended. sendBuf is the array the stream's pending bytes are the
 // tail of while the tunnel waits for the peer's window. All but feed are
 // guarded by the connection's mu.
+//
+// held says the handler holds the tunnel's reads, which keeps the stream's
+// window from being given back, and room is where WaitSendable waits for
+// what is pending to drain, waiting how many do.
 type h2Tunnel struct {
 	feed     TunnelFeed
 	upgraded bool
 	ending   bool
 	ended    bool
+	held     bool
 	sendBuf  []byte
+	room     sync.Cond
+	waiting  int
 }
 
 // upgraded reports whether the stream carries an accepted tunnel. Callers hold
@@ -45,6 +54,7 @@ func (sc *h2ServerConn) serveTunnel(st *h2ServerStream) {
 	st.pooled = false
 	tunnel := &h2Tunnel{feed: TunnelFeed{tunnel: Tunnel{conn: sc.conn, w: (*h2TunnelWriter)(st),
 		limit: int(sc.handler.config.MaxBodyBytes)}}}
+	tunnel.room.L = &sc.mu
 	// Set under the lock, where a shutdown retiring the connection looks for
 	// its tunnels. One that began before this is told here instead.
 	sc.mu.Lock()
@@ -58,24 +68,23 @@ func (sc *h2ServerConn) serveTunnel(st *h2ServerStream) {
 }
 
 // handleTunnelData hands a DATA frame to a tunnel. The window it took is
-// given back as it arrives, as a body read whole's is: the tunnel holds only
-// what arrives before the handler accepts it, up to its limit, and a peer
-// that sends more than that has its stream reset.
+// given back as it arrives, as a body read whole's is, unless the handler
+// holds the tunnel's reads: the tunnel holds only what arrives before the
+// handler accepts it, up to its limit, and a peer that sends more than that
+// has its stream reset.
 func (sc *h2ServerConn) handleTunnelData(st *h2ServerStream, f *h2Frame) error {
 	length := int64(f.length)
+	sc.mu.Lock()
 	if length > st.recvWindow {
+		sc.mu.Unlock()
 		return &H2StreamError{StreamID: f.streamID, Code: H2FlowControlError}
 	}
 	st.recvWindow -= length
 	st.recvUnacked += length
-	if st.recvUnacked >= h2StreamWindow/2 {
-		increment := st.recvUnacked
-		st.recvWindow += increment
-		st.recvUnacked = 0
-		sc.mu.Lock()
-		sc.sendLocked(h2AppendWindowUpdate(nil, st.id, uint32(increment)))
-		sc.mu.Unlock()
+	if !st.tunnel.held {
+		sc.creditTunnelLocked(st)
 	}
+	sc.mu.Unlock()
 	if err := st.tunnel.feed.Write(f.payload); err != nil {
 		return &H2StreamError{StreamID: f.streamID, Code: H2EnhanceYourCalm}
 	}
@@ -106,11 +115,28 @@ func (sc *h2ServerConn) handleTunnelData(st *h2ServerStream, f *h2Frame) error {
 	return nil
 }
 
+// creditTunnelLocked gives back the window a tunnel's stream has taken, half
+// a window at a time.
+func (sc *h2ServerConn) creditTunnelLocked(st *h2ServerStream) {
+	if st.recvUnacked < h2StreamWindow/2 {
+		return
+	}
+	sc.sendLocked(h2AppendWindowUpdate(nil, st.id, uint32(st.recvUnacked)))
+	st.recvWindow += st.recvUnacked
+	st.recvUnacked = 0
+}
+
 // endTunnelLocked tells a stream's tunnel, if it has one, that it has ended.
 // The tunnel's handler may send from the call, which needs the connection's
 // lock, so the call is made on a goroutine of its own.
 func (sc *h2ServerConn) endTunnelLocked(st *h2ServerStream, err error) {
-	if st.tunnel == nil || st.tunnel.ended {
+	if st.tunnel == nil {
+		return
+	}
+	// A writer waiting for room finds the stream gone, even one whose peer
+	// ended the tunnel before.
+	st.tunnel.room.Broadcast()
+	if st.tunnel.ended {
 		return
 	}
 	st.tunnel.ended = true
@@ -232,4 +258,46 @@ func (w *h2TunnelWriter) CloseAfterSend() { _ = (*h2ServerStream)(w).sendTunnel(
 func (w *h2TunnelWriter) Close() error {
 	(*h2ServerStream)(w).abortTunnel()
 	return nil
+}
+
+// HoldReads keeps the stream's window from being given back while hold is
+// set, and gives back what was held when it is cleared.
+func (w *h2TunnelWriter) HoldReads(hold bool) {
+	st := (*h2ServerStream)(w)
+	sc := st.sc
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	st.tunnel.held = hold
+	if !hold && !st.remoteDone && !sc.closed && sc.streams[st.id] == st {
+		sc.creditTunnelLocked(st)
+	}
+}
+
+// Unsent is what the windows hold back of what the tunnel was sent.
+func (w *h2TunnelWriter) Unsent() int {
+	st := (*h2ServerStream)(w)
+	st.sc.mu.Lock()
+	defer st.sc.mu.Unlock()
+	return len(st.pending)
+}
+
+// WaitSendable waits until no more than limit bytes are pending, or the
+// stream has ended. The connection's reader brings the WINDOW_UPDATEs that
+// end the wait, so it must not wait.
+func (w *h2TunnelWriter) WaitSendable(limit int) error {
+	st := (*h2ServerStream)(w)
+	sc := st.sc
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	for {
+		if sc.closed || st.reset || st.tunnel.ending || st.localDone {
+			return errH2StreamClosed
+		}
+		if len(st.pending) <= limit {
+			return nil
+		}
+		st.tunnel.waiting++
+		st.tunnel.room.Wait()
+		st.tunnel.waiting--
+	}
 }

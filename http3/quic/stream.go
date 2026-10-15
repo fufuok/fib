@@ -179,6 +179,15 @@ func (s *Stream) WaitSendable(limit int) error {
 	}
 }
 
+// Unsent reports how many bytes written to the stream are still to be sent,
+// held back by the peer's flow control or by congestion control.
+func (s *Stream) Unsent() int {
+	c := s.conn
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return int(s.send.end() - s.send.next)
+}
+
 // Close ends the sending side once what has been written is sent.
 func (s *Stream) Close() error { return s.Write(nil, true) }
 

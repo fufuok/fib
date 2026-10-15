@@ -511,6 +511,9 @@ func (sc *serverConn) opened(tun *tunnel, t *fib.Connection) {
 	}
 	sc.state = stateRelaying
 	sc.relay = (*tunnelClient)(tun)
+	// Each side is paced by the other's backlog; see tunnel.
+	sc.c.SetWriteBackpressure(false)
+	t.SetWriteBackpressure(false)
 	early, held := sc.early, sc.held
 	sc.early, sc.held = nil, false
 	// The reply goes out before anything the destination sends can, and

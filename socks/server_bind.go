@@ -101,6 +101,9 @@ func (sc *serverConn) bound(conn *net.TCPConn) {
 	}
 	sc.state = stateRelaying
 	sc.relay = p
+	// The client is paced by the queue to the peer, not its own backlog; see
+	// tunnel.
+	sc.c.SetWriteBackpressure(false)
 	early := sc.early
 	sc.early = nil
 	sc.reply(ReplySucceeded, conn.RemoteAddr())

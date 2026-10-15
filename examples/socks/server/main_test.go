@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net"
 	"strings"
@@ -39,10 +40,15 @@ func TestRunRelays(t *testing.T) {
 	}
 	defer echo.Close()
 	go func() {
-		conn, err := echo.Accept()
-		if err == nil {
-			defer conn.Close()
-			_, _ = io.Copy(conn, conn)
+		for {
+			conn, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
 		}
 	}()
 
@@ -80,11 +86,29 @@ func TestRunRelays(t *testing.T) {
 	if got[1] != 2 || got[3] != 0 || got[5] != 0 || string(got[14:]) != "ping" {
 		t.Fatalf("got %x", got)
 	}
+	// The same port is an HTTP proxy.
+	httpConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpConn.Close()
+	_ = httpConn.SetDeadline(time.Now().Add(10 * time.Second))
+	target := echo.Addr().String()
+	login := base64.StdEncoding.EncodeToString([]byte("me:pw"))
+	_, _ = httpConn.Write([]byte("CONNECT " + target + " HTTP/1.1\r\nHost: " + target +
+		"\r\nProxy-Authorization: Basic " + login + "\r\n\r\npong"))
+	head := "HTTP/1.1 200 OK\r\n\r\npong"
+	reply := make([]byte, len(head))
+	if _, err := io.ReadFull(httpConn, reply); err != nil || string(reply) != head {
+		t.Fatalf("HTTP proxy: %q (%v)", reply, err)
+	}
+
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "SOCKS5 connect "+echo.Addr().String()) {
+	if !strings.Contains(out.String(), "SOCKS5 connect "+echo.Addr().String()) ||
+		!strings.Contains(out.String(), "HTTP/1.1 CONNECT "+echo.Addr().String()) {
 		t.Fatalf("output %q", out.String())
 	}
 }

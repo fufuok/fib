@@ -720,6 +720,10 @@ func (c *Connection) HoldReads(hold bool) {
 	c.mu.Unlock()
 }
 
+// SetWriteBackpressure does nothing on the portable backend, whose reads
+// never pause for the connection's own backlog.
+func (c *Connection) SetWriteBackpressure(bool) {}
+
 // ReadsHeld reports whether HoldReads is currently holding reads back.
 func (c *Connection) ReadsHeld() bool {
 	c.mu.Lock()

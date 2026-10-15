@@ -43,6 +43,7 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
 | HTTP/3 + QUIC | ✓ | ✓ | QUIC 和 QPACK 基于 `crypto/tls.QUICConn` 自行实现，不依赖 quic-go 或 x/net |
 | WebSocket | ✓ | ✓ | RFC 6455、permessage-deflate，可经 HTTP/1.1、HTTP/2（RFC 8441）、HTTP/3（RFC 9220）升级；CI 跑 Autobahn |
 | arpc | ✓ | ✓ | 与 [lesismal/arpc](https://github.com/lesismal/arpc) 相同的协议格式和 API：双向调用、notify、异步调用、stream、广播、中间件、断线重连 |
+| HTTP CONNECT 代理 | ✓ HTTP/1.x、HTTP/2、HTTP/3 | — | `Context.Connect` 建立隧道，双向背压；`ConnectProxy` 是现成的代理，可供 curl `-x`、浏览器与 `HTTPS_PROXY` 使用 |
 | SOCKS5 / SOCKS4 / 4a | ✓ | ✓（异步拨号） | CONNECT、BIND 与 UDP ASSOCIATE，用户名/密码认证；HTTP、WebSocket 与 TLS 客户端可经它拨号 |
 | gRPC | ✓ h2 和 h2c | ✓ | unary 与双向 streaming、metadata、deadline、拦截器、gzip；可直接用 protoc-gen-go-grpc 生成的代码，与 grpc-go 互通 |
 
@@ -286,6 +287,19 @@ err = proxy.Dial(clientEngine, "tcp", "example.com:443", 5*time.Second, handler,
 `Config.MaxQueuedBytes` 时暂停读取较快的一侧。`Config.Allow` 审核每个请求，`Config.Dial` 可把
 代理串到另一个代理上。经 `Dialer` 拨号从不阻塞：连接代理、协商和 DNS 解析都在 engine 及其客户端池上进行。
 
+HTTP handler 用 `Context.Connect` 接受 CONNECT 请求，支持 HTTP/1.x、HTTP/2（RFC 9113 第 8.5 节）和
+HTTP/3（RFC 9114 第 4.4 节），得到一个 `Tunnel`，与 `Upgrade` 为某个协议返回的隧道相同。
+`Tunnel.HoldReads`、`Unsent` 与 `WaitSendable` 借助流本身的流控为隧道限速。`fibhttp.ConnectProxy`
+是在此之上实现的完整 HTTPS 代理，支持 Basic 代理认证；放在 `mux` 后面，一个端口可同时提供它和 SOCKS：
+
+```go
+proxy := fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{Authenticate: check})
+engine, err := fib.Bind(config, mux.New(
+	mux.Route{Match: mux.SOCKS(), Handler: socks.NewServer(socks.Config{Authenticate: check})},
+	mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(proxy)}, // curl -x http://host:port
+))
+```
+
 ### 裸 TCP
 
 ```go
@@ -347,7 +361,7 @@ go run ./examples/http/router
 go run ./examples/websocket/nontls/server
 go run ./examples/arpc/server
 go run ./examples/grpc/server
-go run ./examples/socks/server        # SOCKS5/4/4a 代理；examples/socks/client 经它抓取一个 URL
+go run ./examples/socks/server        # 同一端口上的 SOCKS5/4/4a 与 HTTP CONNECT 代理；examples/socks/client 经它抓取 URL
 go run ./examples/http3/tls/server
 go run ./examples/gateway/upstream    # 反向代理 / 网关：HTTP/1.1、HTTP/2、HTTP/3、WebSocket，全部异步回调
 go run ./examples/gateway/server      # 依次启动 upstream、gateway、client（见 server 的文件头注释）
@@ -640,7 +654,7 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) 服务端和客户端，协议兼容 |
 | [`grpc`](grpc) | gRPC 服务端和客户端，自带 HTTP/2 传输层，与 grpc-go 及其生成代码兼容 |
 | [`middleware`](middleware) | 中间件链和常用中间件 |
-| [`socks`](socks) | SOCKS5、SOCKS4 与 SOCKS4a 代理服务端及非阻塞拨号器 |
+| [`socks`](socks) | SOCKS5、SOCKS4 与 SOCKS4a 代理服务端及非阻塞拨号器；HTTP 代理见 `http.ConnectProxy` |
 | [`mux`](mux) | 按客户端最先发送的字节识别协议，多种协议共用一个端口 |
 | [`prefork`](prefork) | 一个程序由多个共享端口的进程服务（Linux） |
 

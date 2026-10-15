@@ -7,15 +7,18 @@ import (
 	"net"
 	stdhttp "net/http"
 	"strings"
+	"sync"
 
 	"github.com/lesismal/fib/bufferpool"
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3/qpack"
+	"github.com/lesismal/fib/http3/quic"
 )
 
-// Extended CONNECT over HTTP/3 (RFC 9220): a request whose :protocol names
-// what it wants to speak, such as WebSocket, opens a stream that its handler
-// may switch to a tunnel with Context.Upgrade. The stream then carries the
+// CONNECT over HTTP/3: an extended CONNECT (RFC 9220), whose :protocol names
+// what it wants to speak, such as WebSocket, or a CONNECT to a host and port
+// (RFC 9114 section 4.4), opens a stream that its handler may switch to a
+// tunnel with Context.Upgrade or Context.Connect. The stream then carries the
 // tunnel's bytes in DATA frames both ways until each side ends it with FIN or
 // either resets it.
 
@@ -26,7 +29,7 @@ func (rs *requestStream) serveTunnel() {
 	// A tunnel outlives its handler's return; its stream is not recycled.
 	rs.pooled = false
 	sc := rs.sc
-	tunnel := fibhttp.NewTunnelFeed(sc.conn, (*tunnelWriter)(rs), int(sc.h.config.MaxBodyBytes))
+	tunnel := &streamTunnel{TunnelFeed: fibhttp.NewTunnelFeed(sc.conn, (*tunnelWriter)(rs), int(sc.h.config.MaxBodyBytes))}
 	// Set under the lock, where a shutdown retiring the connection looks for
 	// its tunnels. One that began before this is told here instead.
 	sc.mu.Lock()
@@ -54,9 +57,10 @@ func (rs *requestStream) peerEndedTunnel() {
 	}
 }
 
-// Upgrade accepts an extended CONNECT for protocol with a 200 that leaves the
-// stream open, which carries the tunnel from here on. It makes requestStream
-// an http.StreamUpgrader.
+// Upgrade accepts an extended CONNECT for protocol, or with protocol empty a
+// CONNECT to a host and port, with a 200 that leaves the stream open, which
+// carries the tunnel from here on. It makes requestStream an
+// http.StreamUpgrader.
 func (rs *requestStream) Upgrade(req *stdhttp.Request, protocol string, header stdhttp.Header) (*fibhttp.Tunnel, error) {
 	if rs.tunnel == nil || !strings.EqualFold(req.Header.Get(":protocol"), protocol) {
 		return nil, fibhttp.ErrNotUpgradable
@@ -132,4 +136,71 @@ func (w *tunnelWriter) Close() error {
 	return nil
 }
 
-var _ fibhttp.StreamUpgrader = (*requestStream)(nil)
+// streamTunnel is a request stream's tunnel, and how it is paced: paced is
+// set once the tunnel's handler has held its reads, from when the stream
+// gives the peer room for what the tunnel delivers only while held is clear,
+// and owes it what arrived while held was set. It is kept apart from the
+// stream so that the streams of ordinary requests stay small.
+type streamTunnel struct {
+	*fibhttp.TunnelFeed
+
+	mu          sync.Mutex
+	paced, held bool
+	owed        int
+}
+
+// HoldReads stops or resumes giving the peer room for more of the stream as
+// the tunnel takes what arrives. The first hold has the stream give room
+// only as this side says, from then on.
+func (w *tunnelWriter) HoldReads(hold bool) {
+	t := w.tunnel
+	t.mu.Lock()
+	first := !t.paced
+	t.paced, t.held = true, hold
+	owed := 0
+	if !hold {
+		owed, t.owed = t.owed, 0
+	}
+	t.mu.Unlock()
+	if first {
+		// What has been delivered already counts as consumed; what arrives
+		// from here on is credit's to give back.
+		w.s.HoldCredit()
+	}
+	w.s.Credit(owed)
+}
+
+// credit gives the peer room for n more bytes of a paced tunnel's stream s,
+// or owes it them while the tunnel's reads are held, and reports whether
+// the tunnel is paced.
+func (t *streamTunnel) credit(s *quic.Stream, n int) bool {
+	t.mu.Lock()
+	if !t.paced {
+		t.mu.Unlock()
+		return false
+	}
+	if t.held {
+		t.owed += n
+		t.mu.Unlock()
+		return true
+	}
+	t.mu.Unlock()
+	s.Credit(n)
+	return true
+}
+
+// Unsent is what the stream has still to send of what the tunnel wrote.
+func (w *tunnelWriter) Unsent() int { return w.s.Unsent() }
+
+// WaitSendable waits until no more than limit bytes are still to be sent.
+func (w *tunnelWriter) WaitSendable(limit int) error {
+	if w.s.WaitSendable(limit) != nil {
+		return errStreamClosed
+	}
+	return nil
+}
+
+var (
+	_ fibhttp.StreamUpgrader = (*requestStream)(nil)
+	_ fibhttp.TunnelPacer    = (*tunnelWriter)(nil)
+)

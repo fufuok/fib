@@ -878,7 +878,7 @@ func (sc *serverConn) retire(qc *quic.Conn) {
 	sc.mu.Lock()
 	for _, rs := range sc.streams {
 		if rs.tunnel != nil {
-			tunnels = append(tunnels, rs.tunnel)
+			tunnels = append(tunnels, rs.tunnel.TunnelFeed)
 		}
 	}
 	sc.mu.Unlock()
@@ -904,10 +904,11 @@ type requestStream struct {
 	// streamed is what the request keeps when the server streams bodies, or
 	// nil when it does not.
 	streamed *streamedBody
-	// tunnel is the tunnel of an extended CONNECT (RFC 9220), or nil. It is
-	// set before the handler runs, which may switch the stream to it with
-	// Context.Upgrade; what arrives on the stream waits in it until then.
-	tunnel *fibhttp.TunnelFeed
+	// tunnel is the tunnel of a CONNECT, extended (RFC 9220) or to a host and
+	// port (RFC 9114 section 4.4), or nil. It is set before the handler runs,
+	// which may switch the stream to it with Context.Upgrade or
+	// Context.Connect; what arrives on the stream waits in it until then.
+	tunnel *streamTunnel
 
 	mu sync.Mutex
 	// remoteDone is set when the whole request has arrived.
@@ -1084,7 +1085,9 @@ func (rs *requestStream) feed(data []byte, fin bool) {
 		rs.sc.fail(err)
 		return
 	}
-	if b != nil {
+	if rs.tunnel != nil && rs.tunnel.credit(rs.s, len(data)) {
+		// A paced tunnel gives back what it was delivered itself.
+	} else if b != nil {
 		// What of this delivery went to the handler's body is given back
 		// once the handler has consumed it; the rest now.
 		if b.fed {
@@ -1259,9 +1262,9 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 			return nil
 		}
 	}
-	if _, ok := req.Header[":protocol"]; ok {
-		// An extended CONNECT: its handler runs now, and may switch the
-		// stream to a tunnel.
+	if _, ok := req.Header[":protocol"]; ok || req.Method == stdhttp.MethodConnect {
+		// A CONNECT, extended or to a host and port: its handler runs now,
+		// and may switch the stream to a tunnel.
 		rs.serveTunnel()
 		return nil
 	}

@@ -839,9 +839,10 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		return &H2StreamError{StreamID: id, Code: H2ProtocolError}
 	}
 	st.req = req
-	if _, ok := req.Header[":protocol"]; ok && !endStream {
-		// An extended CONNECT: its handler runs now, and may switch the
-		// stream to a tunnel. What arrives meanwhile waits for it there.
+	if _, ok := req.Header[":protocol"]; (ok || req.Method == stdhttp.MethodConnect) && !endStream {
+		// A CONNECT, extended or to a host and port: its handler runs now,
+		// and may switch the stream to a tunnel. What arrives meanwhile
+		// waits for it there.
 		sc.serveTunnel(st)
 		return nil
 	}

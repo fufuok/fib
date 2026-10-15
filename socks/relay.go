@@ -8,6 +8,11 @@ import (
 // tunnel relays a CONNECT: what the client sends goes to the destination,
 // from the callback that received it, and the other way round. Its two
 // halves are the two connections' handlers.
+//
+// Each side is paced by the other's backlog rather than its own, which
+// SetWriteBackpressure turns off on both: a peer that waits to send its
+// answers before it reads more would otherwise wait for the relay forever,
+// the relay having stopped reading it for the backlog of what it sends it.
 type tunnel struct {
 	sc     *serverConn
 	client *fib.Connection
