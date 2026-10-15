@@ -1283,6 +1283,17 @@ func (c *Connection) noteWritableLocked() {
 func init() {
 	outputwait.Wait = func(c any, limit int64) error { return c.(*Connection).waitOutput(limit) }
 	outputwait.Pending = func(c any) int64 { return c.(*Connection).pendingBytes.Load() }
+	outputwait.Unsent = func(c any) int64 { return c.(*Connection).unsent() }
+}
+
+// unsent is how many bytes Send accepted are still queued for the socket.
+// A flush writes and then uncounts what the socket took under c.mu, so read
+// under it the count never includes bytes already on their way; corkedBytes
+// are queued too, just not counted yet.
+func (c *Connection) unsent() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pendingBytes.Load() + c.corkedBytes
 }
 
 // waitOutput waits while more than limit bytes of what Send accepted are

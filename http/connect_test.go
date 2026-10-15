@@ -11,6 +11,7 @@ import (
 	"net"
 	stdhttp "net/http"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -97,6 +98,12 @@ func TestConnectOverHTTP1(t *testing.T) {
 	tunnel := waitFor(t, probe.opened)
 	_, _ = conn.Write([]byte("later"))
 	readFull(t, conn, "later")
+	// On Windows a send stays counted until its completion is taken, which
+	// can come after the peer has read it.
+	for deadline := time.Now().Add(5 * time.Second); runtime.GOOS == "windows" &&
+		tunnel.Unsent() != 0 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
 	if tunnel.Unsent() != 0 {
 		t.Fatalf("%d bytes unsent with nothing waiting", tunnel.Unsent())
 	}

@@ -335,8 +335,8 @@ func (t *Tunnel) HoldReads(hold bool) {
 func (t *Tunnel) Unsent() int {
 	switch w := t.w.(type) {
 	case *fib.Connection:
-		if outputwait.Pending != nil {
-			return int(outputwait.Pending(w))
+		if outputwait.Unsent != nil {
+			return int(outputwait.Unsent(w))
 		}
 	case TunnelPacer:
 		return w.Unsent()

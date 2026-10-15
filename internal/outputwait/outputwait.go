@@ -14,3 +14,10 @@ var Wait func(c any, limit int64) error
 // still queued for its socket, without waiting. It is set and nil where Wait
 // is.
 var Pending func(c any) int64
+
+// Unsent is Pending read under the connection's lock, for a caller that
+// wants the exact figure rather than one to pace by: it never counts bytes a
+// write in progress has already handed the socket, which the peer may have
+// read, and counts those a read round has queued without counting them yet.
+// It is set and nil where Wait is.
+var Unsent func(c any) int64
