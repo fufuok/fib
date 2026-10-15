@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"io"
 	"net"
@@ -270,6 +271,27 @@ func TestOnePortServesEveryProtocol(t *testing.T) {
 		resp.Body.Close()
 		if string(body) != "HTTP/2.0 tls=yes /secure" {
 			t.Fatalf("HTTPS answered %q", body)
+		}
+	})
+
+	// With X25519 alone, a hello is 256 to 511 bytes long, as curl's is, and
+	// its opening reads as an arpc request most of the time: the byte arpc
+	// would read as the method's is random.
+	t.Run("TLSShortHello", func(t *testing.T) {
+		config := clientTLS.Clone()
+		config.CurvePreferences = []tls.CurveID{tls.X25519}
+		for range 8 {
+			transport := &stdhttp.Transport{TLSClientConfig: config, ForceAttemptHTTP2: true}
+			resp, err := (&stdhttp.Client{Transport: transport, Timeout: 10 * time.Second}).Get("https://" + addr + "/short")
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			transport.CloseIdleConnections()
+			if string(body) != "HTTP/2.0 tls=yes /short" {
+				t.Fatalf("HTTPS answered %q", body)
+			}
 		}
 	})
 
