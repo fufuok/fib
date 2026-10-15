@@ -408,9 +408,16 @@ func TestConnectProxyTargetGoneFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
+	// The target resets once the proxy has its connection: a reset that
+	// beat the connect's completion would fail the dial instead.
+	dialed := make(chan struct{})
 	go func() {
 		c, err := ln.Accept()
 		if err == nil {
+			select {
+			case <-dialed:
+			case <-time.After(10 * time.Second):
+			}
 			_ = c.(*net.TCPConn).SetLinger(0)
 			_ = c.Close()
 		}
@@ -426,6 +433,7 @@ func TestConnectProxyTargetGoneFirst(t *testing.T) {
 					done(c, err)
 					return
 				}
+				close(dialed)
 				go func() {
 					<-closed
 					done(c, nil)

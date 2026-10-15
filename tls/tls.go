@@ -405,6 +405,7 @@ func (h *Handler) OnShutdown(c *fib.Connection) {
 
 func (h *Handler) OnClose(c *fib.Connection, err error) {
 	if t, ok := c.Layer().(*layer); ok {
+		err = t.reason(err)
 		if t.abortNative() {
 			// A handshake without a worker that did not finish: there is
 			// no plaintext to deliver first, and no worker to report it.
@@ -497,6 +498,9 @@ type layer struct {
 	closed      bool
 	closeHeld   bool
 	closeErr    error
+	// failErr is why the layer itself ended the connection, recorded before
+	// it tells the peer so; see failWith.
+	failErr error
 
 	// native is the handshake of a client that runs without a worker, until it
 	// completes or fails; see client13.go. nbuf holds the start of a record
@@ -576,6 +580,7 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 	t.handshaking = false
 	t.mu.Unlock()
 	if err != nil {
+		t.failWith(err)
 		t.settle(handler)
 		t.c.CloseWithError(err)
 		return
@@ -598,6 +603,9 @@ func (t *layer) settle(handler fib.Handler) {
 	t.settling = false
 	held, err := t.closeHeld, t.closeErr
 	t.closeHeld, t.closeErr = false, nil
+	if t.failErr != nil {
+		err = t.failErr
+	}
 	if t.closed {
 		t.releaseInLocked()
 	}
@@ -668,6 +676,9 @@ func (t *layer) drainLocked(handler fib.Handler) {
 			return
 		}
 		// io.EOF is close_notify: the peer has finished cleanly.
+		if err != io.EOF {
+			t.failWith(err)
+		}
 		t.c.CloseWithError(err)
 		return
 	}
@@ -704,6 +715,29 @@ func (t *layer) shutdown() {
 // closing is shutdown for Handler.OnClose. It reports whether the wrapped
 // handler hears of the close now; otherwise the handshake's worker reports it
 // with err once it is done.
+// failWith records err as why the layer ends the connection, before the
+// alert that tells the peer goes out: the peer hangs up in answer, which can
+// close the connection before the layer's own close does, and OnClose then
+// reports err rather than the end of input. The first reason stands.
+func (t *layer) failWith(err error) {
+	t.mu.Lock()
+	if t.failErr == nil {
+		t.failErr = err
+	}
+	t.mu.Unlock()
+}
+
+// reason is err, the reason a close came with, or the one failWith recorded
+// before it.
+func (t *layer) reason(err error) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.failErr != nil {
+		return t.failErr
+	}
+	return err
+}
+
 func (t *layer) closing(err error) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1107,6 +1141,7 @@ func (t *layer) nativeFailed(hs nativeHandshake, herr *hsError, err error) {
 	}
 	t.pending = nil
 	t.wmu.Unlock()
+	t.failWith(err)
 	if herr != nil && herr.alert != 0 {
 		if record := hs.alertRecord(herr.alert); record != nil {
 			_ = t.c.SendRaw(record)
@@ -1187,6 +1222,7 @@ func (t *layer) completeNative(handler fib.Handler, hs nativeHandshake, rest []b
 	bufferpool.Put(t.nbuf)
 	t.nbuf = nil
 	if err != nil {
+		t.failWith(err)
 		t.settle(handler)
 		t.c.CloseWithError(err)
 		return

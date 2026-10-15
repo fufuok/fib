@@ -500,7 +500,10 @@ func (t *layer) handleAlert(data []byte) bool {
 	if !t.rx.tls13() && data[0] == alertLevelWarning {
 		return true
 	}
-	t.c.CloseWithError(&net.OpError{Op: "remote error", Err: stdtls.AlertError(data[1])})
+	err := &net.OpError{Op: "remote error", Err: stdtls.AlertError(data[1])}
+	// The peer hangs up after its alert, often in the same read.
+	t.failWith(err)
+	t.c.CloseWithError(err)
 	return false
 }
 
@@ -586,11 +589,13 @@ func (t *layer) updateWriteKeys() bool {
 // closes it. The alert is flushed first, since a close drops what is still
 // queued.
 func (t *layer) fail(alert uint8) {
+	err := &net.OpError{Op: "local error", Err: stdtls.AlertError(alert)}
+	t.failWith(err)
 	t.wmu.Lock()
 	_ = t.sealSendLocked(recordTypeAlert, []byte{alertLevelError, alert}, nil)
 	t.wmu.Unlock()
 	_ = t.c.Flush()
-	t.c.CloseWithError(&net.OpError{Op: "local error", Err: stdtls.AlertError(alert)})
+	t.c.CloseWithError(err)
 }
 
 var errSequenceExhausted = errors.New("fib: tls sequence number exhausted")
