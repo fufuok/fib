@@ -562,6 +562,9 @@ type Config struct {
 	// as it does on the other backends: on more than four CPUs.
 	IOPollers     bool
 	IOPollerCount int
+	// EngineLoop gives an epoll or kqueue engine with pollers a loop of its
+	// own for its listeners. This backend has no loops, and ignores it.
+	EngineLoop bool
 	// ReusePort binds an epoll or kqueue engine's listeners with SO_REUSEPORT.
 	// This backend listens through the net package, and ignores it.
 	ReusePort bool
@@ -575,7 +578,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
-	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: defaultIOPollers(defaultCPUs())}
+	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true, ReusePort: true}
 }
 
 type portableEvent struct {

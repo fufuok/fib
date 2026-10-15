@@ -177,26 +177,26 @@ func TestSetPoolSizingKeepsFieldsLeftUnset(t *testing.T) {
 	}
 }
 
-// DefaultConfig leaves IOPollers off on four CPUs or fewer, where the
-// engine's own loop serves its connections, and sets it on more.
+// DefaultConfig serves on pollers, with no loop of the engine's own, and
+// binds its listeners with SO_REUSEPORT.
 func TestDefaultIOPollers(t *testing.T) {
-	for cpus, want := range map[int]bool{1: false, 2: false, 3: false, 4: false, 5: true, 8: true, 64: true} {
-		if got := defaultIOPollers(cpus); got != want {
-			t.Errorf("%d CPUs: IOPollers %v, want %v", cpus, got, want)
-		}
+	config := DefaultConfig()
+	if !config.IOPollers || config.EngineLoop || !config.ReusePort {
+		t.Errorf("IOPollers %v, EngineLoop %v, ReusePort %v, want true, false, true",
+			config.IOPollers, config.EngineLoop, config.ReusePort)
 	}
 }
 
 // The defaults go by GOMAXPROCS where it is below the cores, as in a child of
-// package prefork: a process held to four Ps gets no pollers, and one held to
+// package prefork: a process held to four Ps gets one poller, and one held to
 // eight gets two, however many cores the machine has.
 func TestDefaultsFollowGOMAXPROCS(t *testing.T) {
 	if runtime.NumCPU() < 8 {
 		t.Skip("needs 8 CPUs")
 	}
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
-	if config := DefaultConfig(); config.IOPollers {
-		t.Error("GOMAXPROCS 4: IOPollers on, want off")
+	if config := DefaultConfig(); pollerCount(config) != 1 {
+		t.Errorf("GOMAXPROCS 4: %d pollers, want 1", pollerCount(config))
 	}
 	runtime.GOMAXPROCS(8)
 	config := DefaultConfig()
@@ -205,11 +205,10 @@ func TestDefaultsFollowGOMAXPROCS(t *testing.T) {
 	}
 }
 
-// The engine gives itself one poller for every four CPUs, rounded down, and at
-// least two on more than four CPUs, up to 32 CPUs, and one for every two on
-// more. Asked for on four CPUs or fewer, it gets one.
+// The engine gives itself one poller on four CPUs or fewer, two on up to
+// sixteen, and one for every eight CPUs, rounded down, on more.
 func TestDefaultPollerCount(t *testing.T) {
-	for cpus, want := range map[int]int{1: 1, 3: 1, 4: 1, 5: 2, 7: 2, 8: 2, 9: 2, 16: 4, 32: 8, 33: 16, 64: 32, 96: 48} {
+	for cpus, want := range map[int]int{1: 1, 4: 1, 5: 2, 8: 2, 16: 2, 17: 2, 23: 2, 24: 3, 32: 4, 64: 8, 128: 16} {
 		if got := defaultPollerCount(cpus); got != want {
 			t.Errorf("%d CPUs: %d pollers, want %d", cpus, got, want)
 		}
@@ -227,9 +226,9 @@ func acceptsConnections(t *testing.T, fd int) bool {
 }
 
 // Each poller listens on a TCP socket of its own, bound where the engine's
-// is, and accepts its connections itself, with ReusePort or without it; the
-// engine's socket only holds the address and the port the kernel chose, and
-// takes none.
+// is, and accepts its connections itself, with ReusePort or without it,
+// handing each to the poller its descriptor picks; the engine's socket only
+// holds the address and the port the kernel chose, and takes none.
 func TestPollersAcceptWithReusePort(t *testing.T) {
 	for _, reusePort := range []bool{true, false} {
 		t.Run("ReusePort="+strconv.FormatBool(reusePort), func(t *testing.T) {
@@ -327,6 +326,7 @@ func TestPollersRefuseAddressInUse(t *testing.T) {
 	}
 	defer held.Close()
 	config := pollerConfig("pollers-in-use", 2)
+	config.ReusePort = false
 	config.Addr = held.Addr().String()
 	if e, err := Bind(config, HandlerFuncs{}); err == nil {
 		e.Close()
@@ -369,11 +369,12 @@ func TestPollersRefuseAddressInUse(t *testing.T) {
 	b.Close()
 }
 
-// A Unix socket has no SO_REUSEPORT to share, so its engine keeps accepting
-// for its pollers whatever ReusePort says.
+// A Unix socket has no SO_REUSEPORT to share, so an engine with a loop of
+// its own keeps accepting for its pollers whatever ReusePort says.
 func TestReusePortLeavesUnixListenersOnEngine(t *testing.T) {
 	config := pollerConfig("pollers-reuseport-unix", 2)
 	config.ReusePort = true
+	config.EngineLoop = true
 	config.Network = "unix"
 	config.Addr = filepath.Join(t.TempDir(), "fib.sock")
 	server, err := Bind(config, nil)

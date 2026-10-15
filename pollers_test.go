@@ -36,12 +36,6 @@ func checkPoller(t *testing.T, e *Engine, c *Connection, fd int) {
 	t.Helper()
 	if fd < 0 {
 		t.Errorf("connection has no descriptor")
-	} else if e.pollersListen && !c.dialed {
-		// The pollers accept for themselves, each the connections the kernel
-		// hands its own socket.
-		if c.engine.parent != e {
-			t.Errorf("descriptor %d is served by %p, want one of the engine's pollers", fd, c.engine)
-		}
 	} else if want := e.pollers[fd%len(e.pollers)]; c.engine != want {
 		t.Errorf("descriptor %d is served by %p, want poller %p", fd, c.engine, want)
 	}
@@ -186,17 +180,38 @@ func TestPollersServeDialedConnections(t *testing.T) {
 	}
 }
 
-// A UDP listener's peers share its socket, so they stay on the engine's own
-// loop.
-func TestPollersLeaveUDPPeersOnEngine(t *testing.T) {
-	server, addr := startUDPServer(t, pollerConfig("pollers-udp", 2), HandlerFuncs{Data: func(c *Connection, b []byte) {
-		if c.engine.parent != nil {
-			t.Error("a UDP peer was handed to a poller")
+// Without ReusePort a UDP listener's peers share its one socket, so they
+// stay on one loop: the engine's own with EngineLoop, and otherwise the
+// first poller's.
+func TestPollersLeaveUDPPeersOnOneLoop(t *testing.T) {
+	for _, engineLoop := range []bool{true, false} {
+		t.Run(fmt.Sprintf("EngineLoop=%v", engineLoop), func(t *testing.T) {
+			testPollersLeaveUDPPeersOnOneLoop(t, engineLoop)
+		})
+	}
+}
+
+func testPollersLeaveUDPPeersOnOneLoop(t *testing.T, engineLoop bool) {
+	config := pollerConfig("pollers-udp", 2)
+	config.ReusePort = false
+	config.EngineLoop = engineLoop
+	var server *Engine
+	var ready sync.WaitGroup
+	ready.Add(1)
+	server, addr := startUDPServer(t, config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+		ready.Wait()
+		want := server
+		if !engineLoop {
+			want = server.pollers[0]
+		}
+		if c.engine != want {
+			t.Errorf("a UDP peer is served by %p, want %p", c.engine, want)
 		}
 		if err := c.Send(b); err != nil {
 			c.Close()
 		}
 	}})
+	ready.Done()
 	conn, err := net.DialUDP("udp4", nil, addr)
 	if err != nil {
 		t.Fatal(err)
@@ -278,7 +293,12 @@ func TestBudgetDrainWakesWaitingPollers(t *testing.T) {
 	if !waiting.wakePending.Load() {
 		t.Fatal("the loop holding budget-paused connections was not woken")
 	}
-	for _, e := range []*Engine{server, server.pollers[0], server.pollers[1]} {
+	loops := []*Engine{server.pollers[0], server.pollers[1]}
+	if !server.noLoop {
+		// An engine without a loop of its own is marked awake for good.
+		loops = append(loops, server)
+	}
+	for _, e := range loops {
 		if e.wakePending.Load() {
 			t.Fatal("a loop with nothing paused on the budget was woken")
 		}
@@ -294,6 +314,9 @@ func TestBudgetPausedConnectionResumesAcrossPollers(t *testing.T) {
 	// from the same process, so accepted ones step by two.
 	config := pollerConfig("pollers-budget", 3)
 	config.MaxPendingBytes = 64 << 10
+	// The engine's loop hands connections out by descriptor, where pollers
+	// sharing one listening socket might all take theirs on one poller.
+	config.EngineLoop = true
 	accepted := make(chan *Connection, 8)
 	big := bytes.Repeat([]byte{'b'}, backlog)
 	server, addr := startEchoServer(t, config, HandlerFuncs{
@@ -424,13 +447,11 @@ func TestPollersRunRoundsOnWorkers(t *testing.T) {
 	}
 }
 
-// The default configuration spreads connections over pollers on more than
-// four CPUs and keeps them on the engine's own loop otherwise, and either way
-// hands their rounds to the engine's pool of workers.
+// The default configuration spreads connections over pollers on any number
+// of CPUs, and hands their rounds to the engine's pool of workers.
 func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 	config := DefaultConfig()
-	wantPollers := defaultCPUs() > 4
-	if config.IOPollers != wantPollers || config.TaskPoolMode == taskpool.ModeInline {
+	if !config.IOPollers || config.TaskPoolMode == taskpool.ModeInline {
 		t.Fatalf("DefaultConfig on %d CPUs has IOPollers=%v, TaskPoolMode=%v",
 			defaultCPUs(), config.IOPollers, config.TaskPoolMode)
 	}
@@ -442,7 +463,7 @@ func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 	}
 	defer server.Close()
 	want := 0
-	if wantPollers && pollersSupported {
+	if pollersSupported {
 		want = defaultPollerCount(defaultCPUs())
 	}
 	if len(server.pollers) != want {

@@ -14,8 +14,10 @@ import (
 )
 
 const (
-	epollET    = uint32(1 << 31)
-	baseEvents = uint32(syscall.EPOLLIN|syscall.EPOLLPRI|syscall.EPOLLERR|
+	epollET = uint32(1 << 31)
+	// epollExclusive is EPOLLEXCLUSIVE, which package syscall leaves out.
+	epollExclusive = uint32(1 << 28)
+	baseEvents     = uint32(syscall.EPOLLIN|syscall.EPOLLPRI|syscall.EPOLLERR|
 		syscall.EPOLLHUP|syscall.EPOLLRDHUP) | epollET
 	allEvents = baseEvents | syscall.EPOLLOUT
 )
@@ -47,7 +49,18 @@ func (e *Engine) openBackend() error {
 			// Its pollers accept for it; see Config.ReusePort.
 			continue
 		}
-		if err = e.addFD(l.fd, listenerToken(l.fd), uint32(syscall.EPOLLIN)|epollET); err != nil {
+		events := uint32(syscall.EPOLLIN) | epollET
+		if l.shared {
+			// Every poller waits on the engine's socket; see
+			// Config.EngineLoop. Exclusive, a connection arriving wakes one
+			// of them that is waiting rather than all.
+			events |= epollExclusive
+		}
+		if err = e.addFD(l.fd, listenerToken(l.fd), events); err != nil && l.shared && err == syscall.EINVAL {
+			// Kernels before 4.5 know no EPOLLEXCLUSIVE, and wake them all.
+			err = e.addFD(l.fd, listenerToken(l.fd), events&^epollExclusive)
+		}
+		if err != nil {
 			break
 		}
 	}

@@ -1,0 +1,230 @@
+//go:build linux
+
+package fib
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"sync"
+	"testing"
+	"time"
+)
+
+// With EngineLoop the engine's own loop waits on every listener, TCP, Unix
+// and UDP alike, with ReusePort or without it, and hands each connection it
+// accepts to a poller, which listens on nothing.
+func TestEngineLoopListensForPollers(t *testing.T) {
+	for _, reusePort := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ReusePort=%v", reusePort), func(t *testing.T) {
+			config := pollerConfig("engine-loop", 3)
+			config.EngineLoop = true
+			config.ReusePort = reusePort
+			var mu sync.Mutex
+			served := map[*Engine]bool{}
+			tcp := HandlerFuncs{
+				Open: func(c *Connection) {
+					mu.Lock()
+					served[c.engine] = true
+					mu.Unlock()
+				},
+				Data: prefixEcho("t:").(HandlerFuncs).Data,
+			}
+			config.Bindings = []Binding{
+				{Addr: "127.0.0.1:0", Handler: tcp},
+				{Network: "unix", Addr: unixSocketPath(t), Handler: prefixEcho("x:")},
+				{Network: "udp", Addr: "127.0.0.1:0", Handler: prefixEcho("u:")},
+			}
+			server, err := Bind(config, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runEngine(t, server)
+			if server.noLoop || server.pollersListen || server.udpSpread || server.udpHanded {
+				t.Fatalf("noLoop=%v pollersListen=%v udpSpread=%v udpHanded=%v",
+					server.noLoop, server.pollersListen, server.udpSpread, server.udpHanded)
+			}
+			for i, l := range server.listeners {
+				if l.spread || l.shared || !acceptsConnections(t, l.fd) {
+					t.Fatalf("the engine's listener %d is %+v", i, l)
+				}
+			}
+			if len(server.udpListeners) != 1 {
+				t.Fatalf("the engine reads %d UDP sockets, want 1", len(server.udpListeners))
+			}
+			for i, p := range server.pollers {
+				if len(p.listeners) != 0 || len(p.udpListeners) != 0 {
+					t.Fatalf("poller %d has %d listeners and %d UDP sockets", i, len(p.listeners), len(p.udpListeners))
+				}
+			}
+			for i, prefix := range []string{"t:", "x:", "u:"} {
+				addrs, err := server.BindingAddrs(i)
+				if err != nil || len(addrs) != 1 {
+					t.Fatalf("BindingAddrs(%d) = %v, %v", i, addrs, err)
+				}
+				for round := 0; round < 6; round++ {
+					if got := exchange(t, addrs[0], "ping"); got != prefix+"ping" {
+						t.Fatalf("binding %d answered %q", i, got)
+					}
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for e := range served {
+				if e.parent != server {
+					t.Fatalf("a TCP connection is served by %p, want one of the engine's pollers", e)
+				}
+			}
+		})
+	}
+}
+
+// Without EngineLoop the engine has no loop and no backend of its own, and
+// every poller waits on its one Unix socket and serves the connections it
+// accepts there itself.
+func TestNoEngineLoopSharesUnixListener(t *testing.T) {
+	const pollers, conns = 3, 60
+	config := pollerConfig("no-engine-loop-unix", pollers)
+	config.Network = "unix"
+	config.Addr = unixSocketPath(t)
+	var mu sync.Mutex
+	served := map[*Engine]int{}
+	server, err := Bind(config, HandlerFuncs{
+		Open: func(c *Connection) {
+			mu.Lock()
+			served[c.engine]++
+			mu.Unlock()
+		},
+		Data: prefixEcho("x:").(HandlerFuncs).Data,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runEngine(t, server)
+	if !server.noLoop || server.epollFD != 0 || server.wakeFD != 0 {
+		t.Fatalf("noLoop=%v epollFD=%d wakeFD=%d, want no backend", server.noLoop, server.epollFD, server.wakeFD)
+	}
+	if len(server.listeners) != 1 || !server.listeners[0].shared || !acceptsConnections(t, server.listeners[0].fd) {
+		t.Fatalf("the engine's listeners are %+v", server.listeners)
+	}
+	for i, p := range server.pollers {
+		if len(p.listeners) != 1 || !p.listeners[0].shared || p.listeners[0].fd != server.listeners[0].fd {
+			t.Fatalf("poller %d listens on %+v, want the engine's socket", i, p.listeners)
+		}
+	}
+	addrs, err := server.ListenAddrs()
+	if err != nil || len(addrs) != 1 {
+		t.Fatalf("ListenAddrs() = %v, %v", addrs, err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < conns; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if got := exchange(t, addrs[0], "ping"); got != "x:ping" {
+				t.Errorf("answered %q", got)
+			}
+		}()
+	}
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	total := 0
+	for e, n := range served {
+		if e.parent != server {
+			t.Fatalf("a connection is served by %p, want one of the engine's pollers", e)
+		}
+		total += n
+	}
+	if total != conns {
+		t.Fatalf("%d connections opened, want %d", total, conns)
+	}
+}
+
+// Without a loop of its own the engine still shuts down, its stop reaching
+// every poller, and a dial that fails before it has a socket is reported
+// from a poller.
+func TestNoEngineLoopShutdownAndDialFailure(t *testing.T) {
+	config := pollerConfig("no-engine-loop-shutdown", 2)
+	config.Addr = "127.0.0.1:0"
+	server, err := Bind(config, prefixEcho(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !server.noLoop {
+		t.Fatal("the engine has a loop of its own")
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer server.Close()
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := exchange(t, addr, "ping"); got != "ping" {
+		t.Fatalf("answered %q", got)
+	}
+
+	dialed := make(chan error, 1)
+	if err := server.Dial("tcp", "fib-no-such-host.invalid:80", 5*time.Second, func(_ *Connection, err error) {
+		dialed <- err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-dialed:
+		if err == nil {
+			t.Fatal("a dial to a name that does not resolve succeeded")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("a failed dial was never reported")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Shutdown")
+	}
+	if _, err := net.DialTimeout("tcp4", addr.String(), time.Second); err == nil {
+		t.Fatal("the engine still accepts after Shutdown")
+	}
+}
+
+// Whichever poller accepts a connection on a socket they share, the poller
+// its descriptor picks serves it.
+func TestNoEngineLoopPlacesAcceptedByDescriptor(t *testing.T) {
+	const pollers, conns = 3, 30
+	config := pollerConfig("no-engine-loop-fd", pollers)
+	config.Network = "unix"
+	config.Addr = unixSocketPath(t)
+	opened := make(chan *Connection, conns)
+	server, err := Bind(config, HandlerFuncs{
+		Open: func(c *Connection) { opened <- c },
+		Data: prefixEcho("").(HandlerFuncs).Data,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runEngine(t, server)
+	addrs, err := server.ListenAddrs()
+	if err != nil || len(addrs) != 1 {
+		t.Fatalf("ListenAddrs() = %v, %v", addrs, err)
+	}
+	for i := 0; i < conns; i++ {
+		if got := exchange(t, addrs[0], "ping"); got != "ping" {
+			t.Fatalf("answered %q", got)
+		}
+		c := <-opened
+		if fd := c.FD(); fd >= 0 && c.engine != server.pollers[fd%pollers] {
+			t.Fatalf("descriptor %d is served by %p, want poller %p", fd, c.engine, server.pollers[fd%pollers])
+		}
+	}
+}

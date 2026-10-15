@@ -57,11 +57,13 @@ type enginePlatform struct {
 	// configured order.
 	listeners []streamListener
 	// pollersListen says the engine's pollers accept some of its
-	// connections, or read its datagrams, on sockets of their own; see
-	// Config.ReusePort. Which TCP listeners they accept for each says
-	// itself, and udpSpread says they read every UDP address.
+	// connections, or read its datagrams, themselves; see Config.EngineLoop
+	// and Config.ReusePort. Which listeners they accept for each says
+	// itself. udpSpread says they read every UDP address on sockets of their
+	// own, and udpHanded that the first poller reads the engine's own.
 	pollersListen  bool
 	udpSpread      bool
+	udpHanded      bool
 	nextGeneration atomic.Uint64
 	// listenMu guards stopping the listeners, which Stop does from whatever
 	// goroutine calls it, and listenAddrs, the addresses they were bound to
@@ -96,7 +98,12 @@ type streamListener struct {
 	// spread says the engine's pollers accept the address's connections on
 	// sockets of their own, bound beside this one, which only holds the
 	// address; see Config.ReusePort.
-	spread  bool
+	spread bool
+	// shared says, of an engine's socket, that every one of its pollers
+	// waits on this socket itself and accepts onto its own loop, and, of a
+	// poller's, that the socket is the engine's, which stops and closes it;
+	// see Config.EngineLoop.
+	shared  bool
 	handler Handler
 	// binding is the index of the Binding the socket was opened for.
 	binding int
@@ -171,16 +178,18 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 		// A poller that accepts for itself listens beside its parent's
 		// other pollers, on every TCP address the parent is bound to.
 		for _, like := range p.listeners {
-			if !like.spread {
-				continue
+			switch {
+			case like.shared:
+				e.listeners = append(e.listeners, like)
+			case like.spread:
+				fd, err := listener.CreateLike(listenOptions(config, like.network), like.fd)
+				if err != nil {
+					e.closeListeners()
+					return err
+				}
+				like.fd, like.spread = fd, false
+				e.listeners = append(e.listeners, like)
 			}
-			fd, err := listener.CreateLike(listenOptions(config, like.network), like.fd)
-			if err != nil {
-				e.closeListeners()
-				return err
-			}
-			like.fd, like.spread = fd, false
-			e.listeners = append(e.listeners, like)
 		}
 		if err := e.openUDPBeside(config, p); err != nil {
 			e.closeListeners()
@@ -201,23 +210,36 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 				e.udpSpread = e.udpSpread || pollersListen(config, b.Network)
 				continue
 			}
-			// When the pollers listen, the engine's own socket only holds the
-			// address, and the port the kernel chose for it: were it to listen
-			// too, it would be handed a share of the connections that nothing
-			// accepts.
+			// When the pollers listen each on a socket of its own, the
+			// engine's socket only holds the address, and the port the kernel
+			// chose for it: were it to listen too, it would be handed a share
+			// of the connections that nothing accepts. An engine without a
+			// loop of its own has its pollers all wait on the one socket
+			// where they cannot each have their own.
 			spread := pollersListen(config, b.Network)
+			shared := e.noLoop && !spread
 			fd, err := listener.Create(listenOptions(config, b.Network), addr, !spread, spread)
 			if err != nil {
 				e.closeListeners()
 				return err
 			}
 			e.listeners = append(e.listeners, streamListener{fd: fd, network: b.Network,
-				unix: netaddr.IsUnix(b.Network), spread: spread, handler: b.Handler, binding: i})
-			e.pollersListen = e.pollersListen || spread
+				unix: netaddr.IsUnix(b.Network), spread: spread, shared: shared, handler: b.Handler, binding: i})
+			e.pollersListen = e.pollersListen || spread || shared
 			e.noteUnixPath(b.Network, addr)
 		}
 	}
-	e.pollersListen = e.pollersListen || e.udpSpread
+	// Without a loop of its own, the engine has the first poller read the
+	// UDP sockets it cannot give every poller one of.
+	e.udpHanded = e.noLoop && !e.udpSpread && len(e.udpListeners) > 0
+	e.pollersListen = e.pollersListen || e.udpSpread || e.udpHanded
+	if e.noLoop {
+		// Nothing waits on a backend, and nothing need wake one: every
+		// command goes to a poller. Marking the engine awake for good makes
+		// notify, which Stop calls, do nothing.
+		e.wakePending.Store(true)
+		return nil
+	}
 	if err := e.openBackend(); err != nil {
 		e.closeListeners()
 		return err
@@ -228,19 +250,22 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 // openUDPBeside gives a poller of an engine whose pollers read its UDP
 // addresses themselves (see Config.ReusePort) a socket on each of them. The
 // first poller takes the engine's own sockets, and every other one binds one
-// of its own beside them. The engine cannot keep a socket only to hold the
+// of its own beside them, unless the engine has no loop of its own and no
+// ReusePort, when the first poller reads them alone. The engine cannot keep a socket only to hold the
 // address, as it does a TCP listener it leaves unlistened: a bound UDP socket
 // is in its address's SO_REUSEPORT group whatever else it does, and would be
 // handed a share of the datagrams that nothing reads.
 func (e *Engine) openUDPBeside(config Config, parent *Engine) error {
-	if !parent.udpSpread {
+	if !parent.udpSpread && !parent.udpHanded {
 		return nil
 	}
 	if len(parent.udpListeners) > 0 {
 		e.udpListeners, parent.udpListeners = parent.udpListeners, nil
 		return nil
 	}
-	if len(parent.pollers) == 0 {
+	if !parent.udpSpread || len(parent.pollers) == 0 {
+		// The engine's sockets went to the first poller, which reads them
+		// alone; see Config.EngineLoop.
 		return nil
 	}
 	for _, like := range parent.pollers[0].udpListeners {
@@ -268,6 +293,10 @@ func (e *Engine) stopListening() {
 	e.listenStopped = true
 	e.listenAddrs = make([]syscall.Sockaddr, len(e.listeners))
 	for i, l := range e.listeners {
+		if l.shared && e.parent != nil {
+			// The engine's own, which it stops itself.
+			continue
+		}
 		e.listenAddrs[i], _ = syscall.Getsockname(l.fd)
 		stopListeningFD(l.fd)
 	}
@@ -314,7 +343,9 @@ func (e *Engine) listenSockname(i, fd int) (syscall.Sockaddr, error) {
 
 func (e *Engine) closeListeners() {
 	for _, l := range e.listeners {
-		syscall.Close(l.fd)
+		if !l.shared || e.parent == nil {
+			syscall.Close(l.fd)
+		}
 	}
 	e.listeners = nil
 	for _, l := range e.udpListeners {
@@ -585,8 +616,9 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 }
 
 // Run serves the engine until Stop. With pollers, it runs each of them on a
-// goroutine of its own while this one accepts, and returns once they have all
-// returned; a poller that fails stops the rest.
+// goroutine of its own while this one runs the engine's own loop, if it has
+// one (see Config.EngineLoop), and returns once they have all returned; a
+// poller that fails stops the rest.
 func (e *Engine) Run() error {
 	e.logRun()
 	if len(e.pollers) == 0 {
@@ -602,8 +634,11 @@ func (e *Engine) Run() error {
 			errs <- err
 		}(p)
 	}
-	err := e.runLoop()
-	e.Stop()
+	var err error
+	if !e.noLoop {
+		err = e.runLoop()
+		e.Stop()
+	}
 	for range e.pollers {
 		if pollerErr := <-errs; err == nil {
 			err = pollerErr
@@ -630,13 +665,19 @@ func (e *Engine) acceptConnections(listenFD int) {
 			// one back until the peer's delayed ACK.
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		}
-		if len(e.pollers) == 0 {
+		// Whichever loop accepted it, the connection is served by the poller
+		// its descriptor picks, which spreads connections over the pollers
+		// evenly however unevenly the kernel woke them to accept.
+		p := e
+		if pollers := e.root().pollers; len(pollers) > 0 {
+			p = pollers[fd%len(pollers)]
+		}
+		if p == e {
 			e.admit(newAccepted(e, l.handler, l.unix, peer), fd)
 			continue
 		}
 		// The poller registers the descriptor itself, since its table and
 		// its backend are its loop's alone.
-		p := e.pollers[fd%len(e.pollers)]
 		c := newAccepted(p, l.handler, l.unix, peer)
 		c.fd.Store(int32(fd))
 		if !p.request(command{kind: commandAccept, connection: c}) {
@@ -792,6 +833,11 @@ func (e *Engine) release() error {
 	e.closeUDPPeers()
 	e.budgetPaused = nil
 	for _, l := range e.listeners {
+		if l.shared && e.parent != nil {
+			// The engine's own, closed below once every poller is done
+			// with it.
+			continue
+		}
 		if err := syscall.Close(l.fd); err != nil && closeErr == nil {
 			closeErr = err
 		}
@@ -802,6 +848,9 @@ func (e *Engine) release() error {
 		}
 	}
 	e.removeUnixPaths()
+	if e.noLoop {
+		return closeErr
+	}
 	if err := e.closeBackend(); err != nil && closeErr == nil {
 		closeErr = err
 	}
@@ -810,13 +859,13 @@ func (e *Engine) release() error {
 
 // pollersListen reports whether config has each poller listen on a socket
 // of its own for an address on network, accepting its TCP connections or
-// reading its UDP datagrams itself. Under IOPollers it does for TCP whatever
-// ReusePort says, where SO_REUSEPORT spreads connections; see
-// Config.ReusePort. UDP needs ReusePort, since a peer's datagrams move
+// reading its UDP datagrams itself. Under IOPollers without EngineLoop it
+// does for TCP whatever ReusePort says, where SO_REUSEPORT spreads
+// connections; see Config.ReusePort. UDP needs ReusePort, since a peer's datagrams move
 // between sockets as sockets join.
 func pollersListen(config Config, network string) bool {
 	return (config.ReusePort || !netaddr.IsUDP(network)) && sys.ReusePortSpreads &&
-		pollerCount(config) > 0 && !netaddr.IsUnix(network)
+		!engineLoop(config) && !netaddr.IsUnix(network)
 }
 
 // listenOptions is what of config the listening sockets on network are
@@ -893,18 +942,23 @@ func (c *Connection) socketError() error {
 // its descriptor picks, as for an accepted connection, so the socket is
 // opened here, on whatever goroutine asked for the dial, rather than on the
 // loop. A dial that cannot open one runs on the engine's own loop, which
-// only has to report why.
+// only has to report why, or on the first poller where the engine has none.
 func (e *Engine) dialLoop(d *dialRequest) *Engine {
-	if len(e.pollers) == 0 || d.err != nil || d.hasSocket {
+	if len(e.pollers) == 0 || d.hasSocket {
 		return e
 	}
-	fd, err := d.openSocket()
-	if err != nil {
+	if d.err == nil {
+		fd, err := d.openSocket()
+		if err == nil {
+			d.socket, d.hasSocket = fd, true
+			return e.pollers[fd%len(e.pollers)]
+		}
 		d.err = err
-		return e
 	}
-	d.socket, d.hasSocket = fd, true
-	return e.pollers[fd%len(e.pollers)]
+	if e.noLoop {
+		return e.pollers[0]
+	}
+	return e
 }
 
 // openSocket returns the socket opened for d ahead of time, if there is one,

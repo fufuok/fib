@@ -183,6 +183,13 @@ func (c *Config) validateTaskPool() error {
 	return nil
 }
 
+// engineLoop reports whether config gives an engine an event loop of its
+// own: always without pollers, which leave it the only loop, and with them
+// only when Config.EngineLoop asks for one.
+func engineLoop(config Config) bool {
+	return config.EngineLoop || pollerCount(config) == 0
+}
+
 // pollerCount reports how many loops config has an engine hand its
 // connections to, or zero when it keeps them on its own loop.
 func pollerCount(config Config) int {
@@ -207,57 +214,33 @@ func defaultCPUs() int { return min(runtime.NumCPU(), runtime.GOMAXPROCS(0)) }
 // only waits for events and hands the connections they make runnable to the
 // workers, which costs a small share of what the workers then spend on them:
 // profiled at 0.2us a request against 4.5us on the workers, for WebSocket and
-// HTTP/2 echoes over 10k connections. Every loop competes with the workers
-// for the same Ps: on 3 and 4 CPUs, one poller served as many requests as
-// none or more, and one per CPU served 2% to 6% fewer with a 99th percentile
-// 10% to 15% higher.
-const cpusPerPoller = 4
+// HTTP/2 echoes over 10k connections, and every loop competes with the
+// workers for the same Ps.
+const cpusPerPoller = 8
 
-// singleLoopCPUs is the most CPUs on which DefaultConfig leaves IOPollers
-// off, so that the engine serves its listeners and connections on its own
-// loop. Up to there a poller only adds a loop: on 3 CPUs an HTTP/1 echo over
-// 10k connections served 583k requests/s on the single loop and 584k with
-// one poller, and on 4 CPUs one poller is all the default would create.
-const singleLoopCPUs = 4
-
-// defaultIOPollers is what DefaultConfig sets IOPollers to on cpus CPUs.
-func defaultIOPollers(cpus int) bool { return cpus > singleLoopCPUs }
-
-// manyPollerCPUs is the most CPUs on which the default gives a poller to
-// cpusPerPoller of them; above it, one goes to every two CPUs. Up to 32 CPUs
-// the count made no difference: HTTP/1 and WebSocket, with connections held
-// and reconnecting every ten requests, served within 3% of one another with a
-// poller for every four CPUs, every two and every one, on 8, 16 and 32 CPUs,
-// every one of them busy. On 64 CPUs a poller for every four left a quarter
-// of them idle where connections come and go, the pollers accepting them
-// being what ran short: a poller for every two served HttpArena's
-// limited-conn 15% faster, and its WebSocket counterpart 6% faster, with
-// held connections unchanged.
-const manyPollerCPUs = 32
+// onePollerCPUs and twoPollerCPUs are the most CPUs on which the default
+// creates one poller and two. A lone poller is the one thread every
+// readiness and every accepted connection goes through: on 8 CPUs of a
+// Ryzen 7800X3D, HttpArena's limited-conn profile, ten requests a
+// connection over 4096 at a time, served 705k requests/s with one poller,
+// which left the CPUs 18% idle, and 827k with two.
+const (
+	onePollerCPUs = 4
+	twoPollerCPUs = 16
+)
 
 // defaultPollerCount is how many pollers IOPollers creates on cpus CPUs when
-// IOPollerCount leaves it to the engine: cpus divided by cpusPerPoller,
-// rounded down, and at least two, up to manyPollerCPUs, and half the CPUs
-// above it. On singleLoopCPUs or fewer, where the default has no pollers,
-// asking for them gets one.
-//
-// Two, not one, on 5 to 7 CPUs, where cpus/cpusPerPoller is 1: a lone poller
-// is the one thread every readiness and every accepted connection goes
-// through, and it left CPUs idle with the workers short of work. WebSocket
-// echoes over 10k connections, the server on 5, 6 and 7 CPUs of an 8-core
-// Ryzen with the client on the others, served 713k, 826k and 925k messages a
-// second with one poller and 756k, 885k and 1010k with two (+6%, +7%, +9%);
-// 30k connections were accepted and upgraded at 104k a second against 138k
-// (+33%); a pipelined echo was unchanged. On 8 CPUs, where the default was
-// already two, one poller served 878k and two 1006k.
+// IOPollerCount leaves it to the engine: one on onePollerCPUs or fewer, two
+// on up to twoPollerCPUs, and cpus divided by cpusPerPoller, rounded down,
+// on more.
 func defaultPollerCount(cpus int) int {
-	if cpus > manyPollerCPUs {
-		return cpus / 2
-	}
-	if cpus <= singleLoopCPUs {
+	switch {
+	case cpus <= onePollerCPUs:
 		return 1
+	case cpus <= twoPollerCPUs:
+		return 2
 	}
-	return max(2, cpus/cpusPerPoller)
+	return cpus / cpusPerPoller
 }
 
 // SetPoolSizing pins the pool sizing to the caller's own numbers, which a later

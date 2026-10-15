@@ -7,10 +7,10 @@ import (
 )
 
 // Under pollers each binding's addresses are served as one address on its
-// own network would be: the pollers accept TCP connections themselves, the
-// engine's loop accepts the Unix ones and hands them on, and with ReusePort
-// the pollers read UDP datagrams themselves, each with the handler of the
-// binding the socket belongs to.
+// own network would be: the pollers accept TCP connections each on a socket
+// of its own, all wait on the one Unix socket, and read UDP datagrams each
+// on a socket of its own with ReusePort and on the first poller's alone
+// without it, each with the handler of the binding the socket belongs to.
 func TestBindingsUnderPollers(t *testing.T) {
 	for _, reusePort := range []bool{false, true} {
 		config := pollerConfig("bindings-pollers", 3)
@@ -25,18 +25,19 @@ func TestBindingsUnderPollers(t *testing.T) {
 			t.Fatal(err)
 		}
 		runEngine(t, server)
-		if !server.pollersListen || server.udpSpread != reusePort {
-			t.Fatalf("ReusePort=%v: pollersListen=%v udpSpread=%v", reusePort, server.pollersListen, server.udpSpread)
+		if !server.pollersListen || server.udpSpread != reusePort || server.udpHanded == reusePort {
+			t.Fatalf("ReusePort=%v: pollersListen=%v udpSpread=%v udpHanded=%v",
+				reusePort, server.pollersListen, server.udpSpread, server.udpHanded)
 		}
-		if len(server.listeners) != 2 || !server.listeners[0].spread || server.listeners[1].spread {
+		if len(server.listeners) != 2 || !server.listeners[0].spread || !server.listeners[1].shared {
 			t.Fatalf("ReusePort=%v: the engine's listeners are %+v", reusePort, server.listeners)
 		}
 		for i, p := range server.pollers {
-			if len(p.listeners) != 1 || p.listeners[0].binding != 0 {
-				t.Fatalf("poller %d listens on %+v, want the TCP binding alone", i, p.listeners)
+			if len(p.listeners) != 2 || p.listeners[0].binding != 0 || p.listeners[1].fd != server.listeners[1].fd {
+				t.Fatalf("poller %d listens on %+v, want a TCP socket of its own and the engine's Unix one", i, p.listeners)
 			}
 			wantUDP := 0
-			if reusePort {
+			if reusePort || i == 0 {
 				wantUDP = 1
 			}
 			if len(p.udpListeners) != wantUDP {

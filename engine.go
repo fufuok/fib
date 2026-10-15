@@ -106,7 +106,10 @@ type Engine struct {
 	parent *Engine
 	// pollers are the loops the engine hands its connections to; see
 	// Config.IOPollers. Empty when the engine serves them itself.
-	pollers            []*Engine
+	pollers []*Engine
+	// noLoop says the engine has no event loop of its own, and its pollers
+	// listen, dial and serve everything; see Config.EngineLoop.
+	noLoop             bool
 	name               string
 	logStatus          bool
 	maxEvents          int
@@ -261,6 +264,7 @@ func newEngine(config Config, handler Handler, listen bool) (*Engine, error) {
 	}
 
 	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents,
+		noLoop:             !engineLoop(config),
 		useWritev:          config.UseWritev,
 		socketSyscalls:     config.SocketSyscalls,
 		coalesceWrites:     config.CoalesceWrites,
@@ -532,8 +536,12 @@ func (e *Engine) Stop() {
 // engine is shutting down, and reports how many connections the engine
 // accepted are still open between them; see Shutdown.
 func (e *Engine) shutdownRound(ctx context.Context) (int, error) {
-	round := newShutdownRound(1 + len(e.pollers))
-	for _, l := range append([]*Engine{e}, e.pollers...) {
+	loops := e.pollers
+	if !e.noLoop {
+		loops = append([]*Engine{e}, loops...)
+	}
+	round := newShutdownRound(len(loops))
+	for _, l := range loops {
 		if !l.request(command{kind: commandShutdown, round: round}) {
 			// Closed: nothing is left open on it.
 			round.report(0)
@@ -1099,15 +1107,15 @@ type Config struct {
 	// TaskPool, when set, runs the engine's connections instead of a pool the
 	// engine builds from the fields above. See SetTaskPool.
 	TaskPool TaskPool
-	// IOPollers splits the engine across several event loops. The engine's
-	// own loop is left to accept connections and serve its UDP sockets, and
-	// every connection it accepts is handed to one of IOPollerCount further
-	// loops, the one its descriptor picks modulo their number, which then
-	// waits on that connection for the rest of its life. Connections the
-	// engine dials, over TCP, UDP or a Unix socket, go to those loops the
-	// same way. A UDP listener's peers share its one socket, so they stay on
-	// the engine's own loop, unless ReusePort gives each poller a socket of
-	// its own.
+	// IOPollers splits the engine across IOPollerCount event loops, its
+	// pollers, each of which waits on the connections it is given for the
+	// rest of their lives. Which loops listen is EngineLoop's to say: by
+	// default the pollers accept connections themselves and the engine has
+	// no loop of its own; with EngineLoop the engine's own loop accepts every
+	// connection and reads the UDP sockets. Either way a connection is served
+	// by the poller its descriptor picks modulo their number, whichever loop
+	// accepted it, and so is a connection the engine dials, over TCP, UDP or
+	// a Unix socket.
 	//
 	// Spreading the connections spreads the loops' own work, the waits,
 	// registrations and wake-ups, over several cores. With or without it, a
@@ -1121,21 +1129,17 @@ type Config struct {
 	// of their own, apart from the workers that read their connections; see
 	// Engine.HandlerPool.
 	//
-	// DefaultConfig sets it on more than four CPUs, counting GOMAXPROCS where
-	// it is below runtime.NumCPU, and leaves it off on four or fewer, where
-	// one loop serves as many requests as a poller would.
-	// Without it, the engine serves listeners and connections alike on its
-	// one loop. Setting it explicitly gives an engine pollers on any number
-	// of CPUs.
+	// DefaultConfig sets it. Without it, the engine serves listeners and
+	// connections alike on its one loop.
 	//
 	// Only the epoll and kqueue backends have pollers; on Windows the engine
 	// keeps its single loop, as if this were unset.
 	IOPollers bool
 	// IOPollerCount is how many loops IOPollers creates. Zero or less means
-	// the CPUs divided by four, rounded down, and at least one, up to 32
-	// CPUs, and half the CPUs on more: 1 up to 7 CPUs, 2 on 8, 4 on 16, 8 on
-	// 32, 32 on 64. The CPUs are runtime.NumCPU, or GOMAXPROCS where that is
-	// lower.
+	// one on up to four CPUs, two on up to sixteen, and the CPUs divided by
+	// eight, rounded down, on more: 1 on 4, 2 on 8 and 16, 2 on 17 to 23, 3
+	// on 24, 4 on 32, 8 on 64. The CPUs are runtime.NumCPU, or GOMAXPROCS
+	// where that is lower.
 	//
 	// A loop only waits for events and hands them on, which costs a small
 	// share of what the workers spend on them, so one loop keeps up with the
@@ -1149,27 +1153,52 @@ type Config struct {
 	// connections and waking for them, is what runs short, as it may with
 	// ReusePort and many connections arriving at once.
 	IOPollerCount int
+	// EngineLoop gives an engine with IOPollers a loop of its own beside
+	// its pollers, which every listener of the engine waits on: it accepts
+	// each TCP and Unix connection and hands it to the poller its descriptor
+	// picks, and reads the datagrams of every UDP address itself. One loop
+	// accepting caps how fast connections are taken.
+	//
+	// Left unset, as it is by default, the engine has no loop of its own,
+	// and its pollers listen as well as serve. On Linux each poller listens
+	// on a TCP socket of its own, bound to the address with SO_REUSEPORT, as
+	// ReusePort below describes. A Unix socket, and a TCP one on the
+	// platforms where SO_REUSEPORT does not spread connections, is one
+	// socket every poller waits on; on Linux it wakes one of them at a time.
+	// A poller hands each connection it accepts to the poller its descriptor
+	// picks, keeping it only when that is itself, since the kernel wakes the
+	// pollers to accept unevenly: 400 connections to a socket four pollers
+	// shared landed 367 on one of them, where they spread 153, 143, 47 and
+	// 57 by descriptor. The UDP addresses are read by every poller with
+	// ReusePort on Linux, and otherwise by the first poller alone. Dials go
+	// to the pollers either way.
+	//
+	// Without IOPollers the engine always has its loop, which listens and
+	// serves alike.
+	EngineLoop bool
 	// ReusePort binds the engine's listeners with SO_REUSEPORT, so that
 	// other sockets that set it too, in this process or another of the same
 	// user, may listen on the same address and share its connections, or
-	// its datagrams.
+	// its datagrams. DefaultConfig sets it.
 	//
-	// Under IOPollers on Linux the pollers accept TCP connections themselves
-	// whether or not it is set: each poller listens on a socket of its own,
-	// bound to the engine's address with SO_REUSEPORT, and accepts the
+	// Under IOPollers on Linux, without EngineLoop, the pollers accept TCP
+	// connections themselves whether or not it is set: each poller listens
+	// on a socket of its own, bound to the engine's address with
+	// SO_REUSEPORT, and accepts the
 	// connections the kernel spreads onto that socket by a hash of their
 	// addresses. The engine's own loop accepting every connection and waking
 	// the poller it hands it to capped how fast connections were accepted
 	// however many cores there were to serve them: HttpArena's limited-conn
 	// profile, ten requests a connection over 4096 at a time on 64 CPUs,
 	// served 0.94M requests a second that way and 1.65M with the pollers
-	// accepting. What it gives up is balance: a connection stays with the
-	// poller its hash picked, however busy that poller is. Without
-	// ReusePort the engine first claims the address with a socket bound
+	// accepting. A poller hands each connection it accepts to the poller its
+	// descriptor picks; see EngineLoop. Without ReusePort the engine first
+	// claims the address with a socket bound
 	// without SO_REUSEPORT, so that an address another socket holds is
 	// refused with EADDRINUSE as it always was, and only a socket that sets
 	// SO_REUSEPORT itself can join the engine's afterwards. Unix sockets, and
-	// the other platforms, keep the engine's loop accepting.
+	// the other platforms, have one socket the pollers all wait on; see
+	// EngineLoop.
 	//
 	// On a UDP address it has the pollers read datagrams in the same way,
 	// which they do only with it set: each poller reads a
@@ -1177,7 +1206,8 @@ type Config struct {
 	// one of the sockets by a hash of its source and destination addresses,
 	// waking only the poller that reads it. A peer's datagrams therefore all
 	// reach one poller, which keeps its connection, its OnData and its idle
-	// timeout; without it the engine's own loop reads every peer. The hash
+	// timeout; without it one loop reads every peer, the engine's own with
+	// EngineLoop and otherwise the first poller. The hash
 	// holds only while the sockets sharing the address stay the same, so a
 	// socket another process binds there moves some peers to it, and a peer
 	// whose address changes reaches whichever poller its new address hashes
@@ -1204,7 +1234,7 @@ func DefaultConfig() Config {
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
 		UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,
-		IOPollers: defaultIOPollers(defaultCPUs())}
+		IOPollers: true, ReusePort: true}
 }
 
 // UDP rides on the same connections, handlers and workers as TCP. What is
