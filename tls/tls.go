@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -154,7 +155,8 @@ func NewClient(config *stdtls.Config, handler fib.Handler) *Handler {
 }
 
 // Dial is engine.DialWithHandler over TLS. When config names no server, the
-// host in addr is used, as crypto/tls.Dial does. A nil handler means the
+// host in addr is used, as crypto/tls.Dial does, or the whole of a unix
+// address. A nil handler means the
 // engine's. done runs once the connect completes, as it does for
 // fib.Engine.Dial; the handshake follows, and what done sends waits for it.
 func Dial(engine *fib.Engine, network, addr string, timeout time.Duration, config *stdtls.Config,
@@ -182,8 +184,10 @@ func DialWithOptions(engine *fib.Engine, network, addr string, timeout time.Dura
 		config = &stdtls.Config{}
 	}
 	if config.ServerName == "" {
+		// A unix address is a path, which on Windows has a colon after its
+		// drive letter: it is the name whole.
 		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
+		if err != nil || strings.HasPrefix(network, "unix") {
 			host = addr
 		}
 		config = config.Clone()

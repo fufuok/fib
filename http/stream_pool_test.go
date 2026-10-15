@@ -309,3 +309,62 @@ func TestStreamPoolCancelWhileQueued(t *testing.T) {
 		t.Fatal("the request did not end once its handler returned")
 	}
 }
+
+// TestStreamPoolRetainAfterCancel cancels a queued request whose handler
+// retains it and answers from elsewhere, as one answering asynchronously
+// does. The Retain comes after the cancellation, and still holds the request:
+// it does not end at the handler's return, which would hand its
+// StreamRequest to the protocol to recycle under the goroutine still using
+// it, but at the Release.
+func TestStreamPoolRetainAfterCancel(t *testing.T) {
+	pool := NewStreamPool(StreamPoolConfig{})
+	stream := &endingStream{recordingStream: recordingStream{done: make(chan struct{}, 1)}, ended: make(chan struct{})}
+	returned := make(chan struct{})
+	release := make(chan struct{})
+	handler := HandlerFunc(func(c *Context) {
+		c.Retain()
+		go func() {
+			<-release
+			// A Context recycled under the handler would have lost the reason.
+			if !errors.Is(c.Err(), os.ErrDeadlineExceeded) {
+				t.Errorf("the retained request reports %v, want the cancellation", c.Err())
+			}
+			c.Release()
+		}()
+		close(returned)
+	})
+	r := new(StreamRequest)
+	r.URL.Path = "/retained"
+	r.Request.URL = &r.URL
+	r.Request.Method = stdhttp.MethodGet
+	r.Request.Header = stdhttp.Header{}
+	c := r.Context(nil, stream, nil)
+	var gate StreamGate
+	var batch StreamBatch
+	pool.Queue(&batch, &gate, nil, handler, r)
+	r.Cancel(os.ErrDeadlineExceeded)
+	deadline := time.Now().Add(5 * time.Second)
+	for c.Err() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the cancellation never reached the request")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	pool.Submit(&batch)
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never ran")
+	}
+	select {
+	case <-stream.ended:
+		t.Fatal("the request ended under the Retain its handler took")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stream.ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request did not end once it was released")
+	}
+}

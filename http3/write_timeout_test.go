@@ -44,11 +44,18 @@ func TestWriteTimeoutResetsStalledStream(t *testing.T) {
 	if err := s.Write(head, true); err != nil {
 		t.Fatal(err)
 	}
-	w.await(s.ID(), "the header", func(st *h3WireStream) bool { return st.status == 200 })
-	if status, body := w.response(w.send(t, h3Request{path: "/quick"}, false)); status != 200 || string(body) != "quick" {
-		t.Fatalf("a request beside the stalled one got %d %q", status, body)
+	// The clock runs from the request's arrival: on a loaded machine the
+	// handler may start after it has run out, and the reset comes first.
+	st := w.await(s.ID(), "the header", func(st *h3WireStream) bool { return st.status == 200 || st.done })
+	w.mu.Lock()
+	headed := st.status == 200
+	w.mu.Unlock()
+	if headed {
+		if status, body := w.response(w.send(t, h3Request{path: "/quick"}, false)); status != 200 || string(body) != "quick" {
+			t.Fatalf("a request beside the stalled one got %d %q", status, body)
+		}
 	}
-	st := w.await(s.ID(), "reset", func(st *h3WireStream) bool { return st.done })
+	st = w.await(s.ID(), "reset", func(st *h3WireStream) bool { return st.done })
 	w.mu.Lock()
 	reset := st.reset
 	w.mu.Unlock()

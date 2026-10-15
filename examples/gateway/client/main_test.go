@@ -12,6 +12,7 @@ import (
 	stdhttp "net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -271,8 +272,13 @@ func TestChecksCatchAMisbehavingGateway(t *testing.T) {
 	startEngines(t, server)
 	addr := example.Addr(server)
 	base := func(fault string) string { return "http://" + addr + "/" + fault }
-	// Nothing listens on port 1.
+	// Nothing listens on port 1. Windows retries a connect the port refuses
+	// for longer than the shortened timeouts, which then report it.
 	const refused = "http://127.0.0.1:1"
+	refusal := "refused"
+	if runtime.GOOS == "windows" {
+		refusal = "timed out"
+	}
 
 	engine, stop := example.ClientEngine()
 	t.Cleanup(stop)
@@ -307,19 +313,19 @@ func TestChecksCatchAMisbehavingGateway(t *testing.T) {
 		got  func() outcome
 		want string
 	}{
-		{"echo refused", func() outcome { return echo(client, refused) }, "refused"},
+		{"echo refused", func() outcome { return echo(client, refused) }, refusal},
 		{"echo status", func() outcome { return echo(client, base("status")) }, "status 500"},
 		{"echo body", func() outcome { return echo(client, base("body")) }, "unexpected reply"},
 		{"echo hangs", func() outcome { return echo(client, base("hang")) }, "timed out"},
-		{"download refused", func() outcome { return download(client, refused, 10) }, "refused"},
+		{"download refused", func() outcome { return download(client, refused, 10) }, refusal},
 		{"download status", func() outcome { return download(client, base("status"), 10) }, "status 500"},
 		{"download wrong bytes", func() outcome { return download(client, base("wrong"), 1024) }, `byte 0 is 'z'`},
 		{"download cut short", func() outcome { return download(client, base("cut"), 1024) }, ""},
-		{"stream refused", func() outcome { return stream(client, refused) }, "refused"},
+		{"stream refused", func() outcome { return stream(client, refused) }, refusal},
 		{"stream body", func() outcome { return stream(client, base("body")) }, "body "},
 		{"stream trailer", func() outcome { return stream(client, base("trailer")) }, "trailer"},
 		{"stream not streamed", func() outcome { return stream(client, base("fast")) }, "did not stream"},
-		{"websocket refused", func() outcome { return relay(dialer, "ws://127.0.0.1:1/ws") }, "refused"},
+		{"websocket refused", func() outcome { return relay(dialer, "ws://127.0.0.1:1/ws") }, refusal},
 		{"websocket dial hangs", func() outcome { return relay(dialer, "ws://"+mute.Addr().String()+"/ws") }, "dial timed out"},
 		{"websocket wrong echo", func() outcome { return relay(dialer, "ws://"+addr+"/mismatch/ws") }, "echoed 14 bytes, want 25"},
 		{"websocket no echo", func() outcome { return relay(dialer, "ws://"+addr+"/silent/ws") }, "no echo"},

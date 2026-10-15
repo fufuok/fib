@@ -278,13 +278,33 @@ func (c *Context) reopen() {
 // order. Nothing bounds how long a request may be retained, so a handler that
 // never releases holds its connection until the peer or a timeout ends it.
 //
-// Retaining a request whose response is already written, or whose connection
-// has already gone, does nothing.
+// Retaining a request whose response is already written does nothing, and
+// neither does retaining one whose connection has gone, once the request has
+// ended. A request whose connection went while its handler was still at it
+// is held as one retained a moment before would be: nothing more is written,
+// but the request and its Context stay the handler's until the Release, so a
+// handler that retains and answers from elsewhere does not find its Context
+// recycled under it, whenever the cancellation lands.
 //
 // A handler may hold at most 65535 Retains on one request at a time.
-func (c *Context) Retain() { c.retain() }
+func (c *Context) Retain() {
+	for {
+		w := c.word.Load()
+		if ctxState(w) == ctxOpen || ctxState(w) == ctxCancelled && w&ctxAlive != 0 {
+			if w&ctxHolds == ctxHolds {
+				panic("http: too many Retains on one request")
+			}
+			if c.word.CompareAndSwap(w, w+1) {
+				return
+			}
+			continue
+		}
+		return
+	}
+}
 
-// retain is Retain, reporting whether it took a hold.
+// retain takes a hold on an open response, as Retain does, reporting whether
+// it took one; a cancelled request it leaves alone, which OnBody relies on.
 func (c *Context) retain() bool {
 	for {
 		w := c.word.Load()
