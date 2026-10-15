@@ -372,6 +372,7 @@ engine, err := fib.Bind(config, multiproto.New(multiproto.Config{
 
 ```sh
 go run ./examples/multiprotocol/server # 一个引擎同时提供 HTTP、HTTPS、HTTP/3、WebSocket 和裸 TCP，另有一个按首字节分流的端口
+go run ./examples/multiproto/server   # 同一端口上的 HTTPS、HTTP/1.1、h2c、WebSocket、gRPC、SOCKS、HTTP CONNECT、arpc 与 TCP 回显
 go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
 go run ./examples/http/router
@@ -385,7 +386,7 @@ go run ./examples/gateway/server      # 依次启动 upstream、gateway、client
 go run ./examples/gateway/client
 ```
 
-除 `multiprotocol` 外，每个 server 目录旁边都有对应的 `client`。
+除 `multiprotocol` 和 `multiproto` 外，每个 server 目录旁边都有对应的 `client`；`multiproto` 的文件头注释列出了各协议对应的客户端与 curl 命令。
 
 ## 架构
 

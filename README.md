@@ -389,6 +389,7 @@ engine, err := fib.Bind(config, multiproto.New(multiproto.Config{
 
 ```sh
 go run ./examples/multiprotocol/server # HTTP, HTTPS, HTTP/3, WebSocket and raw TCP from one engine, and a port that sniffs
+go run ./examples/multiproto/server   # HTTPS, HTTP/1.1, h2c, WebSocket, gRPC, SOCKS, HTTP CONNECT, arpc and a TCP echo on one port
 go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
 go run ./examples/http/router
@@ -405,7 +406,7 @@ go run ./examples/gateway/server       # upstream, gateway and client, all callb
 go run ./examples/gateway/client
 ```
 
-Each server directory but `multiprotocol` has a matching `client` next to it.
+Each server directory but `multiprotocol` and `multiproto` has a matching `client` next to it; `multiproto`'s doc comment lists the clients and curl commands for each of its protocols.
 
 ## Architecture
 
