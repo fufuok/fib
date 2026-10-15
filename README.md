@@ -367,6 +367,24 @@ engine, err := fib.Bind(config, mux.NewWithConfig(mux.Config{Fallback: rawEcho},
 Only protocols whose client speaks first can be sniffed; one where the server greets first, such as
 SMTP or MySQL, needs a binding of its own.
 
+`multiproto` builds such a handler from the protocols you name: each one whose handler is set is
+served, and it reads only as far as those need to be told apart — the whole request head to set a
+WebSocket handshake apart from other HTTP/1.x, the first HTTP/2 headers to set gRPC apart from other
+h2c (sending the server's SETTINGS to clients that wait for them, as grpc-go's do):
+
+```go
+engine, err := fib.Bind(config, multiproto.New(multiproto.Config{
+	TLS:       fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), web),
+	HTTP1:     web, // fibhttp.NewHandler(...)
+	HTTP2:     web,
+	WebSocket: websocket.NewHandler(wsHandler),
+	GRPC:      grpcServer,
+	SOCKS:     socks.NewServer(socks.Config{}),
+	HTTPProxy: fibhttp.NewHandler(fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{})), // CONNECT, absolute URLs
+	ARPC:      arpcServer,
+}))
+```
+
 ### Examples
 
 ```sh

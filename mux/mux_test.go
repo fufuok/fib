@@ -9,6 +9,7 @@ import (
 	"net"
 	stdhttp "net/http"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -226,7 +227,7 @@ func TestEarlierRoutesWin(t *testing.T) {
 		Route{Match: Prefix("GETX"), Handler: replying("first:")},
 		Route{Match: Prefix("GE"), Handler: replying("second:")},
 	)
-	if got, ok := h.decide([]byte("GE")); ok {
+	if got, _, ok := h.decide([]byte("GE")); ok {
 		t.Fatalf("decided on %v before the first route ruled itself out", got)
 	}
 	_, addr := serve(t, h)
@@ -342,7 +343,86 @@ func TestRoutesAreCopied(t *testing.T) {
 	routes := []Route{{Match: Prefix("a"), Handler: replying("a:")}}
 	h := New(routes...)
 	routes[0].Match = Prefix("b")
-	if got, ok := h.decide([]byte("a")); !ok || got == nil {
+	if got, _, ok := h.decide([]byte("a")); !ok || got == nil {
 		t.Fatal("the route changed with the caller's slice")
+	}
+}
+
+// A route waiting for more can speak first, once, to a client that waits for
+// the server before it says enough.
+func TestNudgeSpeaksOnce(t *testing.T) {
+	var nudges atomic.Int32
+	h := New(Route{
+		Match:   Prefix("HELLO"),
+		Handler: replying("hello:"),
+		Nudge: func(c *fib.Connection, input []byte) bool {
+			nudges.Add(1)
+			_ = c.Send([]byte("?"))
+			return true
+		},
+	})
+	_, addr := serve(t, h)
+	conn := dial(t, addr)
+	if _, err := conn.Write([]byte("HE")); err != nil {
+		t.Fatal(err)
+	}
+	readUntil(t, conn, "?")
+	if _, err := conn.Write([]byte("L")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := conn.Write([]byte("LO")); err != nil {
+		t.Fatal(err)
+	}
+	// No second "?" comes before the reply.
+	readUntil(t, conn, "hello:HELLO")
+	if n := nudges.Load(); n != 1 {
+		t.Fatalf("Nudge ran %d times, want 1", n)
+	}
+}
+
+func TestSOCKSMatchers(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		m     Matcher
+		input string
+		want  Result
+	}{
+		{"SOCKS5", SOCKS5(), "\x05", NeedMore},
+		{"SOCKS5", SOCKS5(), "\x05\x00", NoMatch},
+		{"SOCKS5", SOCKS5(), "\x05\x02\x00\x02", Match},
+		{"SOCKS5", SOCKS5(), "\x04\x01", NoMatch},
+		{"SOCKS4", SOCKS4(), "\x04", NeedMore},
+		{"SOCKS4", SOCKS4(), "\x04\x01", Match},
+		{"SOCKS4", SOCKS4(), "\x04\x02", Match},
+		{"SOCKS4", SOCKS4(), "\x04\x03", NoMatch},
+		{"SOCKS4", SOCKS4(), "\x05\x01", NoMatch},
+		{"SOCKS", SOCKS(), "\x05\x01\x00", Match},
+		{"SOCKS", SOCKS(), "\x04\x01", Match},
+		{"SOCKS", SOCKS(), "\x05", NeedMore},
+		{"SOCKS", SOCKS(), "GET ", NoMatch},
+	} {
+		if got := c.m([]byte(c.input)); got != c.want {
+			t.Errorf("%s(% x) = %v, want %v", c.name, c.input, got, c.want)
+		}
+	}
+}
+
+// The guards for what races the decision: data on a connection the mux did
+// not open, and a shutdown that closed the connection before a no-match or a
+// handoff could. None of them touches the connection beyond its attachment.
+func TestDecisionGuards(t *testing.T) {
+	h := NewWithConfig(Config{Timeout: -1}, Route{Match: Prefix("a"), Handler: replying("a:")})
+	c := &fib.Connection{}
+	h.OnData(c, []byte("a"))
+	h.OnPriorityData(c, []byte("a"))
+
+	s := &sniff{}
+	s.decided.Store(true)
+	c.SetAttachment(s)
+	h.OnData(c, []byte("b")) // no route, but already decided
+	h.OnData(c, []byte("a")) // a route, but already decided
+	if c.Attachment() != s {
+		t.Fatal("a decided connection was handed off")
 	}
 }

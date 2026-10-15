@@ -54,6 +54,14 @@ var ErrNoMatch = errors.New("mux: no route matches the connection's first bytes"
 type Route struct {
 	Match   Matcher
 	Handler fib.Handler
+	// Nudge, if set, runs each time the mux waits for more bytes because
+	// Match answered NeedMore, with the connection and everything read so
+	// far, until it reports that it is done. It lets a route speak first
+	// when its protocol's client waits for the server before it says enough
+	// to be told apart: a gRPC client waits for the server's SETTINGS before
+	// it sends the request whose headers set gRPC apart from other HTTP/2.
+	// It runs on the connection's worker and must not block, or keep input.
+	Nudge func(c *fib.Connection, input []byte) (done bool)
 }
 
 // Config is how a Handler decides.
@@ -120,6 +128,9 @@ type sniff struct {
 	// decided is set once, by whichever comes first: the handoff, or a
 	// shutdown closing the connection undecided.
 	decided atomic.Bool
+	// nudged marks the routes whose Nudge is done, allocated by the first
+	// Nudge to run.
+	nudged []bool
 }
 
 // OnOpen starts the sniff, and the timeout that bounds it.
@@ -142,8 +153,9 @@ func (h *Handler) OnData(c *fib.Connection, data []byte) {
 		s.peeked = append(s.peeked, data...)
 		input = s.peeked
 	}
-	route, decided := h.decide(input)
+	route, waiting, decided := h.decide(input)
 	if !decided {
+		h.nudge(c, s, waiting, input)
 		if len(s.peeked) == 0 {
 			// data is the engine's only for this call.
 			s.peeked = append(make([]byte, 0, h.maxPeek), data...)
@@ -160,20 +172,36 @@ func (h *Handler) OnData(c *fib.Connection, data []byte) {
 	h.handoff(c, s, route, input)
 }
 
-// decide returns the handler for input, or reports that more is needed.
-func (h *Handler) decide(input []byte) (fib.Handler, bool) {
+// decide returns the handler for input, or reports that more is needed and
+// the index of the route that waits for it.
+func (h *Handler) decide(input []byte) (fib.Handler, int, bool) {
 	final := len(input) >= h.maxPeek
-	for _, r := range h.routes {
+	for i, r := range h.routes {
 		switch r.Match(input) {
 		case Match:
-			return r.Handler, true
+			return r.Handler, 0, true
 		case NeedMore:
 			if !final {
-				return nil, false
+				return nil, i, false
 			}
 		}
 	}
-	return h.fallback, true
+	return h.fallback, 0, true
+}
+
+// nudge runs the Nudge of route i, the one waiting for more, unless it is
+// done.
+func (h *Handler) nudge(c *fib.Connection, s *sniff, i int, input []byte) {
+	n := h.routes[i].Nudge
+	if n == nil || (s.nudged != nil && s.nudged[i]) {
+		return
+	}
+	if n(c, input) {
+		if s.nudged == nil {
+			s.nudged = make([]bool, len(h.routes))
+		}
+		s.nudged[i] = true
+	}
 }
 
 // handoff gives the connection to handler: the attachment and the deadline

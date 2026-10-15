@@ -351,6 +351,23 @@ engine, err := fib.Bind(config, mux.NewWithConfig(mux.Config{Fallback: rawEcho},
 
 只有客户端先发言的协议才能识别；服务端先打招呼的协议（如 SMTP、MySQL）需要单独的 binding。
 
+`multiproto` 按配置的协议组装这样的 handler：设置了 handler 的协议才会被服务，并且只读到区分这些协议
+所需的长度——要把 WebSocket 握手与其他 HTTP/1.x 分开就读完整个请求头，要把 gRPC 与其他 h2c 分开就读到
+第一个 HTTP/2 HEADERS（并给 grpc-go 这类等待服务端 SETTINGS 的客户端先发送 SETTINGS）：
+
+```go
+engine, err := fib.Bind(config, multiproto.New(multiproto.Config{
+	TLS:       fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), web),
+	HTTP1:     web, // fibhttp.NewHandler(...)
+	HTTP2:     web,
+	WebSocket: websocket.NewHandler(wsHandler),
+	GRPC:      grpcServer,
+	SOCKS:     socks.NewServer(socks.Config{}),
+	HTTPProxy: fibhttp.NewHandler(fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{})), // CONNECT, absolute URLs
+	ARPC:      arpcServer,
+}))
+```
+
 ### 示例
 
 ```sh
