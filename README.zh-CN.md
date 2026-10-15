@@ -386,7 +386,7 @@ go run ./examples/gateway/server      # 依次启动 upstream、gateway、client
 go run ./examples/gateway/client
 ```
 
-除 `multiprotocol` 和 `multiproto` 外，每个 server 目录旁边都有对应的 `client`；`multiproto` 的文件头注释列出了各协议对应的客户端与 curl 命令。
+除 `multiprotocol` 外，每个 server 目录旁边都有对应的 `client`；`multiproto` 的 server 文件头注释还列出了各协议对应的 curl 或客户端命令。
 
 ## 架构
 

@@ -7,8 +7,10 @@
 // an HTTP CONNECT proxy and arpc. What is none of them is echoed back.
 //
 //	go run ./examples/multiproto/server
+//	go run ./examples/multiproto/client
 //
-// Every protocol answers on 127.0.0.1:9000:
+// The client speaks every protocol in turn. Each one also answers its usual
+// clients on 127.0.0.1:9000:
 //
 //	curl http://127.0.0.1:9000/hello
 //	curl --http2-prior-knowledge http://127.0.0.1:9000/hello

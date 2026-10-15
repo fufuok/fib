@@ -406,7 +406,7 @@ go run ./examples/gateway/server       # upstream, gateway and client, all callb
 go run ./examples/gateway/client
 ```
 
-Each server directory but `multiprotocol` and `multiproto` has a matching `client` next to it; `multiproto`'s doc comment lists the clients and curl commands for each of its protocols.
+Each server directory but `multiprotocol` has a matching `client` next to it; `multiproto`'s server also lists a curl or client command for each of its protocols.
 
 ## Architecture
 
