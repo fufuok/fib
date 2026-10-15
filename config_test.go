@@ -226,9 +226,9 @@ func acceptsConnections(t *testing.T, fd int) bool {
 }
 
 // Each poller listens on a TCP socket of its own, bound where the engine's
-// is, and accepts its connections itself, with ReusePort or without it,
-// handing each to the poller its descriptor picks; the engine's socket only
-// holds the address and the port the kernel chose, and takes none.
+// is, and accepts and serves its connections itself, with ReusePort or
+// without it; the engine's socket only holds the address and the port the
+// kernel chose, and takes none.
 func TestPollersAcceptWithReusePort(t *testing.T) {
 	for _, reusePort := range []bool{true, false} {
 		t.Run("ReusePort="+strconv.FormatBool(reusePort), func(t *testing.T) {

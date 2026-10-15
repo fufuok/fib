@@ -1112,10 +1112,10 @@ type Config struct {
 	// rest of their lives. Which loops listen is EngineLoop's to say: by
 	// default the pollers accept connections themselves and the engine has
 	// no loop of its own; with EngineLoop the engine's own loop accepts every
-	// connection and reads the UDP sockets. Either way a connection is served
-	// by the poller its descriptor picks modulo their number, whichever loop
-	// accepted it, and so is a connection the engine dials, over TCP, UDP or
-	// a Unix socket.
+	// connection and reads the UDP sockets. A connection a poller accepts on
+	// a TCP socket of its own stays with that poller; any other is served by
+	// the poller its descriptor picks modulo their number, and so is a
+	// connection the engine dials, over TCP, UDP or a Unix socket.
 	//
 	// Spreading the connections spreads the loops' own work, the waits,
 	// registrations and wake-ups, over several cores. With or without it, a
@@ -1165,11 +1165,12 @@ type Config struct {
 	// ReusePort below describes. A Unix socket, and a TCP one on the
 	// platforms where SO_REUSEPORT does not spread connections, is one
 	// socket every poller waits on; on Linux it wakes one of them at a time.
-	// A poller hands each connection it accepts to the poller its descriptor
-	// picks, keeping it only when that is itself, since the kernel wakes the
-	// pollers to accept unevenly: 400 connections to a socket four pollers
-	// shared landed 367 on one of them, where they spread 153, 143, 47 and
-	// 57 by descriptor. The UDP addresses are read by every poller with
+	// A poller keeps the connections it accepts on a socket of its own, which
+	// the kernel spreads over the pollers by a hash of their addresses.
+	// Those it accepts on a socket the pollers share go to the poller their
+	// descriptor picks, since the kernel wakes the pollers to accept
+	// unevenly: 400 connections to a socket four pollers shared landed 367
+	// on one of them, where they spread 153, 143, 47 and 57 by descriptor. The UDP addresses are read by every poller with
 	// ReusePort on Linux, and otherwise by the first poller alone. Dials go
 	// to the pollers either way.
 	//
@@ -1191,14 +1192,18 @@ type Config struct {
 	// however many cores there were to serve them: HttpArena's limited-conn
 	// profile, ten requests a connection over 4096 at a time on 64 CPUs,
 	// served 0.94M requests a second that way and 1.65M with the pollers
-	// accepting. A poller hands each connection it accepts to the poller its
-	// descriptor picks; see EngineLoop. Without ReusePort the engine first
-	// claims the address with a socket bound
-	// without SO_REUSEPORT, so that an address another socket holds is
-	// refused with EADDRINUSE as it always was, and only a socket that sets
-	// SO_REUSEPORT itself can join the engine's afterwards. Unix sockets, and
-	// the other platforms, have one socket the pollers all wait on; see
-	// EngineLoop.
+	// accepting. Each poller serves the connections it accepts, so the
+	// kernel's hash is also what balances them: a connection stays with the
+	// poller its hash picked, however busy that poller is. Handing each to
+	// the poller its descriptor picks instead served limited-conn 0.2% to
+	// 0.5% slower on 8 CPUs, and pairs descriptors badly where a process
+	// opens one descriptor of its own for every connection it accepts, as a
+	// proxy dialing upstream does. Without ReusePort the engine first claims
+	// the address with a socket bound without SO_REUSEPORT, so that an
+	// address another socket holds is refused with EADDRINUSE as it always
+	// was, and only a socket that sets SO_REUSEPORT itself can join the
+	// engine's afterwards. Unix sockets, and the other platforms, have one
+	// socket the pollers all wait on; see EngineLoop.
 	//
 	// On a UDP address it has the pollers read datagrams in the same way,
 	// which they do only with it set: each poller reads a

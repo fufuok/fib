@@ -30,12 +30,17 @@ func pollerConfig(name string, pollers int) Config {
 }
 
 // checkPoller fails unless c, opened on descriptor fd, is served by the
-// poller that descriptor picks, while still reporting the engine that
-// accepted or dialed it as its own.
+// poller that descriptor picks, or, accepted by a poller on a TCP socket of
+// its own, by one of the engine's pollers, while still reporting the engine
+// that accepted or dialed it as its own.
 func checkPoller(t *testing.T, e *Engine, c *Connection, fd int) {
 	t.Helper()
 	if fd < 0 {
 		t.Errorf("connection has no descriptor")
+	} else if keptByAcceptor(e, c) {
+		if c.engine.parent != e {
+			t.Errorf("descriptor %d is served by %p, want one of the engine's pollers", fd, c.engine)
+		}
 	} else if want := e.pollers[fd%len(e.pollers)]; c.engine != want {
 		t.Errorf("descriptor %d is served by %p, want poller %p", fd, c.engine, want)
 	}
@@ -44,7 +49,25 @@ func checkPoller(t *testing.T, e *Engine, c *Connection, fd int) {
 	}
 }
 
-// Accepted connections go to the poller their descriptor picks, which hands
+// keptByAcceptor reports whether c was accepted by a poller on a TCP socket
+// of its own, which keeps the connection rather than handing it on.
+func keptByAcceptor(e *Engine, c *Connection) bool {
+	if c.dialed {
+		return false
+	}
+	if c.flags.has(flagUnix) {
+		return false
+	}
+	for _, l := range e.listeners {
+		if l.spread {
+			return true
+		}
+	}
+	return false
+}
+
+// Accepted connections go to the poller their descriptor picks, or stay with
+// the poller that accepted them on a socket of its own, which hands
 // their rounds to the engine's workers, and the stream pool is sized as it
 // is without pollers.
 func TestPollersServeAcceptedConnections(t *testing.T) {

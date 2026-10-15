@@ -228,3 +228,43 @@ func TestNoEngineLoopPlacesAcceptedByDescriptor(t *testing.T) {
 		}
 	}
 }
+
+// A poller that accepts on a TCP socket of its own serves the connection
+// itself rather than handing it to the poller its descriptor picks.
+func TestPollersKeepOwnAccepts(t *testing.T) {
+	const pollers, conns = 3, 30
+	config := pollerConfig("pollers-keep-own", pollers)
+	config.Addr = "127.0.0.1:0"
+	accepted := make(chan *Connection, conns)
+	server, err := Bind(config, HandlerFuncs{
+		Open: func(c *Connection) { accepted <- c },
+		Data: prefixEcho("").(HandlerFuncs).Data,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runEngine(t, server)
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := 0
+	for i := 0; i < conns; i++ {
+		if got := exchange(t, addr, "ping"); got != "ping" {
+			t.Fatalf("answered %q", got)
+		}
+		c := <-accepted
+		if c.engine.parent != server {
+			t.Fatalf("a connection is served by %p, want one of the engine's pollers", c.engine)
+		}
+		if fd := c.FD(); fd >= 0 && c.engine != server.pollers[fd%pollers] {
+			moved++
+		}
+	}
+	// Placed by descriptor every connection would sit on pollers[fd%3]; kept
+	// by its acceptor, some sit elsewhere, the kernel's hash being blind to
+	// descriptors.
+	if moved == 0 {
+		t.Fatalf("all %d connections sit on the poller their descriptor picks", conns)
+	}
+}

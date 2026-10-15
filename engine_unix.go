@@ -665,11 +665,15 @@ func (e *Engine) acceptConnections(listenFD int) {
 			// one back until the peer's delayed ACK.
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		}
-		// Whichever loop accepted it, the connection is served by the poller
-		// its descriptor picks, which spreads connections over the pollers
-		// evenly however unevenly the kernel woke them to accept.
+		// A poller that accepted on a socket of its own keeps the
+		// connection: the kernel already spread connections over the
+		// pollers' sockets by a hash of their addresses, and handing it on
+		// would cost a wake-up and a registration on another loop. One
+		// accepted on a socket every poller waits on, or by the engine's own
+		// loop, goes to the poller its descriptor picks, since the kernel
+		// wakes the pollers sharing a socket unevenly.
 		p := e
-		if pollers := e.root().pollers; len(pollers) > 0 {
+		if pollers := e.root().pollers; len(pollers) > 0 && (e.parent == nil || l.shared) {
 			p = pollers[fd%len(pollers)]
 		}
 		if p == e {
