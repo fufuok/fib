@@ -164,7 +164,16 @@ func TestARPCBesideTLSAndSOCKS(t *testing.T) {
 	routes := Routes(Config{TLS: h("tls"), SOCKS: h("socks"), ARPC: h("arpc"), HTTP1: h("http1")})
 	tlsLike := arpcMessage(arpcCmdRequest, "/echo", 0x00040316) // 16 03 04 00
 	socksLike := arpcMessage(arpcCmdRequest, "/echo", 0x0105)   // 05 01 00 00
+	// The first 40 bytes of the ClientHello curl 8.7.1 on macOS sends, which
+	// passes for an arpc request: a 16.8MB body and a one-byte method, 0xd2.
+	curlHello := "\x16\x03\x01\x01\x28\x01\x00\x01\x24\x03\x03\x5f\x74\x52\x48\xad" +
+		"\xd2\x7e\x0b\xc4\xeb\x64\x68\xd2\xa1\x94\xd4\x83\x26\xdf\x20\x77" +
+		"\x10\x24\x8c\x2c\x22\xfe\xb2\x71"
+	if ARPC(0)([]byte(curlHello)) != mux.Match {
+		t.Fatal("the test no longer shows a hello arpc would take")
+	}
 	for _, c := range []struct{ input, want string }{
+		{curlHello, "tls"},
 		{tlsLike, "arpc"},
 		{socksLike, "arpc"},
 		{socksLike[:3], "socks"}, // a whole SOCKS5 greeting, after which its client waits
@@ -355,5 +364,37 @@ func TestHTTP1Family(t *testing.T) {
 				t.Errorf("%+v: %q went to %s, want %s", c.config, input, got, want)
 			}
 		}
+	}
+}
+
+func TestClientHelloMatcher(t *testing.T) {
+	m := ClientHello()
+	// A record of 296 bytes holding a hello of 292.
+	hello := "\x16\x03\x01\x01\x28\x01\x00\x01\x24\x03\x03"
+	with := func(i int, b byte) string { return hello[:i] + string(b) + hello[i+1:] }
+	for _, c := range []struct {
+		input string
+		want  mux.Result
+	}{
+		{hello[:3], mux.NeedMore},
+		{hello[:10], mux.NeedMore},
+		{hello, mux.Match},
+		{"\x17\x03\x01", mux.NoMatch},
+		// A hello that goes on in the next record.
+		{"\x16\x03\x01\x00\x40\x01\x00\x01\x24\x03\x03", mux.Match},
+		// A record too short, or too long, for a ClientHello.
+		{"\x16\x03\x01\x00\x10\x01\x00\x00\x0c\x03\x03", mux.NoMatch},
+		{"\x16\x03\x01\x41\x00\x01\x00\x40\xfc\x03\x03", mux.NoMatch},
+		// Another handshake message.
+		{with(5, 2), mux.NoMatch},
+		// A hello too short to be one, or shorter than its record.
+		{"\x16\x03\x01\x00\x30\x01\x00\x00\x10\x03\x03", mux.NoMatch},
+		{with(8, 0x20), mux.NoMatch},
+		// A client version before TLS 1.0, or past TLS 1.3.
+		{with(9, 2), mux.NoMatch},
+		{with(10, 0), mux.NoMatch},
+		{with(10, 5), mux.NoMatch},
+	} {
+		check(t, "ClientHello", m, c.input, c.want)
 	}
 }

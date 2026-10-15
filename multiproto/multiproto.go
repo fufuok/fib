@@ -126,11 +126,15 @@ func Routes(config Config) []mux.Route {
 	}
 	arpcMatch := ARPC(config.ARPCMaxBodyLen)
 	// An arpc header has no magic number, and the length that opens one can
-	// begin the way a ClientHello or a SOCKS greeting does: when arpc is
-	// served too, those take only what is not arpc.
+	// begin the way a ClientHello or a SOCKS greeting does. When arpc is
+	// served too, TLS takes only a ClientHello whose headers agree, which a
+	// client's first arpc message does not pass for: the record length would
+	// be its body length's top byte and its reserved byte, which a body
+	// under 16MB and no flag bits make 0, and the client version would be
+	// bytes of its sequence number. SOCKS takes only what is not arpc.
 	tlsMatch, socksMatch := mux.TLS(), mux.SOCKS()
 	if config.ARPC != nil {
-		tlsMatch = except(tlsMatch, arpcMatch, nil)
+		tlsMatch = ClientHello()
 		socksMatch = except(socksMatch, arpcMatch, socksSettled)
 	}
 	add(tlsMatch, config.TLS)

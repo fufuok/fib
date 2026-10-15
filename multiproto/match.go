@@ -225,6 +225,52 @@ func NudgeHTTP2(c *fib.Connection, input []byte) bool {
 	return true
 }
 
+// TLS record and handshake limits ClientHello checks: a record carries at
+// most 2^14 bytes of plaintext, and a ClientHello at least its version, its
+// random, and the lengths of its session id, cipher suites and compression
+// methods.
+const (
+	tlsMaxRecordLen   = 1 << 14
+	tlsMinClientHello = 2 + 32 + 1 + 2 + 1
+)
+
+// ClientHello matches a TLS ClientHello as mux.TLS does, and checks its
+// record and handshake headers agree as well: a record length a ClientHello
+// fits, the handshake type of one, a handshake length at least the record's
+// share of it, and a client version of TLS 1.0 or later. It needs the first
+// 11 bytes, where mux.TLS needs 3, and tells a ClientHello from bytes that
+// only begin like one, such as an arpc header whose body length does.
+func ClientHello() mux.Matcher {
+	tls := mux.TLS()
+	return func(input []byte) mux.Result {
+		if r := tls(input); r != mux.Match {
+			return r
+		}
+		if len(input) < 11 {
+			return mux.NeedMore
+		}
+		record := int(binary.BigEndian.Uint16(input[3:5]))
+		hello := int(input[6])<<16 | int(input[7])<<8 | int(input[8])
+		switch {
+		case record < 4+tlsMinClientHello || record > tlsMaxRecordLen:
+			return mux.NoMatch
+		case input[5] != tlsHandshakeClientHello:
+			return mux.NoMatch
+		case hello < tlsMinClientHello || 4+hello < record:
+			// A hello longer than its record goes on in the next one; a
+			// shorter one would leave the record room for another message,
+			// which a client's first flight does not have.
+			return mux.NoMatch
+		case input[9] != 3 || input[10] == 0 || input[10] > 4:
+			return mux.NoMatch
+		}
+		return mux.Match
+	}
+}
+
+// tlsHandshakeClientHello is the handshake type of a ClientHello.
+const tlsHandshakeClientHello = 1
+
 // The arpc header, little endian, ARPC checks (see package arpc).
 const (
 	arpcHeadLen      = 16
