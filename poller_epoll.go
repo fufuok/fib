@@ -5,7 +5,6 @@ package fib
 import (
 	"encoding/binary"
 	"os"
-	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -88,11 +87,8 @@ func (e *Engine) runLoop() error {
 	events := make([]syscall.EpollEvent, batch)
 	var ready []*Connection
 	var tasks []taskpool.Task
-	var waiter *epollWaiter
-	if len(e.root().pollers) > 0 || runtime.GOMAXPROCS(0) == 1 {
-		waiter = newEpollWaiter(e.epollFD)
-		defer waiter.close()
-	}
+	waiter := newEpollWaiter(e.epollFD)
+	defer waiter.close()
 	for !e.stopping.Load() {
 		n, err := waiter.wait(e.epollFD, events)
 		if err == syscall.EINTR {
@@ -157,19 +153,21 @@ func (e *Engine) runLoop() error {
 // measured the CPUs 0 to 2% idle, and HTTP/1 over 10k connections accepted
 // them 19% faster, with echoes unchanged.
 //
-// Only the loops of an engine with pollers wait this way, and a lone loop
-// where GOMAXPROCS is 1. The runtime looks for a parked goroutine's events
-// only when a P runs out of work, or every 10ms under load, and a lone loop,
-// which every connection waits on, waited longer for that than for its P
-// back: the HTTP/1 benchmark accepted connections 15% slower and echoed 2%
-// slower with it parked. With one P, though, a loop blocked in epoll_wait
-// holds the only P there is, and nothing else runs until events arrive or
-// the monitor takes it back, which an idle monitor checks for every 10ms:
-// not the timers of handlers sleeping on the workers, nor the goroutines a
-// response from elsewhere wakes. In a child of package prefork with one P,
-// HttpArena's async profile, 32000 connections each waiting 10ms in its
-// handler, served 1.27M requests a second with the loop blocking, with 26.6ms
-// for the median request, and with two Ps 2.02M.
+// Every loop waits this way, a lone one too. The runtime looks for a parked
+// goroutine's events only when a P runs out of work, or every 10ms under
+// load, and a lone loop, which every connection waits on, waits for that
+// rather than for its P back. On 8 CPUs of a Ryzen 7800X3D, a lone loop
+// parked served HTTP/1 2.2% more pipelined requests, 256 connections 16 deep,
+// but 1.4% fewer where 4096 connections each made ten requests and
+// reconnected, and over 64 connections the same requests at 4% less CPU with
+// their 99th percentile latency 164us to 188us. With one P, a loop blocked in
+// epoll_wait holds the only P there is, and nothing else runs until events
+// arrive or the monitor takes it back, which an idle monitor checks for every
+// 10ms: not the timers of handlers sleeping on the workers, nor the
+// goroutines a response from elsewhere wakes. In a child of package prefork
+// with one P, HttpArena's async profile, 32000 connections each waiting 10ms
+// in its handler, served 1.27M requests a second with the loop blocking, with
+// 26.6ms for the median request, and with two Ps 2.02M.
 //
 // The runtime's poller does not watch the loop's epoll instance itself but a
 // relay: a second epoll instance holding the first, which reports it only
@@ -256,8 +254,11 @@ func (w *epollWaiter) arm(events uint32) error {
 // A loop with events waiting, as a busy one has, takes them without parking
 // and without touching the relay. Read looks for events again before it
 // parks, and each time the runtime reports the relay readable, so events
-// that arrive while the relay is armed are never missed: arming it with the
-// instance already readable reports it at once.
+// that arrive while the relay is armed are never missed. The look after
+// arming is what catches one that came before it: arming reports an instance
+// already readable only if the relay has not kept it on its ready list since
+// an earlier wake-up, which, read by no one, it may. Arming without that
+// look, a single connection's ping-pong hung within a thousand rounds.
 func (w *epollWaiter) wait(epfd int, events []syscall.EpollEvent) (int, error) {
 	if w != nil && w.file != nil {
 		if n, err := pollEvents(epfd, events); n != 0 || (err != nil && err != syscall.EINTR) {
