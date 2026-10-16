@@ -72,6 +72,14 @@ func (rs *requestStream) BeginResponse(req *stdhttp.Request, status int, header 
 // stream until flow control lets it go.
 func (rs *requestStream) WriteBody(p []byte, wait bool) error {
 	for len(p) > 0 {
+		// A stream a reset or WriteTimeout closed takes nothing more, even
+		// in the moment before the QUIC stream itself is reset.
+		rs.mu.Lock()
+		closed := rs.closed
+		rs.mu.Unlock()
+		if closed {
+			return rs.closedErr()
+		}
 		if wait {
 			if err := rs.s.WaitSendable(maxUnsentOutput); err != nil {
 				return rs.closedErr()

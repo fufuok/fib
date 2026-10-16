@@ -807,12 +807,13 @@ func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
 	sc.streams = nil
 	sc.mu.Unlock()
 	for _, rs := range streams {
-		rs.cancel(net.ErrClosed)
+		// Closed before the handler hears of it; see peerReset.
 		rs.mu.Lock()
 		rs.closed = true
 		stopped := rs.stopWriteTimerLocked()
 		readStopped := rs.stopReadTimerLocked()
 		rs.mu.Unlock()
+		rs.cancel(net.ErrClosed)
 		if stopped {
 			rs.unref()
 		}
@@ -1377,13 +1378,14 @@ func (rs *requestStream) abort(code ErrorCode) {
 	rs.done = true
 	rs.dropBody()
 	err := fmt.Errorf("http3: request stream aborted: %v", code)
-	rs.failBody(err)
-	rs.cancel(err)
+	// Closed before the handler hears of it; see peerReset.
 	rs.mu.Lock()
 	rs.closed = true
 	stopped := rs.stopWriteTimerLocked()
 	readStopped := rs.stopReadTimerLocked()
 	rs.mu.Unlock()
+	rs.failBody(err)
+	rs.cancel(err)
 	if stopped {
 		rs.unref()
 	}
@@ -1430,14 +1432,17 @@ func (rs *requestStream) cancel(err error) {
 func (rs *requestStream) peerReset() {
 	rs.done = true
 	rs.dropBody()
-	rs.failBody(errRequestReset)
-	rs.cancel(errRequestReset)
+	// The stream is closed before the handler hears of the reset, through
+	// OnCancel or its body: told first, it could answer or Upgrade on a
+	// stream that still read as open, and get a tunnel the reset never ends.
 	rs.mu.Lock()
 	wasOpen := !rs.closed && (!rs.responded || rs.upgraded || rs.streaming)
 	rs.closed = true
 	stopped := rs.stopWriteTimerLocked()
 	readStopped := rs.stopReadTimerLocked()
 	rs.mu.Unlock()
+	rs.failBody(errRequestReset)
+	rs.cancel(errRequestReset)
 	if stopped {
 		rs.unref()
 	}

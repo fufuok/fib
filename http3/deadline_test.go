@@ -190,7 +190,10 @@ func TestFlushReportsAResetStream(t *testing.T) {
 	base := startServer(t, Config{WriteTimeout: 200 * time.Millisecond}, func(c *fibhttp.Context) {
 		_, _ = c.WriteString("first")
 		if err := c.FlushError(); err != nil {
-			results <- [3]error{err}
+			// A handler that started late finds the stream reset already;
+			// what follows has to report it all the same.
+			_, write := c.WriteString(strings.Repeat("x", 32<<10))
+			results <- [3]error{err, write, c.FlushError()}
 			return
 		}
 		time.Sleep(500 * time.Millisecond)

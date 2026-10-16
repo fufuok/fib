@@ -283,9 +283,10 @@ func (c *Context) FlushError() error {
 	if ctxState(c.word.Load()) == ctxCancelled {
 		// The connection, or the stream, went under the response: a write
 		// timeout, a reset, a hangup. Nothing flushed would reach the
-		// client.
+		// client, and every Write and Flush from here reports it, as they
+		// report a send that failed.
 		if err := c.Err(); err != nil {
-			return err
+			return w.fail(err)
 		}
 	}
 	if w.status == 0 {
