@@ -41,6 +41,11 @@ func Streams(req *stdhttp.Request) bool {
 	if body == nil || body == stdhttp.NoBody {
 		return false
 	}
+	if _, ok := body.(*Pusher); ok {
+		// Pushed, whatever its length: reading it whole would wait for its
+		// producer, on the goroutine that calls Do.
+		return true
+	}
 	if req.ProtoMajor == 1 && req.ProtoMinor == 0 {
 		return false
 	}
@@ -64,6 +69,9 @@ func Declared(req *stdhttp.Request) int64 {
 // it: the first reads req.Body, and any later one what GetBody returns.
 type Source struct {
 	req *stdhttp.Request
+	// push is the body when its producer pushes it, which is sent by
+	// attaching a Sink to it rather than read.
+	push *Pusher
 
 	mu      sync.Mutex
 	current *body
@@ -72,7 +80,14 @@ type Source struct {
 }
 
 // NewSource returns the source of req's body.
-func NewSource(req *stdhttp.Request) *Source { return &Source{req: req} }
+func NewSource(req *stdhttp.Request) *Source {
+	push, _ := req.Body.(*Pusher)
+	return &Source{req: req, push: push}
+}
+
+// Pusher returns the body when its producer pushes it, or nil when it is to
+// be read with Take.
+func (s *Source) Pusher() *Pusher { return s.push }
 
 // Take returns the body for an attempt to send the request, which Pump
 // reads and closes. The attempt before it, if any, has been abandoned.
@@ -114,6 +129,10 @@ func (s *Source) Close() {
 	s.closed = true
 	current, untaken := s.current, !s.taken
 	s.mu.Unlock()
+	if s.push != nil {
+		s.push.Stop()
+		return
+	}
 	if current != nil {
 		current.Close()
 	} else if untaken {

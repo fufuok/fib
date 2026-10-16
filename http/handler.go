@@ -298,6 +298,24 @@ func (c *Context) RequestBody() *BodyStream {
 	return stream
 }
 
+// HoldBody pauses, with hold set, the body that OnBody delivers, and resumes it
+// without: while it is held, the callback is not called, and what arrives
+// waits in the server's buffer, which paces the client as an unread body
+// does — an HTTP/1 connection stops reading its socket once
+// Config.StreamRequestBodyBuffer waits, and HTTP/2 and HTTP/3 give the peer
+// no room for more. That is how a callback that passes the body on to a slower
+// consumer, such as a BodyWriter, waits for it without waiting: it holds the
+// body, and resumes it once the consumer has room. A body that fails or is
+// given up is still reported while held. Resuming hands what waits to the
+// callback on the engine's handler pool, never on the caller's goroutine, so
+// HoldBody may be called from inside the callback and from anywhere else. It
+// does nothing to a body that arrived whole.
+func (c *Context) HoldBody(hold bool) {
+	if stream := c.RequestBody(); stream != nil {
+		stream.holdSink(hold)
+	}
+}
+
 // closeAfterResponse ends the HTTP/1 connection behind the response, with a
 // lingering close if the request's body is still arriving.
 func (c *Context) closeAfterResponse() {

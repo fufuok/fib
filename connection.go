@@ -21,6 +21,7 @@ import (
 	"github.com/lesismal/fib/internal/netaddr"
 	"github.com/lesismal/fib/internal/outputwait"
 	"github.com/lesismal/fib/internal/sys"
+	"github.com/lesismal/fib/sidepool"
 )
 
 // sendItem is one queued chunk. pooled says data came from the buffer pool,
@@ -769,6 +770,7 @@ func (c *Connection) subPending(n int64) {
 	if w := c.outputWaitLocked(); w != nil && pending <= w.release {
 		w.cond.Broadcast()
 	}
+	c.fireNoticesLocked(nil)
 	if c.charged > pending {
 		released := c.charged - pending
 		c.charged = pending
@@ -1278,6 +1280,71 @@ func (c *Connection) wakeOutputWaitLocked() {
 	if w := c.outputWaitLocked(); w != nil {
 		w.cond.Broadcast()
 	}
+	if c.closing || c.closed || c.engine.stopping.Load() {
+		c.fireNoticesLocked(syscall.EPIPE)
+	}
+}
+
+// fireNoticesLocked runs the callbacks waiting in notifyOutput whose backlog
+// has been reached, or every one of them with err when it is not nil. They
+// run on the client pool, never here, under the lock; a pool too busy to
+// take one at once hands it a goroutine of its own, since nothing here may
+// wait for room. Callers hold c.mu.
+func (c *Connection) fireNoticesLocked(err error) {
+	d := c.deadlines
+	if d == nil || len(d.notices) == 0 {
+		return
+	}
+	pending := c.pendingBytes.Load()
+	kept := d.notices[:0]
+	for _, n := range d.notices {
+		if err == nil && pending > n.release {
+			kept = append(kept, n)
+			continue
+		}
+		fn := n.fn
+		run := func() { fn(err) }
+		if !sidepool.Client().TryGo(run) {
+			go run()
+		}
+	}
+	clear(d.notices[len(kept):])
+	d.notices = kept
+	if len(kept) == 0 && d.drain == nil {
+		c.engine.trackOutputWait(c, false)
+	}
+}
+
+// notifyOutput is waitOutput for a caller that may not wait: when more than
+// limit bytes of what Send accepted are queued for the socket it arranges for
+// fn to run, on the client pool, once no more than half of limit are, or
+// with syscall.EPIPE once the connection is closing, and reports true; when
+// no more than limit are, it reports false and fn never runs. Unlike a
+// waiter, nothing here flushes: the connection's own rounds do, at each write
+// edge, since no handler of theirs is held up by the caller.
+func (c *Connection) notifyOutput(limit int64, fn func(error)) bool {
+	if c.udp != nil {
+		return false
+	}
+	c.mu.Lock()
+	c.foldCorkedLocked()
+	closing := c.closing || c.closed || c.engine.stopping.Load()
+	if !closing && c.pendingBytes.Load() <= limit {
+		c.mu.Unlock()
+		return false
+	}
+	d := c.deadlines
+	if d == nil {
+		d = &connectionDeadlines{}
+		c.deadlines = d
+	}
+	d.notices = append(d.notices, drainNotice{release: limit / 2, fn: fn})
+	c.engine.trackOutputWait(c, true)
+	if closing {
+		c.fireNoticesLocked(syscall.EPIPE)
+	}
+	c.mu.Unlock()
+	return true
 }
 
 // noteWritableLocked tells the writers waiting in waitOutput, if any, that the
@@ -1294,6 +1361,9 @@ func init() {
 	outputwait.Wait = func(c any, limit int64) error { return c.(*Connection).waitOutput(limit) }
 	outputwait.Pending = func(c any) int64 { return c.(*Connection).pendingBytes.Load() }
 	outputwait.Unsent = func(c any) int64 { return c.(*Connection).unsent() }
+	outputwait.Notify = func(c any, limit int64, fn func(error)) bool {
+		return c.(*Connection).notifyOutput(limit, fn)
+	}
 }
 
 // unsent is how many bytes Send accepted are still queued for the socket.
@@ -1380,7 +1450,9 @@ func (c *Connection) waitOutput(limit int64) error {
 	}
 	if w.waiters--; w.waiters == 0 {
 		d.drain = nil
-		c.engine.trackOutputWait(c, false)
+		if len(d.notices) == 0 {
+			c.engine.trackOutputWait(c, false)
+		}
 	}
 	c.mu.Unlock()
 	return err
@@ -1959,6 +2031,15 @@ type connectionDeadlines struct {
 	closeReason error
 	// drain is what writers waiting in waitOutput share, while any waits.
 	drain *outputWait
+	// notices are the callbacks waiting in notifyOutput.
+	notices []drainNotice
+}
+
+// drainNotice is a callback waiting for the connection's queued output to
+// drain to release; see notifyOutput.
+type drainNotice struct {
+	release int64
+	fn      func(error)
 }
 
 // The values of closeCode: none, the end of input, a deadline, a reason kept

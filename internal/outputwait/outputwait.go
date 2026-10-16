@@ -21,3 +21,10 @@ var Pending func(c any) int64
 // read, and counts those a read round has queued without counting them yet.
 // It is set and nil where Wait is.
 var Unsent func(c any) int64
+
+// Notify is Wait for a caller that may not wait: when more than limit bytes
+// of what c was sent are queued for its socket it arranges for fn to run, on
+// another goroutine, once no more than half of limit are, or with an error
+// once the connection has closed, and reports true; when no more than limit
+// are, it reports false and fn never runs. It is set and nil where Wait is.
+var Notify func(c any, limit int64, fn func(error)) bool

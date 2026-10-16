@@ -139,6 +139,9 @@ type BodyStream struct {
 	sink      sinkFunc
 	sinkBusy  bool
 	delivered bool
+	// sinkHeld pauses the handing on, while Context.HoldBody holds it: what
+	// arrives is buffered, and paces the peer, as it is for a reader.
+	sinkHeld bool
 	// sendContinue sends the 100 Continue the body waits for, on a protocol
 	// other than HTTP/1, which conn sends it on. credit is told of every
 	// byte of the body the handler has taken, by reading it or through
@@ -183,10 +186,32 @@ func (s *BodyStream) setSink(fn sinkFunc, reserve bool) bool {
 	return true
 }
 
+// holdSink pauses the handing on of the body to the sink, with hold set, and
+// resumes it, on the engine's handler pool, without.
+func (s *BodyStream) holdSink(hold bool) {
+	s.mu.Lock()
+	s.sinkHeld = hold
+	owed := !hold && s.sink != nil && !s.sinkBusy && s.owedLocked()
+	if owed {
+		s.sinkBusy = true
+	}
+	s.mu.Unlock()
+	if owed {
+		// Never here: the caller may be the sink itself, or hold a lock
+		// the sink takes.
+		runOnStreams(s.owner, func() { s.drain(false) })
+	}
+}
+
 // owedLocked reports whether the sink has something to be given: body not
 // yet handed on, or its last call.
 func (s *BodyStream) owedLocked() bool {
 	if s.delivered {
+		return false
+	}
+	if s.sinkHeld && !s.abandoned && s.err == nil {
+		// A hold pauses the body, not its failure, which ends the request
+		// whether or not the sink was ready for more.
 		return false
 	}
 	return s.read < len(s.buf) || s.ended || s.err != nil || s.abandoned
@@ -453,7 +478,7 @@ func (s *BodyStream) push(data []byte) {
 		s.credited(len(data))
 		return
 	}
-	if sink := s.sink; sink != nil && !s.sinkBusy && !s.offload && s.read == len(s.buf) {
+	if sink := s.sink; sink != nil && !s.sinkBusy && !s.sinkHeld && !s.offload && s.read == len(s.buf) {
 		// Nothing is waiting ahead of data, so it goes to the sink straight
 		// from the connection's buffer.
 		s.sinkBusy = true

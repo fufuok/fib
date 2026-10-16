@@ -44,6 +44,11 @@ func NewEngines(tlsConfig *tls.Config, addr, plainAddr string) ([]*fib.Engine, e
 func NewEnginesFor(handler fibhttp.Handler, tlsConfig *tls.Config, addr, plainAddr string) ([]*fib.Engine, error) {
 	httpConfig := fibhttp.DefaultConfig()
 	httpConfig.MaxBodyBytes = 256 << 20
+	// Bodies past streamThreshold reach the handler as they arrive, which
+	// /upload takes them through.
+	httpConfig.StreamRequestBody = true
+	httpConfig.StreamRequestBodyThreshold = streamThreshold
+	httpConfig.MaxStreamedBodyBytes = 256 << 20
 	tcpConfig := fib.DefaultConfig()
 	tcp, err := fib.New(tcpConfig, fib.Binding{Addr: addr, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandlerWithConfig(httpConfig, handler))})
 	if err != nil {
@@ -54,6 +59,9 @@ func NewEnginesFor(handler fibhttp.Handler, tlsConfig *tls.Config, addr, plainAd
 	h3Config := http3.DefaultConfig()
 	h3Config.TLSConfig = tlsConfig
 	h3Config.MaxBodyBytes = 256 << 20
+	h3Config.StreamRequestBody = true
+	h3Config.StreamRequestBodyThreshold = streamThreshold
+	h3Config.MaxStreamedBodyBytes = 256 << 20
 	udp, err := fib.New(udpConfig, fib.Binding{Addr: samePort(addr, tcp), Handler: http3.NewHandlerWithConfig(h3Config, handler)})
 	if err != nil {
 		_ = tcp.Close()
@@ -72,6 +80,10 @@ func NewEnginesFor(handler fibhttp.Handler, tlsConfig *tls.Config, addr, plainAd
 	}
 	return engines, nil
 }
+
+// streamThreshold is the request body size past which a handler runs before
+// the body has arrived. Every route but /upload takes bodies under it.
+const streamThreshold = 64 << 10
 
 // samePort is addr with the port tcp listens on, which is addr's own unless
 // that was 0: it is where a UDP engine that shares the TCP one's port binds.
@@ -114,9 +126,7 @@ func Handler(ws *websocket.ServerHandler) fibhttp.HandlerFunc {
 		case "/stream":
 			stream(c)
 		case "/upload":
-			sum := sha256.Sum256(c.Body())
-			_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8",
-				[]byte(fmt.Sprintf("%s received %d bytes sha256=%s\n", r.Proto, len(c.Body()), hex.EncodeToString(sum[:]))))
+			upload(c)
 		case "/status":
 			code, _ := strconv.Atoi(c.Query("code"))
 			if code < 200 || code > 599 {
@@ -127,6 +137,34 @@ func Handler(ws *websocket.ServerHandler) fibhttp.HandlerFunc {
 			_ = c.Respond(stdhttp.StatusNotFound, "text/plain; charset=utf-8", []byte("not found\n"))
 		}
 	}
+}
+
+// upload answers with the length and SHA-256 of the request body, which it
+// takes as it arrives when it is large, so that an upload of any size passes
+// through in constant memory.
+func upload(c *fibhttp.Context) {
+	digest := sha256.New()
+	var n int
+	answer := func() {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8",
+			[]byte(fmt.Sprintf("%s received %d bytes sha256=%s\n", c.Request.Proto, n, hex.EncodeToString(digest.Sum(nil)))))
+	}
+	if c.BodyComplete() {
+		n, _ = digest.Write(c.Body())
+		answer()
+		return
+	}
+	c.OnBody(func(data []byte, fin bool, err error) {
+		digest.Write(data)
+		n += len(data)
+		if err != nil {
+			_ = c.Respond(stdhttp.StatusBadRequest, "text/plain; charset=utf-8", []byte(err.Error()+"\n"))
+			return
+		}
+		if fin {
+			answer()
+		}
+	})
 }
 
 // echo answers with what the upstream saw, including the headers the gateway

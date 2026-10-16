@@ -192,6 +192,18 @@ same switch streams HTTP/2 bodies, paced by flow control rather than by
 holding the connection's reads (see [`http2.md`](http2.md)), and
 `http3.Config` has one of its own for HTTP/3.
 
+`Context.HoldBody(true)` pauses what `OnBody` delivers, without waiting:
+what arrives waits in the server's buffer and paces the client as an unread
+body does, and `HoldBody(false)` resumes it, on the handler pool. A callback
+that passes the body on to a slower consumer holds it while the consumer is
+behind. That is how a proxy forwards an upload as it arrives with nothing
+waiting for it: the handler sends the upstream request with a
+`fibhttp.BodyWriter` as its body, `Retain`s the request and returns, and its
+`OnBody` callback writes each piece to the writer, which the client sends as
+the upstream connection has room; past the writer's limit the callback holds
+the body, and `BodyWriter.OnDrain` resumes it (see the `BodyWriter` example,
+and `examples/gateway`).
+
 `Config.StreamRequestBodyThreshold` keeps the smaller bodies buffered whole
 while streaming is on: only a body whose `Content-Length` is larger than it,
 or a chunked body that has already sent more than it, streams. Zero streams

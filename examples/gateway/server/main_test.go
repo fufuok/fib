@@ -100,8 +100,12 @@ func (l *lab) upstreamExtras(next fibhttp.HandlerFunc) fibhttp.HandlerFunc {
 	return func(c *fibhttp.Context) {
 		switch c.Request.URL.Path {
 		case "/hang":
-			// Never answers, and says so when the request is abandoned.
+			// Never answers, and says so when the request is abandoned. Its
+			// body is read and dropped: an HTTP/1 connection whose server stops
+			// reading a body holds its reads, and would not see the gateway
+			// hang up.
 			c.Retain()
+			c.OnBody(func([]byte, bool, error) {})
 			c.OnCancel(func(error) {
 				l.canceled <- c.Request.Proto
 				c.Release()
@@ -120,6 +124,24 @@ func (l *lab) upstreamExtras(next fibhttp.HandlerFunc) fibhttp.HandlerFunc {
 			if c.Request.ProtoMajor == 1 {
 				c.Conn.Close()
 			}
+		case "/headonly":
+			// Promises a megabyte and hangs up before sending any of it.
+			c.Header().Set("Content-Length", "1048576")
+			c.WriteHeader(stdhttp.StatusOK)
+			c.Flush()
+			if c.Request.ProtoMajor == 1 {
+				c.Conn.Close()
+			}
+		case "/early":
+			// Answers as soon as the first of the body arrives, which only a
+			// body forwarded as it arrives can make happen.
+			answered := false
+			c.OnBody(func(data []byte, fin bool, err error) {
+				if !answered && (len(data) > 0 || fin || err != nil) {
+					answered = true
+					_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("early"))
+				}
+			})
 		default:
 			next(c)
 		}
@@ -322,8 +344,8 @@ func TestEveryProtocolToEveryUpstream(t *testing.T) {
 	}
 }
 
-// TestLargeUpload sends bodies the gateway takes with OnBody, which it then
-// forwards whole, on every protocol.
+// TestLargeUpload sends bodies the gateway forwards as they arrive, on every
+// protocol.
 func TestLargeUpload(t *testing.T) {
 	l := newLab(t, labOptions{})
 	body := pattern(6 << 20)

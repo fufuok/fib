@@ -88,6 +88,9 @@ type h2ClientStream struct {
 	// streaming says more of the request body is to come than pending
 	// holds: it streams, and has not ended.
 	streaming bool
+	// pushRoom is a pushed body waiting for the windows to let pending go,
+	// to be kicked once they have.
+	pushRoom *reqbody.Pusher
 	// trailer holds the request's trailer fields, as name and value pairs,
 	// which go out in a HEADERS frame once the body has.
 	trailer []string
@@ -180,6 +183,10 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 	hc.sendLocked(out)
 	hc.mu.Unlock()
 	if r.upload != nil {
+		if push := r.upload.Pusher(); push != nil {
+			attachPush(r, push, &h2Sink{hc: hc, st: st, push: push})
+			return
+		}
 		// See clientConn.send for why a goroutine of its own.
 		go hc.sendBody(st)
 	}
@@ -976,6 +983,12 @@ func (hc *h2ClientConn) flushLocked(out []byte) []byte {
 		}
 		if len(st.pending) > 0 {
 			out = hc.flushStreamLocked(out, st)
+		}
+	}
+	for _, st := range hc.streams {
+		if st.pushRoom != nil && len(st.pending) == 0 {
+			goKick(st.pushRoom)
+			st.pushRoom = nil
 		}
 	}
 	// A streamed body waiting for its piece to leave looks again.

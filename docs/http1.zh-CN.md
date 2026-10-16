@@ -148,6 +148,14 @@ context 一致。它不引用 `Context` 本身，所以即使 Reuse 选项把 `C
 也让 HTTP/2 的 body 流式交付，只是由流控而不是暂停读来限速（见
 [`http2.zh-CN.md`](http2.zh-CN.md)）；HTTP/3 在 `http3.Config` 里有同样的开关。
 
+`Context.HoldBody(true)` 暂停 `OnBody` 的交付，但不等待：到达的部分留在 server 的
+缓冲里，像没读的 body 一样给客户端限速；`HoldBody(false)` 在 handler 池上恢复交付。
+把 body 转交给较慢消费者的回调，在消费者跟不上时暂停它。代理就是这样边收边转发上传、
+而不让任何东西等待的：handler 用 `fibhttp.BodyWriter` 作为上游请求的 body 发出请求，
+`Retain` 请求后返回；`OnBody` 回调把每段写进 writer，client 在上游连接有空间时发送；
+超过 writer 的上限时回调暂停 body，由 `BodyWriter.OnDrain` 恢复（见 `BodyWriter` 的
+示例和 `examples/gateway`）。
+
 `Config.StreamRequestBodyThreshold` 在开启流式时让较小的 body 仍然整体缓存：只有
 `Content-Length` 超过它的 body，以及已经发来超过这么多字节的 chunked body 才流式交付。
 为 0 时所有 body 都流式交付；不开 `StreamRequestBody` 时它不起作用。

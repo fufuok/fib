@@ -29,11 +29,15 @@ func (g *Gateway) client(route *Route) doer {
 	return g.h1
 }
 
-// serveHTTP forwards one request. The request body is collected without
-// blocking: one that arrived with the request is used where it is, and a
-// large one is taken with OnBody as its pieces come off the connection. When
-// it is complete the upstream request goes out, and the handler is long
-// gone: the response is written from the upstream's callbacks.
+// serveHTTP forwards one request, without anything waiting for its body: one
+// that arrived with the request is used where it is, and one still arriving
+// is pushed upstream piece by piece from the OnBody callback, through a
+// BodyWriter, as it arrives. An upload of any size then passes through in
+// constant memory, paced by the slower of the two peers: when the upstream
+// falls behind, the callback holds the body with HoldBody, which holds the
+// client back by its own flow control, and the upstream's room resumes it.
+// The handler is long gone by the time the upstream answers: the response is
+// written from the upstream's callbacks.
 func (g *Gateway) serveHTTP(c *fibhttp.Context, route *Route) {
 	r := c.Request
 	if r.ContentLength > g.config.MaxRequestBody {
@@ -44,53 +48,72 @@ func (g *Gateway) serveHTTP(c *fibhttp.Context, route *Route) {
 	header := make(stdhttp.Header, len(r.Header)+4)
 	copyHeader(header, r.Header, "Content-Length", "Expect")
 	addForwarded(header, r)
-	send := func(body []byte) { g.forward(c, route, r.Method, target, header, body) }
 
 	if c.BodyComplete() {
 		// Nothing more to wait for: no body, or one small enough to have come
 		// with the request. Body is the server's own buffer, which the client
 		// reads before Do returns.
-		send(c.Body())
+		var body io.Reader
+		if b := c.Body(); len(b) > 0 {
+			body = bytes.NewReader(b)
+		}
+		g.forward(c, route, r.Method, target, header, body, int64(len(c.Body())))
 		return
 	}
-	var body []byte
-	var rejected bool
+	body := fibhttp.NewBodyWriter(0)
+	g.forward(c, route, r.Method, target, header, body, r.ContentLength)
 	c.OnBody(func(data []byte, fin bool, err error) {
-		if err != nil || rejected {
-			// The request failed, and the server has cancelled it.
+		switch {
+		case err != nil:
+			// The upload failed, or outgrew MaxRequestBody, which fails the
+			// upstream request too.
+			body.CloseWithError(err)
 			return
+		case len(data) > 0:
+			if _, werr := body.Write(data); werr != nil {
+				// The upstream request is over: answered, failed or
+				// abandoned. What is left of the body is not wanted.
+				return
+			}
 		}
-		if int64(len(body)+len(data)) > g.config.MaxRequestBody {
-			rejected = true
-			_ = c.Respond(stdhttp.StatusRequestEntityTooLarge, "text/plain; charset=utf-8", []byte("request body too large\n"))
-			return
-		}
-		body = append(body, data...)
 		if fin {
-			send(body)
+			_ = body.Close()
+			return
+		}
+		// Past the writer's limit, the rest waits for the upstream to take
+		// what it holds. The hold comes first, so that a drain that comes
+		// before OnDrain returns cannot be missed.
+		c.HoldBody(true)
+		if !body.OnDrain(func() { c.HoldBody(false) }) {
+			c.HoldBody(false)
 		}
 	})
 }
 
 // forward sends the upstream request and arranges for its response to be
-// written to c from the callbacks.
-func (g *Gateway) forward(c *fibhttp.Context, route *Route, method, target string, header stdhttp.Header, body []byte) {
+// written to c from the callbacks. length is the body's length, or -1 when
+// it is unknown.
+func (g *Gateway) forward(c *fibhttp.Context, route *Route, method, target string, header stdhttp.Header,
+	body io.Reader, length int64) {
 	ctx, cancel := context.WithCancel(context.Background())
-	var reader io.Reader
-	if len(body) > 0 {
-		reader = bytes.NewReader(body)
-	}
-	req, err := stdhttp.NewRequestWithContext(ctx, method, target, reader)
+	req, err := stdhttp.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
 		cancel()
+		if rc, ok := body.(io.Closer); ok {
+			_ = rc.Close()
+		}
 		_ = c.Respond(stdhttp.StatusBadRequest, "text/plain; charset=utf-8", []byte(err.Error()+"\n"))
 		return
 	}
 	req.Header = header
+	if length > 0 {
+		req.ContentLength = length
+	}
 	x := &exchange{g: g, c: c, cancel: cancel, start: time.Now(), method: method, path: c.Request.URL.Path,
 		proto: c.Request.Proto, http1: c.Request.ProtoMajor == 1}
 	// The handler may return, or the body callback that called forward finish,
-	// before the upstream answers. The Context is ours until x.release.
+	// before the upstream answers, and a streamed body is read after both. The
+	// Context is ours until x.release.
 	c.Retain()
 	// The downstream client going away cancels the upstream request, whose
 	// callbacks then wind the exchange up.
@@ -208,6 +231,10 @@ func (x *exchange) fail(err error) {
 		return
 	}
 	status := failure(err)
+	if errors.Is(err, fibhttp.ErrBodyTooLarge) {
+		// A streamed upload outgrew MaxRequestBody on its way upstream.
+		status = stdhttp.StatusRequestEntityTooLarge
+	}
 	x.g.logf("%s %s %s -> %d: %v", x.proto, x.method, x.path, status, err)
 	_ = x.c.Respond(status, "text/plain; charset=utf-8", []byte(stdhttp.StatusText(status)+": "+err.Error()+"\n"))
 	x.release()

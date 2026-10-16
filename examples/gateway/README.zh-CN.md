@@ -100,8 +100,11 @@ curl -i 'http://127.0.0.1:8081/h1/status?code=418'
 
 ## 网关做了什么
 
-- **请求 body**：请求头到达之后才到的大 body 用 `Context.OnBody` 收；小 body 随请求一起到。body 收齐后用
-  `Client.Do` 发上游请求，此时 handler 早已返回（它 `Retain` 了请求）。
+- **请求 body**：流式转发，没有任何东西为它等待。还在到达的 body 在 `Context.OnBody` 回调里一段一段推给
+  `fibhttp.BodyWriter`，上游 client 在连接有空间时发送（HTTP/1.1 看 socket 排空，HTTP/2 看 `WINDOW_UPDATE`，
+  HTTP/3 看流的流控）。上游跟不上时，回调用 `Context.HoldBody` 暂停 body，借客户端自己的流控让它慢下来，
+  再由 `BodyWriter.OnDrain` 恢复。任意大小的上传都以恒定内存通过，也不占用单独的 goroutine。小 body 随请求
+  一起到。handler 立即返回（它 `Retain` 了请求），超过 `-max-request-body` 的 body 回 `413`。
 - **响应**：在上游 client 的回调里用 `ClientResponse.OnBody` 一段一段写回下游，所以任意大小的下载都以恒定内存
   通过，两边中较慢的一方给另一方施加背压（TCP、HTTP/2、QUIC 各自的流控）。trailer 会转发。
 - **请求头**：丢弃逐跳头；加上 `X-Forwarded-For/Proto/Host` 和 `Via`；HTTP/1.1 与 HTTP/2 的响应带 `Alt-Svc`，
@@ -112,7 +115,6 @@ curl -i 'http://127.0.0.1:8081/h1/status?code=418'
 
 ## 限制
 
-- **请求 body 先收齐再转发**，上限 `-max-request-body`，因为客户端请求是整体发送的（`Client.Do` 不支持流式请求体）。
 - **WebSocket 先升级客户端、再拨号上游**，因为 `Context.Upgrade` 必须在 handler 返回前调用。所以上游不可达时，
   是用关闭码 1014（Bad Gateway）关闭客户端连接，而不是回 HTTP 502；客户端在此期间发的消息会排队。
 - HTTP/2 与 HTTP/3 下，`Context.Write` 在流控窗口里积压约 64 KB 后会等待客户端，进而通过上游自己的流控给上游施加背压。

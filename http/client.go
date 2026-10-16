@@ -321,6 +321,11 @@ func marshalRequest(req *stdhttp.Request, body []byte) ([]byte, error) {
 // closeRequestBody closes the body of a request that goes no further than
 // Do, as a transport closes it whatever becomes of the request.
 func closeRequestBody(req *stdhttp.Request) {
+	if push := pushOf(req); push != nil {
+		// Its producer learns from its next Write that nothing is sent.
+		push.Stop()
+		return
+	}
 	if req.Body != nil && req.Body != stdhttp.NoBody {
 		_ = req.Body.Close()
 	}
@@ -1032,6 +1037,12 @@ func (cc *clientConn) send(r *clientRequest) {
 	}
 	// A failed send closes the connection, and OnClose then settles r.
 	if cc.conn.Send(r.data) == nil && r.upload != nil {
+		if push := r.upload.Pusher(); push != nil {
+			// A pushed body is sent as it is written and as the connection
+			// drains, with nothing waiting for either.
+			attachPush(r, push, &h1Sink{cc: cc, r: r, push: push})
+			return
+		}
 		// The body is read by a goroutine of its own, since a Read may wait
 		// as long as the body's producer likes, and so may the sending, for
 		// the server; neither may hold up a worker or a pool.

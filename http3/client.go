@@ -240,7 +240,9 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 		callback = func(*fibhttp.ClientResponse, error) {}
 	}
 	if req.URL == nil || req.URL.Scheme != "https" {
-		if req.Body != nil && req.Body != stdhttp.NoBody {
+		if push, ok := req.Body.(*reqbody.Pusher); ok {
+			push.Stop()
+		} else if req.Body != nil && req.Body != stdhttp.NoBody {
 			// The request goes no further, and a transport closes its body
 			// whatever becomes of it.
 			_ = req.Body.Close()
@@ -1076,6 +1078,15 @@ func (st *clientStream) send() {
 			return
 		}
 		st.uploading.Store(true)
+		if push := r.upload.Pusher(); push != nil {
+			// A pushed body is sent as it is written and as the stream's
+			// flow control lets it, with nothing waiting for either.
+			if err := push.Attach(&pushSink{st: st, push: push}, r.declared); err != nil {
+				st.uploading.Store(false)
+				r.abort(err)
+			}
+			return
+		}
 		// The body is read by a goroutine of its own, since a Read may wait
 		// as long as the body's producer likes, and so may the sending, for
 		// the server; neither may hold up a worker, a pool, or the goroutine

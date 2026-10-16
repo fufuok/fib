@@ -33,6 +33,10 @@ type Stream struct {
 	resetCode    uint64
 	// finalSize is the sending side's final size once it is known.
 	finalSize uint64
+	// roomFn is the callback waiting in NotifySendable, for the stream to
+	// have no more than roomLimit unsent. Guarded by the connection's mu.
+	roomFn    func(error)
+	roomLimit int
 
 	// Receiving side. recvMax is the limit given to the peer, recvHigh the
 	// highest offset it has reached, and recvFin its final size if known.
@@ -177,6 +181,27 @@ func (s *Stream) WaitSendable(limit int) error {
 		c.sendRoom.Wait()
 		c.roomWaiters--
 	}
+}
+
+// NotifySendable is WaitSendable for a caller that may not wait: when the
+// stream has more than limit bytes written and not yet sent it arranges for
+// fn to run, on another goroutine, once it has no more than limit, or with
+// ErrClosed once its sending side or the connection ends, and reports true;
+// otherwise it reports false and fn never runs. A stream has room for one
+// such callback at a time; a second replaces the first, which never runs.
+func (s *Stream) NotifySendable(limit int, fn func(error)) bool {
+	c := s.conn
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed && s.hasSend && !s.reset && s.send.end()-s.send.next <= uint64(limit) {
+		return false
+	}
+	if s.roomFn == nil {
+		c.roomStreams = append(c.roomStreams, s)
+	}
+	s.roomFn, s.roomLimit = fn, limit
+	c.wakeWritersLocked()
+	return true
 }
 
 // Unsent reports how many bytes written to the stream are still to be sent,

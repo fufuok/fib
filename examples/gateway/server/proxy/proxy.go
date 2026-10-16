@@ -4,11 +4,13 @@
 // takes HTTP/1.1, HTTP/2, HTTP/3 and WebSocket requests and forwards them to
 // upstream servers, without blocking an engine worker anywhere on the way.
 //
-// Everything is a callback:
+// Nothing waits on a worker:
 //
-//   - A request body that arrives after its header is taken with
-//     Context.OnBody, piece by piece, instead of being read by a handler that
-//     waits for it.
+//   - A request body that arrives after its header is pushed upstream from
+//     Context.OnBody, piece by piece, through a BodyWriter that the client
+//     sends as the upstream has room; when it has none, the callback holds
+//     the body with Context.HoldBody, which holds the client back, until the
+//     writer's OnDrain resumes it.
 //   - The upstream request goes out through the asynchronous clients of
 //     package http and package http3. The handler retains its Context and
 //     returns; the client's callback answers.
@@ -135,9 +137,9 @@ type Config struct {
 	// body has ended; zero means no limit beyond the downstream request's own
 	// cancellation. It is also what turns a hung upstream into a 504.
 	Timeout time.Duration
-	// MaxRequestBody bounds a request body. The gateway collects it before it
-	// sends the request, since a client request is sent whole, so this is also
-	// the memory one upload can take. Zero means 64 MiB.
+	// MaxRequestBody bounds a request body, which is answered with 413 past
+	// it, even when that is found out only on its way upstream. Bodies stream,
+	// so it does not bound the memory an upload takes. Zero means 64 MiB.
 	MaxRequestBody int64
 	// Subprotocols are the WebSocket subprotocols the gateway accepts from
 	// clients and asks the upstream for; the handshake picks the first one a
@@ -215,7 +217,7 @@ func (g *Gateway) Close() {
 
 // HTTPConfig is the server configuration the gateway wants for its HTTP/1.1
 // and HTTP/2 listeners: bodies over a threshold reach the handler while they
-// are still arriving, so the gateway takes them with OnBody.
+// are still arriving, so the gateway forwards them as they arrive.
 func (g *Gateway) HTTPConfig() fibhttp.Config {
 	config := fibhttp.DefaultConfig()
 	config.StreamRequestBody = true

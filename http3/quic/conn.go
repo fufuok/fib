@@ -24,6 +24,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/lesismal/fib/sidepool"
 )
 
 // Packet number spaces.
@@ -394,6 +396,9 @@ type Conn struct {
 	// drain wait on, and roomWaiters counts them; see Stream.WaitSendable.
 	sendRoom    sync.Cond
 	roomWaiters int
+	// roomStreams are the streams with a callback waiting in
+	// NotifySendable.
+	roomStreams []*Stream
 	// buffered are packets that arrived before their keys.
 	buffered [][]byte
 
@@ -1061,6 +1066,31 @@ func (c *Conn) wakeWritersLocked() {
 	if c.roomWaiters > 0 {
 		c.sendRoom.Broadcast()
 	}
+	if len(c.roomStreams) == 0 {
+		return
+	}
+	kept := c.roomStreams[:0]
+	for _, s := range c.roomStreams {
+		var err error
+		switch {
+		case c.closed, !s.hasSend || s.reset:
+			err = ErrClosed
+		case s.send.end()-s.send.next > uint64(s.roomLimit):
+			kept = append(kept, s)
+			continue
+		}
+		fn := s.roomFn
+		s.roomFn = nil
+		// The callback writes to the stream, which takes the lock held
+		// here, so it runs elsewhere; a pool too busy to take it at once
+		// hands it a goroutine of its own, since nothing here may wait.
+		run := func() { fn(err) }
+		if !sidepool.Client().TryGo(run) {
+			go run()
+		}
+	}
+	clear(c.roomStreams[len(kept):])
+	c.roomStreams = kept
 }
 
 func (c *Conn) handleDatagramLocked(d []byte, now time.Time) {

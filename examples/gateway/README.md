@@ -104,9 +104,13 @@ with code 4002 when sent the text `close`).
 
 ## What the gateway does
 
-- **Request bodies** that arrive after the header are taken with `Context.OnBody`; small ones arrive with the
-  request. The upstream request goes out with `Client.Do` once the body is complete, and the handler has
-  returned by then (it `Retain`ed the request).
+- **Request bodies** stream, with nothing waiting for them: one still arriving is pushed upstream from
+  `Context.OnBody`, piece by piece, through a `fibhttp.BodyWriter` that the upstream client sends as its
+  connection has room (socket drain on HTTP/1.1, `WINDOW_UPDATE` on HTTP/2, stream flow control on HTTP/3). When
+  the upstream falls behind, the callback holds the body with `Context.HoldBody`, which holds the client back by
+  its own flow control, and `BodyWriter.OnDrain` resumes it. An upload of any size passes through in constant
+  memory without a goroutine of its own. Small bodies arrive with the request. The handler returns at once (it
+  `Retain`s the request), and a body past `-max-request-body` is a `413`.
 - **Responses** are written from the upstream client's callback, piece by piece with `ClientResponse.OnBody`, so a
   download of any size passes through in constant memory and the slower peer paces the other (TCP, HTTP/2 and
   QUIC flow control). Trailers are forwarded.
@@ -119,8 +123,6 @@ with code 4002 when sent the text `close`).
 
 ## Limits
 
-- **Request bodies are collected before they are forwarded**, up to `-max-request-body`, because a client request is
-  sent whole (`Client.Do` does not stream a request body).
 - **WebSocket upgrades the client first and dials the upstream after**, because `Context.Upgrade` has to be called
   before the handler returns. An upstream that cannot be reached therefore closes the client's connection with code
   1014 (Bad Gateway) rather than answering HTTP 502. What the client sends meanwhile is queued.
