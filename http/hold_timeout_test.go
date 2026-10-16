@@ -279,3 +279,19 @@ func TestReadBodyTimeoutH2BeforeHandler(t *testing.T) {
 		})
 	}
 }
+
+// DefaultConfig bounds every read a client could stall, and a Config built
+// without it bounds none.
+func TestDefaultConfigReadTimeouts(t *testing.T) {
+	config := DefaultConfig()
+	if config.ReadHeaderTimeout != DefaultReadHeaderTimeout || config.ReadBodyTimeout != DefaultReadBodyTimeout ||
+		config.IdleTimeout != DefaultIdleTimeout || config.ReadTimeout != 0 {
+		t.Fatalf("DefaultConfig timeouts: %+v", config)
+	}
+	if h := NewHandlerWithConfig(config, nil); !h.timed {
+		t.Fatal("a server from DefaultConfig is not timed")
+	}
+	if h := NewHandlerWithConfig(Config{}, nil); h.timed {
+		t.Fatal("a zero Config is timed")
+	}
+}

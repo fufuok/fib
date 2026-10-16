@@ -117,7 +117,11 @@ context 一致。它不引用 `Context` 本身，所以即使 Reuse 选项把 `C
 
 `Config.ReadHeaderTimeout`、`Config.ReadTimeout`、`Config.IdleTimeout` 就是
 `net/http.Server` 的那三个，回退规则也一样：`ReadHeaderTimeout` 为 0 时用
-`ReadTimeout`，`IdleTimeout` 同理，全为 0 表示不限（默认）。超时的连接会被关闭，
+`ReadTimeout`，`IdleTimeout` 同理，全为 0 表示不限。和 `net/http` 不同，`DefaultConfig`
+会设置它们：`ReadHeaderTimeout` 10 秒（`DefaultReadHeaderTimeout`）、`ReadBodyTimeout`
+5 分钟（`DefaultReadBodyTimeout`）、`IdleTimeout` 2 分钟（`DefaultIdleTimeout`）；
+`ReadTimeout` 保持 0，因为 header 和 body 的超时已经把整个请求约束住了。上传更久的 server
+调大 `ReadBodyTimeout`；不经 `DefaultConfig` 构造的 `Config` 没有这些超时。超时的连接会被关闭，
 `OnClose` 收到 `os.ErrDeadlineExceeded`。
 
 用哪一个取决于连接在等什么：

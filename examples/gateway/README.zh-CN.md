@@ -78,9 +78,9 @@ WebSocket 请求：`http://` 目标走 `ws://`，其余走 `wss://`（`h3://` �
 | `-timeout` | `5m` | 单个上游请求（含 body）的最长时间；`0` 不限 |
 | `-max-request-body` | `64MiB` | 转发的最大请求 body |
 | `-subprotocols` | `chat,superchat` | 接受客户端、并向上游请求的 WebSocket 子协议 |
-| `-read-header-timeout` | `10s` | 请求 header 最长到达时间；`0` 不限 |
-| `-read-body-timeout` | `0` | 请求 body 最长到达时间（HTTP/2、HTTP/3 上回 408）；`0` 不限 |
-| `-idle-timeout` | `2m` | keep-alive 连接最长空闲时间；`0` 不限 |
+| `-read-header-timeout` | `10s` | 请求 header 最长到达时间；负数不限 |
+| `-read-body-timeout` | `5m` | 请求 body 最长到达时间（HTTP/2、HTTP/3 上回 408）；负数不限 |
+| `-idle-timeout` | `2m` | keep-alive 连接最长空闲时间；负数不限 |
 | `-max-body-hold` | `30s` | 上传等待不再接收的上游的最长时间，超过回 `504` |
 | `-cert`、`-key`、`-cert-out` | 自签 | 网关自己的证书 |
 | `-ca`、`-insecure` | upstream 示例的证书 | 如何验证上游 |

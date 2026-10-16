@@ -309,6 +309,8 @@ func TestCoverServerHeaderTooLarge(t *testing.T) {
 // set.
 func TestCoverServerHeaderTimeoutFallsBackToReadTimeout(t *testing.T) {
 	config := DefaultConfig()
+	// DefaultConfig sets one; this is the server without it.
+	config.ReadHeaderTimeout = 0
 	config.ReadTimeout = 100 * time.Millisecond
 	h := NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {}))
 	if h.headerTimeout() != config.ReadTimeout {

@@ -81,9 +81,9 @@ Without `-route` the gateway uses the demo upstream:
 | `-timeout` | `5m` | longest an upstream request may take, body included; `0` for no limit |
 | `-max-request-body` | `64MiB` | largest request body forwarded |
 | `-subprotocols` | `chat,superchat` | WebSocket subprotocols accepted from clients and asked of the upstream |
-| `-read-header-timeout` | `10s` | longest a request header may take to arrive; `0` for no limit |
-| `-read-body-timeout` | `0` | longest a request body may take to arrive (408 on HTTP/2 and HTTP/3); `0` for no limit |
-| `-idle-timeout` | `2m` | longest a kept-alive connection may sit idle; `0` for no limit |
+| `-read-header-timeout` | `10s` | longest a request header may take to arrive; negative for no limit |
+| `-read-body-timeout` | `5m` | longest a request body may take to arrive (408 on HTTP/2 and HTTP/3); negative for no limit |
+| `-idle-timeout` | `2m` | longest a kept-alive connection may sit idle; negative for no limit |
 | `-max-body-hold` | `30s` | longest an upload may wait for an upstream that stopped taking it, after which it is a `504` |
 | `-cert`, `-key`, `-cert-out` | self-signed | the gateway's certificate |
 | `-ca`, `-insecure` | the upstream example's certificate | how the upstreams are verified |

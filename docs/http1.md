@@ -154,8 +154,13 @@ connection.
 
 `Config.ReadHeaderTimeout`, `Config.ReadTimeout` and `Config.IdleTimeout` are
 `net/http.Server`'s, resolved the same way: `ReadHeaderTimeout` falls back to
-`ReadTimeout`, so does `IdleTimeout`, and zero everywhere means no limit,
-which is the default. A connection that outstays one is closed, and its
+`ReadTimeout`, so does `IdleTimeout`, and zero everywhere means no limit.
+Unlike `net/http`, `DefaultConfig` sets them: `ReadHeaderTimeout` 10s
+(`DefaultReadHeaderTimeout`), `ReadBodyTimeout` 5 minutes
+(`DefaultReadBodyTimeout`) and `IdleTimeout` 2 minutes (`DefaultIdleTimeout`),
+leaving `ReadTimeout` at zero since the header's and the body's bound the
+request between them; a server that takes longer uploads raises
+`ReadBodyTimeout`, and a `Config` built without `DefaultConfig` has none. A connection that outstays one is closed, and its
 `OnClose` is given `os.ErrDeadlineExceeded`.
 
 Which one applies is decided by what the connection is waiting for:

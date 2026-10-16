@@ -67,6 +67,17 @@ const maxRetainedBuffer = 64 << 10
 
 var crlf = []byte("\r\n")
 
+// The read timeouts DefaultConfig sets, so that a server built from it
+// closes the connections of clients that send too slowly, go quiet, or go
+// away while their body waits unread, rather than keeping them for good.
+// Raise DefaultReadBodyTimeout's for a server that takes uploads longer than
+// that to send, or lift it for the request with Context.SetReadDeadline.
+const (
+	DefaultReadHeaderTimeout = 10 * time.Second
+	DefaultReadBodyTimeout   = 5 * time.Minute
+	DefaultIdleTimeout       = 2 * time.Minute
+)
+
 // DefaultStreamRequestBodyBuffer is Config.StreamRequestBodyBuffer's default.
 const DefaultStreamRequestBodyBuffer = 256 << 10
 
@@ -108,7 +119,8 @@ type Config struct {
 	// ReadHeaderTimeout bounds how long a request's header may take to
 	// arrive, measured from the first byte of the request. Zero means
 	// ReadTimeout, as net/http.Server resolves it; both zero means no limit.
-	// A request that outstays it has its connection closed.
+	// A request that outstays it has its connection closed. DefaultConfig
+	// sets DefaultReadHeaderTimeout.
 	ReadHeaderTimeout time.Duration
 	// ReadTimeout bounds how long a whole request, header and body, may take
 	// to arrive, measured from its first byte. It bounds a streamed body for
@@ -134,7 +146,7 @@ type Config struct {
 	// arriving, a handler can lift it with Context.SetReadDeadline, and on
 	// HTTP/2 it applies to each request's body on its own, as ReadTimeout
 	// does there; the two then both run from the HEADERS. Zero means no
-	// limit.
+	// limit; DefaultConfig sets DefaultReadBodyTimeout.
 	ReadBodyTimeout time.Duration
 	// MaxBodyHold bounds how long Context.HoldBody may hold a streamed body
 	// at a time: a body held longer fails with ErrBodyHeldTooLong, which its
@@ -145,6 +157,7 @@ type Config struct {
 	MaxBodyHold time.Duration
 	// IdleTimeout bounds how long a kept-alive connection may sit between
 	// requests. Zero means ReadTimeout; both zero means no limit.
+	// DefaultConfig sets DefaultIdleTimeout.
 	IdleTimeout time.Duration
 	// WriteTimeout bounds how long a response may take to be written,
 	// measured from when its handler is called, as net/http.Server's does. A
@@ -235,8 +248,17 @@ func (c *Config) reuse() reuseOptions {
 	return reuseOptions{requests: c.ReuseRequests, headers: c.ReuseHeaders, urls: c.ReuseURLs}
 }
 
+// DefaultConfig is a Config with every read timeout set (ReadTimeout is left
+// at zero, the header's and the body's bounding the request between them):
+// DefaultReadHeaderTimeout, DefaultReadBodyTimeout and DefaultIdleTimeout.
+// Unlike net/http.Server's zero values, which leave a connection open as long
+// as its client likes, they close the connection of a client that stalls or
+// has gone, including one whose unread body has stopped the connection's
+// reads (see ReadTimeout). A Config built without DefaultConfig has none.
 func DefaultConfig() Config {
 	return Config{MaxHeaderBytes: 1 << 20, MaxBodyBytes: 16 << 20,
+		ReadHeaderTimeout: DefaultReadHeaderTimeout, ReadBodyTimeout: DefaultReadBodyTimeout,
+		IdleTimeout:   DefaultIdleTimeout,
 		ReuseRequests: true, ReuseHeaders: true, ReuseURLs: true, ReuseContexts: true}
 }
 

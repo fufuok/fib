@@ -108,7 +108,8 @@ type Config struct {
 	// handler can lift it, or set another, with Context.SetReadDeadline; one
 	// still being collected before its handler runs has its stream reset
 	// with H3_REQUEST_CANCELLED. The rest of the connection goes on serving.
-	// Zero means no limit.
+	// Zero means no limit; DefaultConfig sets http.DefaultReadBodyTimeout
+	// for ReadBodyTimeout.
 	ReadTimeout     time.Duration
 	ReadBodyTimeout time.Duration
 	// MaxBodyHold bounds how long Context.HoldBody may hold a streamed body
@@ -159,6 +160,9 @@ func DefaultConfig() Config {
 		MaxBodyBytes:         16 << 20,
 		MaxConcurrentStreams: 100,
 		MaxIdleTimeout:       30 * time.Second,
+		// A connection goes once it has been quiet for MaxIdleTimeout, so
+		// the body is the one read a client can stall for good.
+		ReadBodyTimeout: fibhttp.DefaultReadBodyTimeout,
 	}
 }
 

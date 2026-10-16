@@ -144,11 +144,10 @@ type Config struct {
 	// ReadHeaderTimeout, ReadTimeout, ReadBodyTimeout and IdleTimeout bound
 	// how long a client's request header, whole request and body may take
 	// to arrive, and how long its kept-alive connection may sit idle, as
-	// http.Config's do; zero means no limit. MaxBodyHold bounds how long an
-	// upload may wait for an upstream that stopped taking it, after which it
-	// is answered with 504; zero means http.DefaultMaxBodyHold. Without
-	// them, a client that goes away while its upload is held is noticed only
-	// once the hold ends.
+	// http.Config's do. MaxBodyHold bounds how long an upload may wait for
+	// an upstream that stopped taking it, after which it is answered with
+	// 504. Zero keeps the value http.DefaultConfig and http3.DefaultConfig
+	// have, and below zero means no limit.
 	ReadHeaderTimeout time.Duration
 	ReadTimeout       time.Duration
 	ReadBodyTimeout   time.Duration
@@ -236,11 +235,11 @@ func (g *Gateway) HTTPConfig() fibhttp.Config {
 	config.StreamRequestBody = true
 	config.StreamRequestBodyThreshold = streamThreshold
 	config.MaxStreamedBodyBytes = g.config.MaxRequestBody
-	config.ReadHeaderTimeout = g.config.ReadHeaderTimeout
-	config.ReadTimeout = g.config.ReadTimeout
-	config.ReadBodyTimeout = g.config.ReadBodyTimeout
-	config.IdleTimeout = g.config.IdleTimeout
-	config.MaxBodyHold = g.config.MaxBodyHold
+	override(&config.ReadHeaderTimeout, g.config.ReadHeaderTimeout)
+	override(&config.ReadTimeout, g.config.ReadTimeout)
+	override(&config.ReadBodyTimeout, g.config.ReadBodyTimeout)
+	override(&config.IdleTimeout, g.config.IdleTimeout)
+	override(&config.MaxBodyHold, g.config.MaxBodyHold)
 	return config
 }
 
@@ -251,10 +250,18 @@ func (g *Gateway) HTTP3Config(tlsConfig *tls.Config) http3.Config {
 	config.StreamRequestBody = true
 	config.StreamRequestBodyThreshold = streamThreshold
 	config.MaxStreamedBodyBytes = g.config.MaxRequestBody
-	config.ReadTimeout = g.config.ReadTimeout
-	config.ReadBodyTimeout = g.config.ReadBodyTimeout
-	config.MaxBodyHold = g.config.MaxBodyHold
+	override(&config.ReadTimeout, g.config.ReadTimeout)
+	override(&config.ReadBodyTimeout, g.config.ReadBodyTimeout)
+	override(&config.MaxBodyHold, g.config.MaxBodyHold)
 	return config
+}
+
+// override sets a server's timeout to d, unless d is zero, which keeps the
+// server's default. A d below zero is no limit to the server too.
+func override(timeout *time.Duration, d time.Duration) {
+	if d != 0 {
+		*timeout = d
+	}
 }
 
 // streamThreshold is the request body size from which the handler is run
