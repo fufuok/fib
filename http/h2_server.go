@@ -868,6 +868,14 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		sc.streamRequest(st, nil)
 		return nil
 	}
+	// The body is collected, whole or up to the streaming threshold, before
+	// the handler runs: the read timeouts bound that too, from here, and go
+	// on bounding a body that then streams.
+	if at := streamBodyDeadline(&sc.handler.config, time.Now()); !at.IsZero() {
+		sc.mu.Lock()
+		sc.armReadTimerLocked(st, at)
+		sc.mu.Unlock()
+	}
 	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
 		// The body is read, whole or up to the streaming threshold, before
 		// the handler runs, so there is no reason to keep the client waiting
@@ -1047,6 +1055,8 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 	// then, unless it is a tunnel's, whose DATA and trailers never get here.
 	sc.mu.Lock()
 	st.remoteDone = true
+	// The body has all arrived in time.
+	sc.stopReadTimerLocked(st)
 	sc.mu.Unlock()
 	if st.req == nil {
 		// Rejected with its header: the answer has been sent.
@@ -1095,8 +1105,18 @@ func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered []byte) {
 		Declared: st.declared,
 		Limit:    config.MaxStreamedBodyBytes,
 		Continue: sendContinue,
+		MaxHold:  config.MaxBodyHold,
 		Credit:   func(n int) { sc.creditBody(st, n) },
 	})
+	// ReadTimeout and ReadBodyTimeout bound the body as a deadline the
+	// handler could have set, which it can lift or move the same way: the
+	// one armed with the header, while the body was collected, or one from
+	// now for a body that streams from the start.
+	if _, armed := sc.readTimers[st]; !armed {
+		if at := streamBodyDeadline(config, time.Now()); !at.IsZero() {
+			sc.armReadTimerLocked(st, at)
+		}
+	}
 	sc.mu.Unlock()
 	_ = st.feed.Write(buffered)
 	bufferpool.Put(buffered)
@@ -1284,27 +1304,51 @@ func (st *h2ServerStream) setReadDeadline(t time.Time) error {
 		st.refs.Add(1)
 	}
 	if !t.IsZero() {
-		if sc.readTimers == nil {
-			sc.readTimers = make(map[*h2ServerStream]*time.Timer)
-		}
-		sc.readTimers[st] = time.AfterFunc(time.Until(t), st.readTimedOut)
+		sc.startReadTimerLocked(st, t)
 	}
 	return nil
 }
 
-// readTimedOut fails a body that outlasted the deadline its handler set;
-// see setReadDeadline. A timer stopped once it had fired finds itself gone
-// from readTimers, and leaves the body alone.
+// armReadTimerLocked gives st a read timer for t, which takes a reference
+// of its own. Callers hold sc.mu, and st has no read timer yet.
+func (sc *h2ServerConn) armReadTimerLocked(st *h2ServerStream, t time.Time) {
+	st.refs.Add(1)
+	sc.startReadTimerLocked(st, t)
+}
+
+// startReadTimerLocked starts st's read timer for t, whose reference the
+// caller has taken. Callers hold sc.mu.
+func (sc *h2ServerConn) startReadTimerLocked(st *h2ServerStream, t time.Time) {
+	if sc.readTimers == nil {
+		sc.readTimers = make(map[*h2ServerStream]*time.Timer)
+	}
+	sc.readTimers[st] = time.AfterFunc(time.Until(t), st.readTimedOut)
+}
+
+// readTimedOut fails a body that outlasted its deadline, the one its handler
+// set or the one the read timeouts put on it (see setReadDeadline): one
+// streaming to its handler fails, which the handler hears, and one still
+// being collected before its handler has run has its stream reset, since
+// there is nobody to tell. A timer stopped once it had fired finds itself
+// gone from readTimers, and leaves the body alone.
 func (st *h2ServerStream) readTimedOut() {
 	sc := st.sc
+	reset := false
 	sc.mu.Lock()
 	if _, ok := sc.readTimers[st]; ok {
 		delete(sc.readTimers, st)
 		if !sc.closed && !st.reset && !st.remoteDone {
-			st.feed.Fail(os.ErrDeadlineExceeded)
+			if st.feed != nil {
+				st.feed.Fail(os.ErrDeadlineExceeded)
+			} else {
+				reset = true
+			}
 		}
 	}
 	sc.mu.Unlock()
+	if reset {
+		sc.resetStream(st.id, H2Cancel)
+	}
 	st.unref()
 }
 

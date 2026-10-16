@@ -65,9 +65,10 @@ func (g *Gateway) serveHTTP(c *fibhttp.Context, route *Route) {
 	c.OnBody(func(data []byte, fin bool, err error) {
 		switch {
 		case err != nil:
-			// The upload failed, or outgrew MaxRequestBody, which fails the
-			// upstream request too.
-			body.CloseWithError(err)
+			// The upload failed, outgrew MaxRequestBody, outlasted its read
+			// timeout, or was held past MaxBodyHold for an upstream that
+			// stopped taking it, which fails the upstream request too.
+			body.CloseWithError(&uploadError{err})
 			return
 		case len(data) > 0:
 			if _, werr := body.Write(data); werr != nil {
@@ -223,6 +224,13 @@ func (x *exchange) onBody(data []byte, fin bool, err error) {
 	x.release()
 }
 
+// uploadError is the failure of a request body on its way upstream, which
+// failure tells apart from the upstream's own.
+type uploadError struct{ err error }
+
+func (e *uploadError) Error() string { return "request body: " + e.err.Error() }
+func (e *uploadError) Unwrap() error { return e.err }
+
 // fail answers a request whose upstream never produced a response.
 func (x *exchange) fail(err error) {
 	if errors.Is(err, context.Canceled) {
@@ -231,10 +239,6 @@ func (x *exchange) fail(err error) {
 		return
 	}
 	status := failure(err)
-	if errors.Is(err, fibhttp.ErrBodyTooLarge) {
-		// A streamed upload outgrew MaxRequestBody on its way upstream.
-		status = stdhttp.StatusRequestEntityTooLarge
-	}
 	x.g.logf("%s %s %s -> %d: %v", x.proto, x.method, x.path, status, err)
 	_ = x.c.Respond(status, "text/plain; charset=utf-8", []byte(stdhttp.StatusText(status)+": "+err.Error()+"\n"))
 	x.release()

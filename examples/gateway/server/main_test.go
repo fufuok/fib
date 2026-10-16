@@ -132,6 +132,10 @@ func (l *lab) upstreamExtras(next fibhttp.HandlerFunc) fibhttp.HandlerFunc {
 			if c.Request.ProtoMajor == 1 {
 				c.Conn.Close()
 			}
+		case "/stall":
+			// Takes the first of the body and then no more, ever, nor
+			// answers: an upstream that has stopped.
+			c.OnBody(func(data []byte, fin bool, err error) { c.HoldBody(true) })
 		case "/early":
 			// Answers as soon as the first of the body arrives, which only a
 			// body forwarded as it arrives can make happen.
@@ -149,8 +153,10 @@ func (l *lab) upstreamExtras(next fibhttp.HandlerFunc) fibhttp.HandlerFunc {
 }
 
 type labOptions struct {
-	timeout        time.Duration
-	maxRequestBody int64
+	timeout         time.Duration
+	maxRequestBody  int64
+	maxBodyHold     time.Duration
+	readBodyTimeout time.Duration
 }
 
 func newLab(t *testing.T, options labOptions) *lab {
@@ -186,12 +192,14 @@ func newLab(t *testing.T, options labOptions) *lab {
 	}
 	gwPort, gwPlain := freePort(t), freePort(t)
 	gateway, err := proxy.New(proxy.Config{
-		Routes:         routes,
-		TLSConfig:      clientTLS,
-		Timeout:        options.timeout,
-		MaxRequestBody: options.maxRequestBody,
-		Subprotocols:   []string{"chat", "superchat"},
-		AltSvc:         http3.AltSvc(gwPort),
+		Routes:          routes,
+		TLSConfig:       clientTLS,
+		Timeout:         options.timeout,
+		MaxRequestBody:  options.maxRequestBody,
+		MaxBodyHold:     options.maxBodyHold,
+		ReadBodyTimeout: options.readBodyTimeout,
+		Subprotocols:    []string{"chat", "superchat"},
+		AltSvc:          http3.AltSvc(gwPort),
 	})
 	if err != nil {
 		t.Fatal(err)

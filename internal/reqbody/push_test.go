@@ -382,3 +382,23 @@ func TestSourceOfPusher(t *testing.T) {
 		t.Fatal("a read body came out as a Pusher")
 	}
 }
+
+// A body that fails while pieces still wait for room fails its request at
+// once, drops them, and lets a waiting producer go.
+func TestPusherFailsWithQueue(t *testing.T) {
+	p := NewPusher(4)
+	sink := &fakeSink{}
+	_ = p.Attach(sink, -1)
+	_, _ = p.Write([]byte("abcdefgh"))
+	drained := false
+	if !p.OnDrain(func() { drained = true }) {
+		t.Fatal("OnDrain not armed")
+	}
+	p.CloseWithError(errors.New("gone"))
+	if _, _, failed, _ := sink.state(); failed == nil || failed.Error() != "gone" {
+		t.Fatalf("failed %v with pieces waiting", failed)
+	}
+	if !drained || p.Buffered() != 0 {
+		t.Fatalf("drained %v, buffered %d", drained, p.Buffered())
+	}
+}

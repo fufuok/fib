@@ -1082,12 +1082,8 @@ func (c *Conn) wakeWritersLocked() {
 		fn := s.roomFn
 		s.roomFn = nil
 		// The callback writes to the stream, which takes the lock held
-		// here, so it runs elsewhere; a pool too busy to take it at once
-		// hands it a goroutine of its own, since nothing here may wait.
-		run := func() { fn(err) }
-		if !sidepool.Client().TryGo(run) {
-			go run()
-		}
+		// here, so it runs elsewhere, without waiting for room.
+		sidepool.Post(func() { fn(err) })
 	}
 	clear(c.roomStreams[len(kept):])
 	c.roomStreams = kept

@@ -17,7 +17,7 @@ HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 | 响应 body | `Content-Length`、chunked（含 trailer）、HTTP/1.0 流式响应以关闭连接结束 | `Content-Length`、chunked（含 trailer，`Response.Trailer`）、以关闭连接结束 |
 | 流式 | 响应：`Context` 实现了 `http.ResponseWriter`、`http.Flusher`、`io.ReaderFrom`，`Write` + `Flush` 边生成边发送。请求：开启 `StreamRequestBody` 后 `Request.Body` 是 `*BodyStream`，读取不阻塞，也可以用 `Context.OnBody` 接管 | body 完整缓存后再回调 |
 | 文件 | `Connection.SendFile` / `Context.ReadFrom`：Linux、macOS 用 `sendfile(2)`，Windows 分块读取；`http.ServeFile`、`http.ServeContent`、`http.FileServer` 可以直接通过 `Context` 使用（Range、多段 Range、条件请求） | — |
-| 超时 | `ReadHeaderTimeout`、`ReadTimeout`、`IdleTimeout`，回退规则与 `net/http.Server` 相同 | 每个请求的 `Timeout` |
+| 超时 | `ReadHeaderTimeout`、`ReadTimeout`、`IdleTimeout`，回退规则与 `net/http.Server` 相同，另有 `ReadBodyTimeout` | 每个请求的 `Timeout` |
 | 1xx 中间响应 | `WriteInterim` 或 `WriteHeader(1xx)`，自动 `100 Continue` | 自动跳过 |
 | 无 body 的响应 | HEAD（保留 GET 的长度）；204、1xx 不带 `Content-Length`；304 只带 handler 自己给的 `Content-Length` | HEAD、204、304 不读 body |
 | 校验 | HTTP/1.1 缺少或重复 `Host`、HTTP/1.0 带 `Transfer-Encoding`、报文格式错误时返回 400；chunked 以外的 transfer coding 返回 501；无法满足的 `Expect` 返回 417；超限返回 413/431 | 格式错误的响应、未知 transfer coding、body 不完整都会让请求失败 |
@@ -127,13 +127,27 @@ context 一致。它不引用 `Context` 本身，所以即使 Reuse 选项把 `C
 | 第一个请求，或 keep-alive 连接上的下一个请求 | `IdleTimeout` | 上一个响应之后，或连接建立时 |
 | header 收完 | `ReadHeaderTimeout` | 该请求的第一个字节 |
 | body 收完（流式与否都一样） | `ReadTimeout` | 该请求的第一个字节 |
+| ……同时还有 | `ReadBodyTimeout` | 该请求 header 收完时 |
 | 不在等——请求已经收全 | 不限 | — |
 
 最后一行是和 `net/http` 的区别：`net/http` 把读 deadline 设在整个请求期间，handler
 只有在读的时候才会察觉；这里 deadline 是直接关连接的，所以请求收全之后就会撤掉——
 比 `ReadTimeout` 慢的 handler 仍然能把响应写完，`ReadTimeout` 约束的是请求到达的时间
 而不是处理它花的时间。流式 body 在 handler 运行期间仍在到达，所以它确实受
-`ReadTimeout` 约束，这正是慢上传占不住连接的原因。
+`ReadTimeout` 约束，这正是慢上传占不住连接的原因。`ReadBodyTimeout` 只约束 body，
+和 `ReadTimeout` 同时生效，先到期的那个起作用。
+
+客户端已经离开、body 却没被读的连接，也是靠它们关掉的：handler 不再读 body，或用
+`Context.HoldBody` 暂停它，待读的部分达到 `StreamRequestBodyBuffer` 后连接就停止读；
+不读的连接收不到 FIN 的结果（剩下的 body 可能还排在 FIN 前面）。读 deadline 不依赖读，
+到期就关闭这样的连接，`net/http` 的 server 也是靠它自己的读超时。暂停本身也有上限：
+`Config.MaxBodyHold`（默认 `DefaultMaxBodyHold`，一分钟；小于 0 不限）——单次暂停超过它，
+body 以 `ErrBodyHeldTooLong` 失败，`OnBody` 回调会收到。
+
+HTTP/2 不会为某一个流停止读连接，所以 `ReadTimeout` 和 `ReadBodyTimeout` 对每个请求的
+body 单独计时，从它的 HEADERS 算起：流式交给 handler 的 body 以 `os.ErrDeadlineExceeded`
+失败；handler 运行前还在收集的 body，其流被 reset；连接继续服务其他流。`http3.Config`
+为 HTTP/3 提供同样的三个设置。
 
 通过 preface 或 `h2c` 升级变成 HTTP/2 的连接会被解除这些超时：HTTP/2 有自己的连接
 状态，HTTP/1 解析器设下的 deadline 之后没人会去刷新它。

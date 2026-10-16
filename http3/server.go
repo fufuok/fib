@@ -101,6 +101,20 @@ type Config struct {
 	// Keep it below the engine's UDPIdleTimeout, or the engine closes a
 	// quiet peer first.
 	MaxIdleTimeout time.Duration
+	// ReadTimeout and ReadBodyTimeout bound each request's body on its own,
+	// from its header, as http.Config's do on HTTP/2, and whichever ends
+	// first applies. A body that streams to its handler and outlasts it
+	// fails with os.ErrDeadlineExceeded, which the handler is told, and a
+	// handler can lift it, or set another, with Context.SetReadDeadline; one
+	// still being collected before its handler runs has its stream reset
+	// with H3_REQUEST_CANCELLED. The rest of the connection goes on serving.
+	// Zero means no limit.
+	ReadTimeout     time.Duration
+	ReadBodyTimeout time.Duration
+	// MaxBodyHold bounds how long Context.HoldBody may hold a streamed body
+	// at a time, as http.Config.MaxBodyHold does: zero means
+	// http.DefaultMaxBodyHold, and below zero no limit.
+	MaxBodyHold time.Duration
 	// WriteTimeout bounds how long a response may take to be written,
 	// measured from when its handler is called, for each request on its own,
 	// as http.Config.WriteTimeout does on HTTP/2. A stream whose handler has
@@ -900,6 +914,9 @@ type requestStream struct {
 	// the handler whole, its streamed body has ended, or it has been
 	// refused.
 	done bool
+	// refs is described with pooled, below; it sits here, beside the bools,
+	// where it fits in what would otherwise be padding.
+	refs atomic.Int32
 	// streamed is what the request keeps when the server streams bodies, or
 	// nil when it does not.
 	streamed *streamedBody
@@ -927,9 +944,17 @@ type requestStream struct {
 	// timedOut marks a stream reset because its response outlasted
 	// Config.WriteTimeout, which writing to it then reports.
 	timedOut bool
+	// pooled is described below; it sits here, with the other bools.
+	pooled bool
 	// writeTimer resets the stream once Config.WriteTimeout has passed, or
 	// is nil; see armWriteTimeout.
 	writeTimer *time.Timer
+	// collectTimer resets the stream once its body, collected before its
+	// handler runs, has outlasted Config.ReadTimeout or ReadBodyTimeout, or
+	// is nil; see armCollectTimer. It holds a reference to the stream until
+	// it is stopped or has run. A body that streams is timed by its
+	// streamedBody's readTimer instead.
+	collectTimer *time.Timer
 
 	// block is the request, its URL and the Context it is answered through,
 	// allocated with the stream, and values holds its header's values.
@@ -941,9 +966,7 @@ type requestStream struct {
 	// the Context from the handler's dispatch until it ends, and the last
 	// of them to go puts the stream on the connection's dead list through
 	// nextDead; see serverConn.recycleDead. A request header taken from the
-	// pool is headerFromPool.
-	pooled         bool
-	refs           atomic.Int32
+	// pool is headerFromPool. Both fields sit higher up, where they pack.
 	nextDead       *requestStream
 	headerFromPool *pooledHeader
 }
@@ -1015,7 +1038,7 @@ func (rs *requestStream) recycle() {
 	rs.declared, rs.trailers, rs.done = 0, false, false
 	rs.streamed, rs.tunnel = nil, nil
 	rs.remoteDone, rs.responded, rs.closed, rs.upgraded, rs.expected = false, false, false, false, false
-	rs.streaming, rs.timedOut, rs.writeTimer = false, false, nil
+	rs.streaming, rs.timedOut, rs.writeTimer, rs.collectTimer = false, false, nil, nil
 	rs.values = [requestValues]string{}
 	rs.pooled, rs.nextDead, rs.headerFromPool = false, nil, nil
 	rs.refs.Store(0)
@@ -1053,6 +1076,9 @@ type streamedBody struct {
 	// guarded by the request stream's mu, and holds a reference to the
 	// stream until it is stopped or has run.
 	readTimer *time.Timer
+	// headerAt is when the request's header arrived, which the read
+	// timeouts are measured from, or zero when they are not set.
+	headerAt time.Time
 }
 
 // addSkip records n bytes of the body that were given back as they arrived.
@@ -1293,6 +1319,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.startStream(nil)
 		return nil
 	}
+	rs.armCollectTimer()
 	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
 		// The body is read whole before the handler runs, so there is no
 		// reason to keep the client waiting for permission to send it.
@@ -1313,17 +1340,47 @@ func (rs *requestStream) startStream(buffered []byte) {
 		// refuses the request answers it before the upload starts.
 		sendContinue = func() { _ = rs.WriteInterim(stdhttp.StatusContinue, nil) }
 	}
+	// The body is no longer collected; from here its deadline is the feed's.
+	rs.mu.Lock()
+	collectStopped := rs.stopCollectTimerLocked()
+	rs.mu.Unlock()
+	if collectStopped {
+		rs.unref()
+	}
 	_, b.feed = rs.block.StreamContext(sc.conn, rs, fibhttp.BodyFeedConfig{
 		Declared: rs.declared,
 		Limit:    sc.h.config.MaxStreamedBodyBytes,
 		Continue: sendContinue,
+		MaxHold:  sc.h.config.MaxBodyHold,
 		Credit:   func(n int) { b.credit(rs.s, n) },
 	})
+	// ReadTimeout and ReadBodyTimeout bound the body as a deadline the
+	// handler could have set, which it can lift or move the same way,
+	// measured from the header for a body collected until now.
+	start := b.headerAt
+	if start.IsZero() {
+		start = time.Now()
+	}
+	if at := bodyDeadline(&sc.h.config, start); !at.IsZero() {
+		_ = rs.SetReadDeadline(at)
+	}
 	b.addSkip(len(buffered))
 	_ = b.feed.Write(buffered)
 	bufferpool.Put(buffered)
 	rs.armWriteTimeout()
 	sc.h.streams.Queue(&sc.batch, &sc.gate, sc.conn, sc.h.handler, &rs.block)
+}
+
+// bodyDeadline is the read deadline config's timeouts put on a body that
+// begins to stream at start, or zero for none.
+func bodyDeadline(config *Config, start time.Time) time.Time {
+	var at time.Time
+	for _, d := range [...]time.Duration{config.ReadTimeout, config.ReadBodyTimeout} {
+		if bound := start.Add(d); d > 0 && (at.IsZero() || bound.Before(at)) {
+			at = bound
+		}
+	}
+	return at
 }
 
 // failBody tells the handler of a body still streaming that the rest of it
@@ -1688,9 +1745,58 @@ func (rs *requestStream) readTimedOut() {
 	}
 }
 
+// armCollectTimer bounds the body that is collected before the handler runs
+// by the read timeouts, from now, when they are set.
+func (rs *requestStream) armCollectTimer() {
+	now := time.Now()
+	at := bodyDeadline(&rs.sc.h.config, now)
+	if at.IsZero() {
+		return
+	}
+	if b := rs.streamed; b != nil {
+		b.headerAt = now
+	}
+	rs.mu.Lock()
+	rs.refs.Add(1)
+	rs.collectTimer = time.AfterFunc(time.Until(at), rs.collectTimedOut)
+	rs.mu.Unlock()
+}
+
+// collectTimedOut resets a stream whose body did not arrive by its read
+// timeouts while it was collected: its handler has not run, so there is
+// nobody else to tell. A timer stopped once it had fired finds collectTimer
+// gone, and leaves the stream alone. The reset is the stream's own, safe
+// from here; the connection hears the client's answering reset and lets
+// the stream go as for any other.
+func (rs *requestStream) collectTimedOut() {
+	defer rs.unref()
+	rs.mu.Lock()
+	fire := rs.collectTimer != nil && !rs.closed && !rs.remoteDone
+	rs.collectTimer = nil
+	rs.mu.Unlock()
+	if fire {
+		abortStream(rs.s, ErrCodeRequestCancelled)
+	}
+}
+
+// stopCollectTimerLocked stops the collect timer, if there is one, and
+// reports whether the caller is to give up the reference it held.
+func (rs *requestStream) stopCollectTimerLocked() bool {
+	t := rs.collectTimer
+	if t == nil {
+		return false
+	}
+	rs.collectTimer = nil
+	return t.Stop()
+}
+
 // stopReadTimerLocked stops the read timer, if there is one, as
-// stopWriteTimerLocked stops the write timer.
+// stopWriteTimerLocked stops the write timer: the collect timer while the
+// body is collected, and the feed's once it streams.
 func (rs *requestStream) stopReadTimerLocked() bool {
+	if rs.collectTimer != nil {
+		return rs.stopCollectTimerLocked()
+	}
 	b := rs.streamed
 	if b == nil || b.readTimer == nil {
 		return false

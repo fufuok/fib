@@ -18,7 +18,7 @@ usage, see the [HTTP section of the Go guide](guide.zh-CN.md#http-子-package)
 | Response bodies | `Content-Length`, chunked with trailers, close-delimited for HTTP/1.0 streams | `Content-Length`, chunked with trailers (`Response.Trailer`), close-delimited |
 | Streaming | Responses: `Context` is an `http.ResponseWriter`, `http.Flusher` and `io.ReaderFrom`, so `Write` + `Flush` stream the body as it is produced. Requests: with `StreamRequestBody` `Request.Body` is a `*BodyStream`, read without waiting or taken through `Context.OnBody` | Bodies are buffered whole before the callback |
 | Files | `Connection.SendFile` / `Context.ReadFrom`: `sendfile(2)` on Linux and macOS, chunked reads on Windows; `http.ServeFile`, `http.ServeContent` and `http.FileServer` work through `Context` (Range, multipart ranges, conditional requests) | — |
-| Timeouts | `ReadHeaderTimeout`, `ReadTimeout` and `IdleTimeout`, as `net/http.Server` resolves them | Per-request `Timeout` |
+| Timeouts | `ReadHeaderTimeout`, `ReadTimeout` and `IdleTimeout`, as `net/http.Server` resolves them, plus `ReadBodyTimeout` | Per-request `Timeout` |
 | Interim responses | 1xx through `WriteInterim` or `WriteHeader(1xx)`, automatic `100 Continue` | 1xx skipped |
 | Bodiless responses | HEAD (length of the GET kept), 204 and 1xx without `Content-Length`, 304 only with the handler's own `Content-Length` | HEAD, 204, 304 read no body |
 | Validation | 400 for a missing or repeated `Host` in HTTP/1.1, for `Transfer-Encoding` in HTTP/1.0 and for malformed messages; 501 for transfer codings other than chunked; 417 for unknown expectations; 413/431 for limits | Malformed responses, unknown transfer codings and short bodies fail the request |
@@ -165,6 +165,7 @@ Which one applies is decided by what the connection is waiting for:
 | Its first request, or the next one on a kept-alive connection | `IdleTimeout` | the response before it, or the connection opening |
 | A header to finish | `ReadHeaderTimeout` | the request's first byte |
 | A body to finish, streamed or not | `ReadTimeout` | the request's first byte |
+| … and also | `ReadBodyTimeout` | the end of the request's header |
 | Nothing — the request has all arrived | nothing | — |
 
 The last row is the difference from `net/http`, where the read deadline is set
@@ -174,6 +175,26 @@ all arrived: a handler slower than `ReadTimeout` still gets to answer, and
 `ReadTimeout` bounds the arrival of a request rather than the work done for
 it. A streamed body is still arriving while its handler runs, so `ReadTimeout`
 does bound that, which is what keeps a slow upload from holding a connection.
+`ReadBodyTimeout` bounds the body alone, alongside `ReadTimeout`, and
+whichever ends first applies.
+
+They are also what ends a connection whose client has gone while its body is
+unread: a handler that stops reading the body, or holds it with
+`Context.HoldBody`, stops the connection's reads once
+`StreamRequestBodyBuffer` of it waits, and a connection that reads nothing
+does not hear a FIN, since the rest of the body may be ahead of it in the
+socket. The read deadline does not depend on reading, so it closes such a
+connection when it passes, as `net/http`'s server relies on its own. A hold
+has a bound of its own too: `Config.MaxBodyHold` (default
+`DefaultMaxBodyHold`, a minute; below zero, none) fails a body held longer at
+a time with `ErrBodyHeldTooLong`, which its `OnBody` callback is told.
+
+On HTTP/2, which never stops reading a connection for one stream,
+`ReadTimeout` and `ReadBodyTimeout` bound each request's body on its own, from
+its HEADERS: a body streaming to its handler fails with
+`os.ErrDeadlineExceeded`, one still collected before its handler runs has its
+stream reset, and the connection goes on serving. `http3.Config` has the same
+three settings for HTTP/3.
 
 A connection that becomes HTTP/2, by the preface or through an `h2c` upgrade,
 is released from these: HTTP/2 is served by its own connection state, and

@@ -89,6 +89,10 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	timeout := flags.Duration("timeout", 5*time.Minute, "longest an upstream request may take, body included; 0 for no limit")
 	subprotocols := flags.String("subprotocols", "chat,superchat", "WebSocket subprotocols to accept from clients and ask the upstream for")
 	maxBody := flags.Int64("max-request-body", 64<<20, "largest request body to forward")
+	readHeaderTimeout := flags.Duration("read-header-timeout", 10*time.Second, "longest a request header may take to arrive; 0 for no limit")
+	readBodyTimeout := flags.Duration("read-body-timeout", 0, "longest a request body may take to arrive; 0 for no limit")
+	idleTimeout := flags.Duration("idle-timeout", 2*time.Minute, "longest a kept-alive connection may sit idle; 0 for no limit")
+	maxBodyHold := flags.Duration("max-body-hold", 30*time.Second, "longest an upload may wait for an upstream that stopped taking it")
 	var routes routeFlags
 	flags.Var(&routes, "route", "prefix=target, repeatable (default: /h1, /h2 and /h3 to the upstream example)")
 	serverCerts := certs.ServerFlagsWithOut(flags, certs.GatewayCertFile)
@@ -123,6 +127,11 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 		MaxRequestBody: *maxBody,
 		Subprotocols:   strings.FieldsFunc(*subprotocols, func(r rune) bool { return r == ',' || r == ' ' }),
 		Logf:           log.Printf,
+
+		ReadHeaderTimeout: *readHeaderTimeout,
+		ReadBodyTimeout:   *readBodyTimeout,
+		IdleTimeout:       *idleTimeout,
+		MaxBodyHold:       *maxBodyHold,
 	})
 	if err != nil {
 		return err

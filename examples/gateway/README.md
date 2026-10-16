@@ -81,6 +81,10 @@ Without `-route` the gateway uses the demo upstream:
 | `-timeout` | `5m` | longest an upstream request may take, body included; `0` for no limit |
 | `-max-request-body` | `64MiB` | largest request body forwarded |
 | `-subprotocols` | `chat,superchat` | WebSocket subprotocols accepted from clients and asked of the upstream |
+| `-read-header-timeout` | `10s` | longest a request header may take to arrive; `0` for no limit |
+| `-read-body-timeout` | `0` | longest a request body may take to arrive (408 on HTTP/2 and HTTP/3); `0` for no limit |
+| `-idle-timeout` | `2m` | longest a kept-alive connection may sit idle; `0` for no limit |
+| `-max-body-hold` | `30s` | longest an upload may wait for an upstream that stopped taking it, after which it is a `504` |
 | `-cert`, `-key`, `-cert-out` | self-signed | the gateway's certificate |
 | `-ca`, `-insecure` | the upstream example's certificate | how the upstreams are verified |
 
@@ -116,7 +120,8 @@ with code 4002 when sent the text `close`).
   QUIC flow control). Trailers are forwarded.
 - **Headers**: hop-by-hop headers are dropped; `X-Forwarded-For/Proto/Host` and `Via` are added; responses on
   HTTP/1.1 and HTTP/2 carry `Alt-Svc` so browsers can move to HTTP/3.
-- **Errors**: an unreachable upstream is `502`, a slow one `504`, an unknown prefix `404`; a client that goes away
+- **Errors**: an unreachable upstream is `502`, a slow one `504` (also one that stops taking an upload for
+  `-max-body-hold`), a client whose body outlasts `-read-body-timeout` `408`, an unknown prefix `404`; a client that goes away
   cancels the upstream request; an upstream that fails mid-body aborts the downstream response.
 - **WebSocket** works on HTTP/1.1, and on HTTP/2 and HTTP/3 through extended CONNECT (RFC 8441 / RFC 9220). Messages
   and close codes are relayed in both directions.

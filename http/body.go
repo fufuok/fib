@@ -21,6 +21,25 @@ import (
 // belongs to has returned.
 var ErrBodyAbandoned = errors.New("http: request body no longer being read")
 
+// ErrBodyHeldTooLong is what a streamed body fails with when Context.HoldBody
+// has held it longer than Config.MaxBodyHold.
+var ErrBodyHeldTooLong = errors.New("http: request body held past MaxBodyHold")
+
+// DefaultMaxBodyHold is Config.MaxBodyHold's default.
+const DefaultMaxBodyHold = time.Minute
+
+// maxBodyHold resolves Config.MaxBodyHold: zero is the default, and below
+// zero no limit.
+func maxBodyHold(d time.Duration) time.Duration {
+	switch {
+	case d == 0:
+		return DefaultMaxBodyHold
+	case d < 0:
+		return 0
+	}
+	return d
+}
+
 // ErrWouldBlock is what reading a streamed body reports when none of it has
 // arrived yet. It is the engine's own, so a handler may test either for it.
 var ErrWouldBlock = fib.ErrWouldBlock
@@ -141,7 +160,12 @@ type BodyStream struct {
 	delivered bool
 	// sinkHeld pauses the handing on, while Context.HoldBody holds it: what
 	// arrives is buffered, and paces the peer, as it is for a reader.
-	sinkHeld bool
+	// heldSince is when the hold began, and holdTimer fails the body once
+	// it has lasted maxHold; zero leaves a hold unbounded.
+	sinkHeld  bool
+	heldSince time.Time
+	maxHold   time.Duration
+	holdTimer *time.Timer
 	// sendContinue sends the 100 Continue the body waits for, on a protocol
 	// other than HTTP/1, which conn sends it on. credit is told of every
 	// byte of the body the handler has taken, by reading it or through
@@ -190,6 +214,16 @@ func (s *BodyStream) setSink(fn sinkFunc, reserve bool) bool {
 // resumes it, on the engine's handler pool, without.
 func (s *BodyStream) holdSink(hold bool) {
 	s.mu.Lock()
+	if hold && !s.sinkHeld && s.maxHold > 0 && !s.ended && s.err == nil && !s.abandoned {
+		s.heldSince = time.Now()
+		if s.holdTimer == nil {
+			s.holdTimer = time.AfterFunc(s.maxHold, s.holdExpired)
+		} else {
+			s.holdTimer.Reset(s.maxHold)
+		}
+	} else if !hold && s.sinkHeld && s.holdTimer != nil {
+		s.holdTimer.Stop()
+	}
 	s.sinkHeld = hold
 	owed := !hold && s.sink != nil && !s.sinkBusy && s.owedLocked()
 	if owed {
@@ -199,6 +233,40 @@ func (s *BodyStream) holdSink(hold bool) {
 	if owed {
 		// Never here: the caller may be the sink itself, or hold a lock
 		// the sink takes.
+		runOnStreams(s.owner, func() { s.drain(false) })
+	}
+}
+
+// holdExpired fails a body held for maxHold. A timer that fired as the hold
+// was let go, or for an earlier hold, finds the body not held, or held
+// since, and leaves it alone.
+func (s *BodyStream) holdExpired() {
+	s.mu.Lock()
+	expired := s.sinkHeld && time.Since(s.heldSince) >= s.maxHold
+	s.mu.Unlock()
+	if expired {
+		s.failElsewhere(ErrBodyHeldTooLong)
+	}
+}
+
+// failElsewhere fails the body with err, as fail does, from a goroutine that
+// is neither the connection's nor its handler's, such as a timer's: the
+// callback that took the body hears it on the engine's handler pool, and a
+// reader on its next Read. What still arrives is dropped.
+func (s *BodyStream) failElsewhere(err error) {
+	s.mu.Lock()
+	if s.ended || s.err != nil || s.abandoned {
+		s.mu.Unlock()
+		return
+	}
+	s.err = err
+	s.releaseLocked()
+	owed := s.sink != nil && !s.sinkBusy && s.owedLocked()
+	if owed {
+		s.sinkBusy = true
+	}
+	s.mu.Unlock()
+	if owed {
 		runOnStreams(s.owner, func() { s.drain(false) })
 	}
 }
@@ -279,6 +347,7 @@ func newBodyStream(conn *fib.Connection, request *stdhttp.Request, config Config
 		limit:        config.MaxStreamedBodyBytes,
 		highWater:    highWater,
 		wantContinue: wantContinue,
+		maxHold:      maxBodyHold(config.MaxBodyHold),
 	}
 	if decoder == nil {
 		s.remaining = request.ContentLength
@@ -529,10 +598,20 @@ func (s *BodyStream) fail(err error, worker bool) {
 	s.deliverLocked(worker)
 }
 
+// stopHoldLocked stops the timer of a hold, once the body is over.
+func (s *BodyStream) stopHoldLocked() {
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+	}
+}
+
 // releaseLocked ends any hold this body has on the connection's reads. The
 // engine call is safe under the lock: it records the change and wakes the
 // event loop rather than waiting for it.
 func (s *BodyStream) releaseLocked() {
+	if s.ended || s.err != nil || s.abandoned {
+		s.stopHoldLocked()
+	}
 	if s.held {
 		s.held = false
 		s.holdReads(false)

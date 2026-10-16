@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	stdhttp "net/http"
+	"time"
 
 	fib "github.com/lesismal/fib"
 )
@@ -40,6 +41,9 @@ type BodyFeedConfig struct {
 	// asks for the body, so that a handler which refuses the request answers
 	// it before the upload starts.
 	Continue func()
+	// MaxHold is Config.MaxBodyHold for the body: zero is DefaultMaxBodyHold,
+	// and below zero no limit.
+	MaxHold time.Duration
 	// Credit is told of every byte of the body the handler has consumed, by
 	// reading it or through OnBody, and of every byte thrown away unread, for
 	// the protocol to give the peer room for as much again. It is called
@@ -70,6 +74,7 @@ func (r *StreamRequest) streamBody(c *Context, config BodyFeedConfig) *BodyFeed 
 		wantContinue: config.Continue != nil,
 		sendContinue: config.Continue,
 		credit:       config.Credit,
+		maxHold:      maxBodyHold(config.MaxHold),
 		offload:      true,
 		owner:        c.Conn,
 	}

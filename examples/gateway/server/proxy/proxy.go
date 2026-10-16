@@ -141,6 +141,19 @@ type Config struct {
 	// it, even when that is found out only on its way upstream. Bodies stream,
 	// so it does not bound the memory an upload takes. Zero means 64 MiB.
 	MaxRequestBody int64
+	// ReadHeaderTimeout, ReadTimeout, ReadBodyTimeout and IdleTimeout bound
+	// how long a client's request header, whole request and body may take
+	// to arrive, and how long its kept-alive connection may sit idle, as
+	// http.Config's do; zero means no limit. MaxBodyHold bounds how long an
+	// upload may wait for an upstream that stopped taking it, after which it
+	// is answered with 504; zero means http.DefaultMaxBodyHold. Without
+	// them, a client that goes away while its upload is held is noticed only
+	// once the hold ends.
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	ReadBodyTimeout   time.Duration
+	IdleTimeout       time.Duration
+	MaxBodyHold       time.Duration
 	// Subprotocols are the WebSocket subprotocols the gateway accepts from
 	// clients and asks the upstream for; the handshake picks the first one a
 	// client offers. Without any, no subprotocol is negotiated.
@@ -223,6 +236,11 @@ func (g *Gateway) HTTPConfig() fibhttp.Config {
 	config.StreamRequestBody = true
 	config.StreamRequestBodyThreshold = streamThreshold
 	config.MaxStreamedBodyBytes = g.config.MaxRequestBody
+	config.ReadHeaderTimeout = g.config.ReadHeaderTimeout
+	config.ReadTimeout = g.config.ReadTimeout
+	config.ReadBodyTimeout = g.config.ReadBodyTimeout
+	config.IdleTimeout = g.config.IdleTimeout
+	config.MaxBodyHold = g.config.MaxBodyHold
 	return config
 }
 
@@ -233,6 +251,9 @@ func (g *Gateway) HTTP3Config(tlsConfig *tls.Config) http3.Config {
 	config.StreamRequestBody = true
 	config.StreamRequestBodyThreshold = streamThreshold
 	config.MaxStreamedBodyBytes = g.config.MaxRequestBody
+	config.ReadTimeout = g.config.ReadTimeout
+	config.ReadBodyTimeout = g.config.ReadBodyTimeout
+	config.MaxBodyHold = g.config.MaxBodyHold
 	return config
 }
 
@@ -353,6 +374,21 @@ func addForwarded(h stdhttp.Header, r *stdhttp.Request) {
 
 // failure maps an upstream error to the status the client is told.
 func failure(err error) int {
+	var upload *uploadError
+	if errors.As(err, &upload) {
+		switch {
+		case errors.Is(err, fibhttp.ErrBodyTooLarge):
+			// The upload outgrew MaxRequestBody on its way upstream.
+			return stdhttp.StatusRequestEntityTooLarge
+		case errors.Is(err, fibhttp.ErrBodyHeldTooLong):
+			// The upstream stopped taking the upload for MaxBodyHold.
+			return stdhttp.StatusGatewayTimeout
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			// The client took longer than its read timeout to send it.
+			return stdhttp.StatusRequestTimeout
+		}
+		return stdhttp.StatusBadRequest
+	}
 	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
 		return stdhttp.StatusGatewayTimeout
 	}

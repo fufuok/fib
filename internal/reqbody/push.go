@@ -257,11 +257,27 @@ func (p *Pusher) pump(sink Sink) {
 			p.mu.Unlock()
 			return
 		}
+		if p.failed != nil {
+			// A body that failed fails its request now, whatever of it is
+			// still waiting for room that may never come.
+			err := p.failed
+			p.ended = true
+			for _, piece := range p.queue {
+				bufferpool.Put(piece)
+			}
+			clear(p.queue)
+			p.queue, p.queued = p.queue[:0], 0
+			drains := p.takeDrainsLocked()
+			p.mu.Unlock()
+			for _, fn := range drains {
+				fn()
+			}
+			sink.Fail(err)
+			return
+		}
 		if len(p.queue) == 0 {
 			var err error
 			switch {
-			case p.failed != nil:
-				err = p.failed
 			case !p.closed:
 				p.mu.Unlock()
 				return

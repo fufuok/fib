@@ -62,11 +62,7 @@ func NewBodyWriter(limit int) *BodyWriter { return reqbody.NewPusher(limit) }
 
 // goKick runs push.Kick off the goroutine that has room to report, which
 // holds a lock the sending takes.
-func goKick(push *reqbody.Pusher) {
-	if !sidepool.Client().TryGo(push.Kick) {
-		go push.Kick()
-	}
-}
+func goKick(push *reqbody.Pusher) { sidepool.Post(push.Kick) }
 
 // kickOnDrain is the callback a sink arms with outputwait.Notify: a
 // connection that closed instead settles the request where it closes.

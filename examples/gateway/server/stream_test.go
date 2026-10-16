@@ -213,3 +213,77 @@ func TestUpstreamFailsBeforeBody(t *testing.T) {
 		})
 	}
 }
+
+// TestUploadToStalledUpstream sends an upload to an upstream that stops
+// taking it: once the gateway has held the client's body for MaxBodyHold, it
+// gives the request up with a 504 rather than hold the client for good.
+func TestUploadToStalledUpstream(t *testing.T) {
+	l := newLab(t, labOptions{maxBodyHold: 300 * time.Millisecond})
+	for _, client := range l.clients {
+		t.Run(client.name, func(t *testing.T) {
+			pr, pw := io.Pipe()
+			defer pw.Close()
+			req := request(t, "POST", l.url("/h1/stall"), nil)
+			req.Body = pr
+			go func() {
+				piece := pattern(64 << 10)
+				for {
+					if _, err := pw.Write(piece); err != nil {
+						return
+					}
+				}
+			}()
+			r := get(t, client.doer, req)
+			if r.err != nil && client.name == "HTTP/1.1" {
+				// The gateway closes an HTTP/1.1 connection whose body it
+				// gave up on, which may reset the client before it reads the
+				// answer.
+				return
+			}
+			if r.err != nil || r.status != stdhttp.StatusGatewayTimeout {
+				t.Fatalf("err %v, status %d, body %q", r.err, r.status, r.body)
+			}
+		})
+	}
+}
+
+// TestUploadFromStalledClient has clients stop sending their body. One that
+// stops once its body streams upstream is, past the gateway's
+// ReadBodyTimeout, answered with 408 on HTTP/2 and HTTP/3, its connection
+// closed on HTTP/1.1, and its upstream request abandoned. One that stops
+// before the body streams never reaches the upstream: its stream is reset,
+// or its connection closed.
+func TestUploadFromStalledClient(t *testing.T) {
+	l := newLab(t, labOptions{readBodyTimeout: 300 * time.Millisecond})
+	for _, stall := range []struct {
+		name string
+		sent int
+	}{{"streaming", 128 << 10}, {"collected", 8 << 10}} {
+		for _, client := range l.clients {
+			t.Run(stall.name+"/"+client.name, func(t *testing.T) {
+				pr, pw := io.Pipe()
+				defer pw.Close()
+				req := request(t, "POST", l.url("/h1/hang"), nil)
+				req.Body = pr
+				go func() { _, _ = pw.Write(pattern(stall.sent)) }()
+				r := get(t, client.doer, req)
+				switch {
+				case client.name == "HTTP/1.1" || stall.name == "collected":
+					if r.err == nil {
+						t.Fatalf("status %d for a body that outlived its timeout", r.status)
+					}
+				case r.err != nil || r.status != stdhttp.StatusRequestTimeout:
+					t.Fatalf("err %v, status %d, body %q", r.err, r.status, r.body)
+				}
+				if stall.name == "collected" {
+					return
+				}
+				select {
+				case <-l.canceled:
+				case <-time.After(5 * time.Second):
+					t.Fatal("the upstream never saw the request abandoned")
+				}
+			})
+		}
+	}
+}

@@ -1287,9 +1287,8 @@ func (c *Connection) wakeOutputWaitLocked() {
 
 // fireNoticesLocked runs the callbacks waiting in notifyOutput whose backlog
 // has been reached, or every one of them with err when it is not nil. They
-// run on the client pool, never here, under the lock; a pool too busy to
-// take one at once hands it a goroutine of its own, since nothing here may
-// wait for room. Callers hold c.mu.
+// run through sidepool.Post, never here, under the lock, and without
+// waiting for room, which nothing here may do. Callers hold c.mu.
 func (c *Connection) fireNoticesLocked(err error) {
 	d := c.deadlines
 	if d == nil || len(d.notices) == 0 {
@@ -1303,10 +1302,7 @@ func (c *Connection) fireNoticesLocked(err error) {
 			continue
 		}
 		fn := n.fn
-		run := func() { fn(err) }
-		if !sidepool.Client().TryGo(run) {
-			go run()
-		}
+		sidepool.Post(func() { fn(err) })
 	}
 	clear(d.notices[len(kept):])
 	d.notices = kept
@@ -1317,7 +1313,7 @@ func (c *Connection) fireNoticesLocked(err error) {
 
 // notifyOutput is waitOutput for a caller that may not wait: when more than
 // limit bytes of what Send accepted are queued for the socket it arranges for
-// fn to run, on the client pool, once no more than half of limit are, or
+// fn to run, through sidepool.Post, once no more than half of limit are, or
 // with syscall.EPIPE once the connection is closing, and reports true; when
 // no more than limit are, it reports false and fn never runs. Unlike a
 // waiter, nothing here flushes: the connection's own rounds do, at each write

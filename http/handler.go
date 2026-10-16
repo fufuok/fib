@@ -547,7 +547,8 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	h := &ServerHandler{
 		handler: handler,
 		config:  config,
-		timed:   config.ReadHeaderTimeout > 0 || config.ReadTimeout > 0 || config.IdleTimeout > 0,
+		timed: config.ReadHeaderTimeout > 0 || config.ReadTimeout > 0 || config.ReadBodyTimeout > 0 ||
+			config.IdleTimeout > 0,
 	}
 	if !config.DisableHTTP2 {
 		h.streams = NewStreamPool(config.StreamPool)
@@ -640,8 +641,32 @@ func (h *ServerHandler) readDeadline(parser *Parser) time.Time {
 		if d > 0 {
 			at = parser.requestStart.Add(d)
 		}
+		if state == waitBody {
+			if parser.bodyStart.IsZero() {
+				parser.bodyStart = time.Now()
+			}
+			at = earliest(at, h.config.ReadBodyTimeout, parser.bodyStart)
+		}
 	}
 	return at
+}
+
+// earliest is at, or start plus d when that comes first, or when at is zero;
+// a d of zero or less leaves at as it is.
+func earliest(at time.Time, d time.Duration, start time.Time) time.Time {
+	if d <= 0 {
+		return at
+	}
+	if bound := start.Add(d); at.IsZero() || bound.Before(at) {
+		return bound
+	}
+	return at
+}
+
+// streamBodyDeadline is the read deadline Config's timeouts put on a body
+// that streams on a multiplexed protocol, whose request began at start.
+func streamBodyDeadline(config *Config, start time.Time) time.Time {
+	return earliest(earliest(time.Time{}, config.ReadTimeout, start), config.ReadBodyTimeout, start)
 }
 
 // releaseTimeouts hands the connection over to another protocol: this parser

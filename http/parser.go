@@ -115,8 +115,34 @@ type Config struct {
 	// as long as it is still arriving, and stops once the request has all
 	// arrived, so a handler is never cut off by it. A handler can lift it,
 	// or set another, for its own streamed body with Context.SetReadDeadline.
-	// Zero means no limit.
+	// On HTTP/2 it bounds each request's body on its own, from its HEADERS,
+	// and leaves the connection serving its other streams: a body that
+	// streams fails with os.ErrDeadlineExceeded, which its handler is told,
+	// and one still being collected before its handler runs has its stream
+	// reset with CANCEL. Zero means no limit.
+	//
+	// A body that its handler stops reading, or holds with Context.HoldBody,
+	// stops the connection's reads once Config.StreamRequestBodyBuffer of it
+	// waits, and a connection that reads nothing does not hear its peer go:
+	// one of ReadTimeout and ReadBodyTimeout is what closes such a connection
+	// once its client has gone, as net/http's server relies on its own.
 	ReadTimeout time.Duration
+	// ReadBodyTimeout bounds how long a request's body may take to arrive,
+	// measured from the end of its header, alongside ReadTimeout, which
+	// bounds the whole request: whichever ends first applies. Like
+	// ReadTimeout it bounds a streamed body for as long as it is still
+	// arriving, a handler can lift it with Context.SetReadDeadline, and on
+	// HTTP/2 it applies to each request's body on its own, as ReadTimeout
+	// does there; the two then both run from the HEADERS. Zero means no
+	// limit.
+	ReadBodyTimeout time.Duration
+	// MaxBodyHold bounds how long Context.HoldBody may hold a streamed body
+	// at a time: a body held longer fails with ErrBodyHeldTooLong, which its
+	// OnBody callback is told, so that a consumer that stopped taking it, an
+	// upstream a proxy forwards it to, say, gives the request up rather than
+	// holding the client and the connection forever. Zero means
+	// DefaultMaxBodyHold; below zero, no limit.
+	MaxBodyHold time.Duration
 	// IdleTimeout bounds how long a kept-alive connection may sit between
 	// requests. Zero means ReadTimeout; both zero means no limit.
 	IdleTimeout time.Duration
@@ -278,9 +304,11 @@ type Parser struct {
 	// headerComplete records that the request being parsed has its header and
 	// is waiting for its body, which is what tells ReadHeaderTimeout from
 	// ReadTimeout. requestStart is when that request's first byte arrived,
-	// which both are measured from.
+	// which both are measured from, and bodyStart when the connection was
+	// first found waiting for its body, which ReadBodyTimeout is.
 	headerComplete bool
 	requestStart   time.Time
+	bodyStart      time.Time
 	// live is stream, or the last one, reachable without mu so that a close
 	// on the event-loop goroutine can fail a body whose reader is waiting.
 	live atomic.Pointer[BodyStream]
@@ -324,7 +352,7 @@ func (p *Parser) Reset() {
 	p.headerScan = 0
 	p.continued, p.wantContinue = false, false
 	p.stream, p.busy, p.spent, p.upgraded = nil, false, false, false
-	p.headerComplete, p.requestStart = false, time.Time{}
+	p.headerComplete, p.requestStart, p.bodyStart = false, time.Time{}, time.Time{}
 	p.live.Store(nil)
 	p.resetServerState()
 }
@@ -451,7 +479,7 @@ func (p *Parser) feedOne() (*stdhttp.Request, bool, error) {
 // requestEnded marks the request that was arriving as arrived, so the next one
 // is timed from its own first byte.
 func (p *Parser) requestEnded() {
-	p.headerComplete, p.requestStart = false, time.Time{}
+	p.headerComplete, p.requestStart, p.bodyStart = false, time.Time{}, time.Time{}
 }
 
 // waitState is what the connection is waiting for, which says which of the

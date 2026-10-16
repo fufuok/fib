@@ -78,6 +78,10 @@ WebSocket 请求：`http://` 目标走 `ws://`，其余走 `wss://`（`h3://` �
 | `-timeout` | `5m` | 单个上游请求（含 body）的最长时间；`0` 不限 |
 | `-max-request-body` | `64MiB` | 转发的最大请求 body |
 | `-subprotocols` | `chat,superchat` | 接受客户端、并向上游请求的 WebSocket 子协议 |
+| `-read-header-timeout` | `10s` | 请求 header 最长到达时间；`0` 不限 |
+| `-read-body-timeout` | `0` | 请求 body 最长到达时间（HTTP/2、HTTP/3 上回 408）；`0` 不限 |
+| `-idle-timeout` | `2m` | keep-alive 连接最长空闲时间；`0` 不限 |
+| `-max-body-hold` | `30s` | 上传等待不再接收的上游的最长时间，超过回 `504` |
 | `-cert`、`-key`、`-cert-out` | 自签 | 网关自己的证书 |
 | `-ca`、`-insecure` | upstream 示例的证书 | 如何验证上游 |
 
@@ -109,7 +113,8 @@ curl -i 'http://127.0.0.1:8081/h1/status?code=418'
   通过，两边中较慢的一方给另一方施加背压（TCP、HTTP/2、QUIC 各自的流控）。trailer 会转发。
 - **请求头**：丢弃逐跳头；加上 `X-Forwarded-For/Proto/Host` 和 `Via`；HTTP/1.1 与 HTTP/2 的响应带 `Alt-Svc`，
   浏览器可以据此切到 HTTP/3。
-- **错误**：上游不可达 `502`，太慢 `504`，前缀没有路由 `404`；下游客户端离开会取消上游请求；上游在 body 中途
+- **错误**：上游不可达 `502`，太慢 `504`（上游停止接收上传超过 `-max-body-hold` 也是），客户端 body 超过
+  `-read-body-timeout` 回 `408`，前缀没有路由 `404`；下游客户端离开会取消上游请求；上游在 body 中途
   失败会中止下游响应。
 - **WebSocket**：HTTP/1.1 上可用，HTTP/2 与 HTTP/3 上通过扩展 CONNECT（RFC 8441 / RFC 9220）。消息和关闭码双向转发。
 
