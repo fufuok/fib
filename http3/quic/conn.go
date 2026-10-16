@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
+	"math/bits"
 	"net"
 	"sync"
 	"time"
@@ -364,6 +365,15 @@ type Conn struct {
 	closeErr error
 	// closeWhenDone is the close CloseWhenDone asked for.
 	closeWhenDone *ApplicationError
+	// closePacket is the datagram that carried this side's CONNECTION_CLOSE,
+	// kept until closingUntil, the end of the closing period (RFC 9000
+	// section 10.2.1), to send again to what still arrives: the first may
+	// have been lost, and the peer, which goes on probing, would otherwise
+	// hold on to the connection until it idled out. closingSeen counts what
+	// arrived meanwhile, the close going again at each power of two of it.
+	closePacket  []byte
+	closingUntil time.Time
+	closingSeen  int
 
 	// events are the handler calls waiting for dispatch, and spareEvents
 	// the array the last batch of them was run from, kept for the next.
@@ -655,6 +665,8 @@ func (c *Conn) HandlePathDatagram(pc PacketConn, remote net.Addr, datagram []byt
 		c.handleDatagramLocked(datagram, now)
 		c.armAckLocked(now)
 		c.wantFlush = true
+	} else {
+		c.answerClosingLocked(1)
 	}
 	c.recycleLocked(datagram)
 	givenUp := c.takeGivenUpLocked()
@@ -678,6 +690,8 @@ func (c *Conn) HandlePathDatagrams(pc PacketConn, remote net.Addr, datagrams [][
 		}
 		c.armAckLocked(now)
 		c.wantFlush = true
+	} else {
+		c.answerClosingLocked(len(datagrams))
 	}
 	for _, d := range datagrams {
 		c.recycleLocked(d)
@@ -1712,6 +1726,44 @@ func (c *Conn) sendClose(err error) {
 		out = c.sealPlan(out, &plans[i])
 	}
 	_ = c.pc.Send(out)
+	c.closePacket = out
+	c.closingUntil = c.now().Add(c.closingPeriod())
+}
+
+// minClosingPeriod is the shortest the closing period lasts. Three probe
+// timeouts of this side's are what RFC 9000 asks for at least, but the peer
+// probes by its own clock, which backs off and, on a loaded machine, can run
+// far behind this side's estimate: a server whose probe came 314ms after its
+// client closed, with the client's probe timeout at 26ms, was told of the
+// close by nothing but its idle timeout.
+const minClosingPeriod = time.Second
+
+// closingPeriod is how long a connection that closed answers what arrives
+// with its CONNECTION_CLOSE: three of its probe timeouts as they have backed
+// off, at least minClosingPeriod, and no longer than its idle timeout, past
+// which the peer has given up on the connection anyway.
+func (c *Conn) closingPeriod() time.Duration {
+	d := max(3*(c.rtt.pto()<<c.ptoCount), minClosingPeriod)
+	if c.idleTimeout > 0 {
+		d = min(d, c.idleTimeout)
+	}
+	return d
+}
+
+// answerClosingLocked answers n datagrams that arrived for a connection in
+// its closing period with the CONNECTION_CLOSE it sent, again: the 1st, 2nd,
+// 4th, 8th and so on, so that a peer that goes on sending gets fewer answers
+// the more it sends (RFC 9000 section 10.2.1). Callers hold c.mu.
+func (c *Conn) answerClosingLocked(n int) {
+	if c.closePacket == nil || n == 0 || !c.now().Before(c.closingUntil) {
+		return
+	}
+	before := c.closingSeen
+	c.closingSeen += n
+	// A power of two reached among those that just arrived.
+	if bits.Len(uint(before)) != bits.Len(uint(c.closingSeen)) {
+		_ = c.pc.Send(c.closePacket)
+	}
 }
 
 // terminateLocked ends the connection at once, without telling the peer.
@@ -1841,4 +1893,13 @@ func (c *Conn) onTimer() {
 	c.mu.Unlock()
 	closePaths(givenUp)
 	c.dispatch()
+}
+
+// endClosing ends the closing period: the CONNECTION_CLOSE is no longer sent
+// again, and the paths it went on close.
+func (c *Conn) endClosing(paths []PacketConn) {
+	c.mu.Lock()
+	c.closePacket = nil
+	c.mu.Unlock()
+	closePaths(paths)
 }

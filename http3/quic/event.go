@@ -1,6 +1,10 @@
 package quic
 
-import "github.com/lesismal/fib/bufferpool"
+import (
+	"time"
+
+	"github.com/lesismal/fib/bufferpool"
+)
 
 // eventKind is which handler call an event is.
 type eventKind uint8
@@ -62,13 +66,25 @@ func (c *Conn) run(e *event) {
 		c.mu.Lock()
 		t, pc, prev := c.tls, c.pc, c.prevPC
 		c.prevPC = nil
+		closing := time.Duration(0)
+		if c.closePacket != nil {
+			closing = c.closingUntil.Sub(c.now())
+		}
 		c.mu.Unlock()
 		if t != nil {
 			t.Close()
 		}
-		_ = pc.Close()
+		paths := []PacketConn{pc}
 		if prev != nil {
-			_ = prev.Close()
+			paths = append(paths, prev)
+		}
+		if closing > 0 {
+			// This side closed: its paths stay open for the closing period,
+			// to send the close again to what still arrives (see
+			// answerClosingLocked), and close once it is over.
+			time.AfterFunc(closing, func() { c.endClosing(paths) })
+		} else {
+			closePaths(paths)
 		}
 		// closeErr is set once, before evClose is queued.
 		c.handler.OnClose(c, c.closeErr)
