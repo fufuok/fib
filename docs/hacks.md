@@ -655,15 +655,15 @@ All of fib's clients (`Engine.Dial`, `fibhttp.Client`, `websocket.Dialer`, the `
 the server's event loop, worker pool and backpressure.
 
 ```go
-engine, _ := fib.Bind(config, handler)           // server
+engine, _ := fib.New(config, fib.Binding{Addr: ":8080", Handler: handler}) // server
 client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig()) // reuses the server's Engine
 ```
 
 - For a gateway or proxy, use the **same Engine** for the upstream client; no second set of
   threads or pools is needed.
-- `Engine.DialWithHandler(...)`: the connection uses **its own handler** and the Engine's handler
-  never sees it, so one Engine can host servers and clients of different protocols at once.
-- `fib.NewEngine(config, nil)` creates an Engine that **does not listen**, only for dialing.
+- `Engine.DialWithHandler(...)`: the connection uses **its own handler**, as each binding's
+  connections do theirs, so one Engine can host servers and clients of different protocols at once.
+- `fib.New(config)` with no bindings creates an Engine that **does not listen**, only for dialing.
 - `client.Go(req).Wait()` is the Future form, for places that may block (such as `main` or tests).
   **Never `Wait()` inside a handler**, which holds a worker; in a handler use a callback with
   `Retain`/`Release`.

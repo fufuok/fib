@@ -17,8 +17,7 @@ import (
 func serve(t *testing.T, handler fib.Handler) string {
 	t.Helper()
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, handler)
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}

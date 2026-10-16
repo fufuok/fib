@@ -53,10 +53,9 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 		return err
 	}
 	config := fib.DefaultConfig()
-	config.Addr = *addr
 	// The WebSocket handler is the same one the plain server uses:
 	// fibtls.NewServer decrypts in front of it and encrypts what it sends.
-	engine, err := fib.Bind(config, fibtls.NewServer(tlsConfig, echo(out, *compress)))
+	engine, err := fib.New(config, fib.Binding{Addr: *addr, Handler: fibtls.NewServer(tlsConfig, echo(out, *compress))})
 	if err != nil {
 		return err
 	}

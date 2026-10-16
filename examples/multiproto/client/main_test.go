@@ -70,8 +70,7 @@ func serve(t *testing.T) (addr, certFile string) {
 	})
 
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, multiproto.New(multiproto.Config{
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: multiproto.New(multiproto.Config{
 		TLS:   fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), web),
 		HTTP1: web,
 		HTTP2: web,
@@ -85,7 +84,7 @@ func serve(t *testing.T) (addr, certFile string) {
 		HTTPProxy: fibhttp.NewHandler(fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{})),
 		ARPC:      arpcServer,
 		Fallback:  fib.HandlerFuncs{Data: func(c *fib.Connection, data []byte) { _ = c.Send(data) }},
-	}))
+	})})
 	if err != nil {
 		t.Fatal(err)
 	}

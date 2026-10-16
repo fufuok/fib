@@ -24,13 +24,12 @@ func TestConcurrentBackpressuredEcho(t *testing.T) {
 	for _, useWritev := range []bool{false, true} {
 		t.Run(map[bool]string{false: "write", true: "writev"}[useWritev], func(t *testing.T) {
 			config := DefaultConfig()
-			config.Addr = "127.0.0.1:0"
 			config.UseWritev = useWritev
-			server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+			server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{Data: func(c *Connection, b []byte) {
 				if err := c.Send(b); err != nil {
 					c.Close()
 				}
-			}})
+			}}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -88,10 +87,9 @@ func TestConcurrentBackpressuredEcho(t *testing.T) {
 func TestStopRefusesNewConnections(t *testing.T) {
 	for _, pollers := range []int{0, 2} {
 		config := DefaultConfig()
-		config.Addr = "127.0.0.1:0"
 		config.IOPollers = pollers > 0
 		config.IOPollerCount = pollers
-		engine, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) { _, _ = c.Write(b) }})
+		engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{Data: func(c *Connection, b []byte) { _, _ = c.Write(b) }}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -126,8 +124,7 @@ func TestStopRefusesNewConnections(t *testing.T) {
 func TestOnCloseReportsPeerEOF(t *testing.T) {
 	closed := make(chan error, 1)
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, HandlerFuncs{Close: func(_ *Connection, err error) { closed <- err }})
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{Close: func(_ *Connection, err error) { closed <- err }}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,13 +170,12 @@ func TestReadsDeferredWhileOutputQueued(t *testing.T) {
 			second := make(chan []byte, 1)
 			closed := make(chan error, 1)
 			config := DefaultConfig()
-			config.Addr = "127.0.0.1:0"
 			// Disable the watermark so epoll keeps EPOLLIN registered and only
 			// the process ordering stands between queued output and a read.
 			config.WriteBufferHighWatermark = -1
 			var first sync.Once
 			var sender atomic.Pointer[Connection]
-			server, err := Bind(config, HandlerFuncs{
+			server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{
 				Data: func(c *Connection, data []byte) {
 					started := false
 					first.Do(func() {
@@ -201,7 +197,7 @@ func TestReadsDeferredWhileOutputQueued(t *testing.T) {
 					}
 				},
 				Close: func(_ *Connection, err error) { closed <- err },
-			})
+			}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -285,11 +281,10 @@ func TestReadsContinueBelowWatermark(t *testing.T) {
 	payload := bytes.Repeat([]byte{0xCD}, 8*1024*1024)
 	second := make(chan []byte, 1)
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	config.WriteBufferHighWatermark = 4 * len(payload)
 	var first sync.Once
 	var sender atomic.Pointer[Connection]
-	server, err := Bind(config, HandlerFuncs{
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{
 		Data: func(c *Connection, data []byte) {
 			started := false
 			first.Do(func() {
@@ -306,7 +301,7 @@ func TestReadsContinueBelowWatermark(t *testing.T) {
 				second <- append([]byte(nil), data...)
 			}
 		},
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,12 +361,11 @@ func TestReadsContinueBelowWatermark(t *testing.T) {
 func TestConcurrentAcceptBurst(t *testing.T) {
 	const burst = 256
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{Data: func(c *Connection, b []byte) {
 		if err := c.Send(b); err != nil {
 			c.Close()
 		}
-	}})
+	}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,24 +419,22 @@ func TestConcurrentAcceptBurst(t *testing.T) {
 // inline pool, whether it would build it or is handed one.
 func TestEngineRefusesInlinePool(t *testing.T) {
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	config.SetTaskPoolMode(taskpool.ModeInline)
-	if server, err := Bind(config, nil); !errors.Is(err, errInlinePool) {
+	if server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}}); !errors.Is(err, errInlinePool) {
 		if server != nil {
 			_ = server.Close()
 		}
-		t.Fatalf("Bind with ModeInline: %v, want errInlinePool", err)
+		t.Fatalf("New with ModeInline: %v, want errInlinePool", err)
 	}
 	config = DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	pool := taskpool.NewInline("refused-inline")
 	defer pool.Stop()
 	config.SetTaskPool(pool)
-	if server, err := Bind(config, nil); !errors.Is(err, errInlinePool) {
+	if server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}}); !errors.Is(err, errInlinePool) {
 		if server != nil {
 			_ = server.Close()
 		}
-		t.Fatalf("Bind with an inline TaskPool: %v, want errInlinePool", err)
+		t.Fatalf("New with an inline TaskPool: %v, want errInlinePool", err)
 	}
 }
 
@@ -453,16 +445,17 @@ func TestEngineRefusesInlinePool(t *testing.T) {
 func TestMultipleListenersShareOneEngine(t *testing.T) {
 	const listeners = 4
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:9999" // ignored once Addrs is set
-	config.Addrs = make([]string, listeners)
-	for i := range config.Addrs {
-		config.Addrs[i] = "127.0.0.1:0"
+	// Addr is ignored once Addrs is set.
+	binding := Binding{Addr: "127.0.0.1:9999", Addrs: make([]string, listeners)}
+	for i := range binding.Addrs {
+		binding.Addrs[i] = "127.0.0.1:0"
 	}
-	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+	binding.Handler = HandlerFuncs{Data: func(c *Connection, b []byte) {
 		if err := c.Send(b); err != nil {
 			c.Close()
 		}
-	}})
+	}}
+	server, err := New(config, binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -558,12 +551,11 @@ func TestListenAddressFormsMatchNetListen(t *testing.T) {
 
 			config := DefaultConfig()
 			config.Network = tc.network
-			config.Addr = tc.addr
-			server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+			server, err := New(config, Binding{Addr: tc.addr, Handler: HandlerFuncs{Data: func(c *Connection, b []byte) {
 				if err := c.Send(b); err != nil {
 					c.Close()
 				}
-			}})
+			}}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -622,15 +614,14 @@ func TestListenAddressFormsMatchNetListen(t *testing.T) {
 func TestListenRejectsUnknownNetwork(t *testing.T) {
 	config := DefaultConfig()
 	config.Network = "unixgram"
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, HandlerFuncs{})
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err == nil {
 		server.Close()
-		t.Fatal("Bind accepted network \"unixgram\", want an error")
+		t.Fatal("New accepted network \"unixgram\", want an error")
 	}
 	var unknown net.UnknownNetworkError
 	if !errors.As(err, &unknown) {
-		t.Fatalf("Bind error = %v, want net.UnknownNetworkError", err)
+		t.Fatalf("New error = %v, want net.UnknownNetworkError", err)
 	}
 }
 
@@ -658,15 +649,14 @@ func TestCustomTaskPoolRunsConnectionsAndOutlivesEngine(t *testing.T) {
 	pool := &countingPool{TaskPool: taskpool.NewWithMode("test", taskpool.ModeElastic, 4, 64)}
 	defer pool.Stop()
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	// Invalid for the built-in pool, and ignored once a pool is supplied.
 	config.WorkerCount = 0
 	config.SetTaskPool(pool)
-	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{Data: func(c *Connection, b []byte) {
 		if err := c.Send(b); err != nil {
 			c.Close()
 		}
-	}})
+	}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -781,8 +771,7 @@ func startUnixServer(t *testing.T, path string, handler Handler) *Engine {
 	t.Helper()
 	config := DefaultConfig()
 	config.Network = "unix"
-	config.Addr = path
-	server, err := Bind(config, handler)
+	server, err := New(config, Binding{Addr: path, Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -806,15 +795,14 @@ func TestUnixSocketEcho(t *testing.T) {
 	var remote sync.Map
 	config := DefaultConfig()
 	config.Network = "unix"
-	config.Addr = path
-	server, err := Bind(config, HandlerFuncs{
+	server, err := New(config, Binding{Addr: path, Handler: HandlerFuncs{
 		Open: func(c *Connection) { remote.Store(c, c.RemoteAddr()) },
 		Data: func(c *Connection, b []byte) {
 			if c.Send(b) != nil {
 				c.Close()
 			}
 		},
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -880,16 +868,15 @@ func TestUnixSocketEcho(t *testing.T) {
 // than taking the path from whatever owns it.
 func TestUnixSocketPathInUse(t *testing.T) {
 	path := unixSocketPath(t)
-	startUnixServer(t, path, nil)
+	startUnixServer(t, path, HandlerFuncs{})
 	config := DefaultConfig()
 	config.Network = "unix"
-	config.Addr = path
-	if second, err := Bind(config, nil); err == nil {
+	if second, err := New(config, Binding{Addr: path, Handler: HandlerFuncs{}}); err == nil {
 		second.Close()
 		t.Fatal("a second engine bound a path already in use")
 	}
 	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("the failed Bind removed the first engine's socket: %v", err)
+		t.Fatalf("the failed New removed the first engine's socket: %v", err)
 	}
 }
 
@@ -898,7 +885,7 @@ func TestUnixSocketPathInUse(t *testing.T) {
 func TestDialUnix(t *testing.T) {
 	path := unixSocketPath(t)
 	startUnixServer(t, path, echoHandler())
-	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{})
 
 	received := make(chan []byte, 16)
 	handler := HandlerFuncs{Data: func(_ *Connection, b []byte) { received <- append([]byte(nil), b...) }}
@@ -993,7 +980,8 @@ func TestDialedConnectionsEcho(t *testing.T) {
 	opened := map[*Connection]bool{}
 	received := map[*Connection][]byte{}
 	echoed := make(chan *Connection, conns)
-	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{
+	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{})
+	handler := HandlerFuncs{
 		Open: func(c *Connection) {
 			mu.Lock()
 			opened[c] = true
@@ -1008,11 +996,11 @@ func TestDialedConnectionsEcho(t *testing.T) {
 				echoed <- c
 			}
 		},
-	})
+	}
 
 	results := make(chan dialResult, conns)
 	for i := 0; i < conns; i++ {
-		err := client.Dial("tcp4", serverAddr, 5*time.Second, func(c *Connection, err error) {
+		err := client.DialWithHandler("tcp4", serverAddr, 5*time.Second, handler, func(c *Connection, err error) {
 			if err == nil {
 				mu.Lock()
 				if !opened[c] {
@@ -1053,7 +1041,7 @@ func TestDialedConnectionsEcho(t *testing.T) {
 func TestDialResolvesHostName(t *testing.T) {
 	_, serverAddr := startEchoServer(t, DefaultConfig(), echoHandler())
 	_, port, _ := net.SplitHostPort(serverAddr)
-	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{})
 	results := make(chan dialResult, 1)
 	if err := client.Dial("tcp4", net.JoinHostPort("localhost", port), 5*time.Second, func(c *Connection, err error) {
 		results <- dialResult{c, err}
@@ -1085,12 +1073,13 @@ func TestDialRefusedReportsError(t *testing.T) {
 	var handlerCalls int
 	var mu sync.Mutex
 	count := func(*Connection) { mu.Lock(); handlerCalls++; mu.Unlock() }
-	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{
+	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{})
+	handler := HandlerFuncs{
 		Open:  count,
 		Close: func(c *Connection, _ error) { count(c) },
-	})
+	}
 	results := make(chan dialResult, 1)
-	if err := client.Dial("tcp4", addr, 5*time.Second, func(c *Connection, err error) {
+	if err := client.DialWithHandler("tcp4", addr, 5*time.Second, handler, func(c *Connection, err error) {
 		results <- dialResult{c, err}
 	}); err != nil {
 		t.Fatal(err)
@@ -1116,7 +1105,7 @@ func TestDialRefusedReportsError(t *testing.T) {
 const blackholeAddr = "192.0.2.1:81"
 
 func TestDialTimeout(t *testing.T) {
-	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{})
 	results := make(chan dialResult, 1)
 	start := time.Now()
 	if err := client.Dial("tcp4", blackholeAddr, 200*time.Millisecond, func(c *Connection, err error) {
@@ -1141,8 +1130,7 @@ func TestDialTimeout(t *testing.T) {
 // its dialer waiting forever.
 func TestCloseFailsPendingDial(t *testing.T) {
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	client, err := Bind(config, nil)
+	client, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1179,7 +1167,7 @@ func TestCloseFailsPendingDial(t *testing.T) {
 }
 
 func TestDialRejectsWhatCannotStart(t *testing.T) {
-	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{})
 	never := func(*Connection, error) { t.Error("done called for a dial that could not start") }
 	for _, tc := range []struct{ network, addr string }{
 		{"unixgram", "127.0.0.1:80"},
@@ -1194,8 +1182,7 @@ func TestDialRejectsWhatCannotStart(t *testing.T) {
 	}
 
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	closed, err := Bind(config, nil)
+	closed, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1208,16 +1195,11 @@ func TestDialRejectsWhatCannotStart(t *testing.T) {
 	}
 }
 
-// A dialed connection with a handler of its own gets every callback there, and
-// the engine's handler hears nothing of it. An engine made by NewEngine has no
-// listener at all.
+// A dialed connection with a handler of its own gets every callback there. An
+// engine New is given no bindings has no listener at all.
 func TestDialWithHandlerOnListenerlessEngine(t *testing.T) {
 	_, addr := startEchoServer(t, DefaultConfig(), echoHandler())
-	var engineCalls atomic.Int64
-	client, err := NewEngine(DefaultConfig(), HandlerFuncs{
-		Open: func(*Connection) { engineCalls.Add(1) },
-		Data: func(*Connection, []byte) { engineCalls.Add(1) },
-	})
+	client, err := New(DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1261,9 +1243,6 @@ func TestDialWithHandlerOnListenerlessEngine(t *testing.T) {
 		t.Fatal("no echo reached the dial's own handler")
 	}
 	<-opened
-	if n := engineCalls.Load(); n != 0 {
-		t.Fatalf("the engine's handler was called %d times for a connection dialed with its own", n)
-	}
 }
 
 // closeWatcher reports the error each connection closed with.
@@ -1617,9 +1596,8 @@ func TestRemoteAddrPort(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/pollers=%v", tc.name, pollers), func(t *testing.T) {
 				got := make(chan [2]string, 1)
 				config := DefaultConfig()
-				config.Addr = tc.listen
 				config.IOPollers, config.IOPollerCount = pollers, 2
-				server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, _ []byte) {
+				server, err := New(config, Binding{Addr: tc.listen, Handler: HandlerFuncs{Data: func(c *Connection, _ []byte) {
 					remote := ""
 					if addr := c.RemoteAddr(); addr != nil {
 						remote = addr.String()
@@ -1628,7 +1606,7 @@ func TestRemoteAddrPort(t *testing.T) {
 					case got <- [2]string{c.RemoteAddrPort().String(), remote}:
 					default:
 					}
-				}})
+				}}})
 				if err != nil {
 					t.Skipf("listen %s: %v", tc.listen, err)
 				}

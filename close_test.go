@@ -79,8 +79,7 @@ func TestCloseReleasesAtOnceWhenIdle(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := DefaultConfig()
-	config.Addr = addr
-	again, err := Bind(config, shutdownEcho())
+	again, err := New(config, Binding{Addr: addr, Handler: shutdownEcho()})
 	if err != nil {
 		t.Fatalf("the port is still held after Close: %v", err)
 	}

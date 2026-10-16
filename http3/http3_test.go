@@ -49,9 +49,7 @@ func startServerOn(t testing.TB, fc fib.Config, config Config, handler fibhttp.H
 		t.Fatal(err)
 	}
 	config.TLSConfig = serverTLS
-	fc.Network = "udp"
-	fc.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(fc, NewHandlerWithConfig(config, handler))
+	engine, err := fib.New(fc, fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: NewHandlerWithConfig(config, handler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +67,7 @@ func newClient(t testing.TB, configure func(*ClientConfig)) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

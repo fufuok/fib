@@ -228,6 +228,30 @@ func (e *Engine) registerDatagram(fd int, _ uint64) error {
 // unregister does nothing: closing a descriptor removes its kevents.
 func (e *Engine) unregister(int) {}
 
+// watchListener has the loop wait on a TCP or Unix listener for the
+// connections it takes.
+func (e *Engine) watchListener(l streamListener) error {
+	change := [1]syscall.Kevent_t{newKevent(l.fd, syscall.EVFILT_READ, syscall.EV_ADD|syscall.EV_CLEAR)}
+	_, err := syscall.Kevent(e.kq, change[:], nil, nil)
+	return err
+}
+
+// watchUDP has the loop read a UDP socket's datagrams, level-triggered; see
+// openBackend.
+func (e *Engine) watchUDP(fd int) error {
+	change := [1]syscall.Kevent_t{newKevent(fd, syscall.EVFILT_READ, syscall.EV_ADD)}
+	_, err := syscall.Kevent(e.kq, change[:], nil, nil)
+	return err
+}
+
+// unwatch has the loop stop waiting on a listener or a UDP socket. Closing
+// it would remove its kevent too, but the engine's socket its pollers share
+// stays open while the others wait on it.
+func (e *Engine) unwatch(fd int) {
+	change := [1]syscall.Kevent_t{newKevent(fd, syscall.EVFILT_READ, syscall.EV_DELETE)}
+	_, _ = syscall.Kevent(e.kq, change[:], nil, nil)
+}
+
 // pausesInPlace says reads pause by the connection's readPaused flag alone,
 // as with epoll: the read filter, which clears on delivery, stays added.
 const pausesInPlace = true

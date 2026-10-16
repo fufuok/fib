@@ -59,7 +59,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
   `HoldReads` gives read-side flow control.
 - **Pools**: an adaptive worker pool that grows and shrinks with load, and a size-classed buffer
   pool aligned to the Go allocator's size classes.
-- **Many protocols, one engine**: `Config.Bindings` gives each group of addresses, TCP, Unix or
+- **Many protocols, one engine**: each `Binding` passed to `fib.New` gives a group of addresses, TCP, Unix or
   UDP, a handler of its own, so one engine serves HTTP, HTTPS, HTTP/3, WebSocket, gRPC and raw TCP
   side by side on shared loops, pools and buffers. Package `mux` goes further and serves several
   protocols on one port, told apart by the first bytes each client sends.
@@ -102,9 +102,10 @@ func main() {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
 	})
 
-	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:8080"
-	engine, err := fib.Bind(config, fibhttp.NewHandler(middleware.Chain(app, recover.New(), logger.New())))
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
+		Addr:    "127.0.0.1:8080",
+		Handler: fibhttp.NewHandler(middleware.Chain(app, recover.New(), logger.New())),
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -117,9 +118,9 @@ func main() {
 
 This one handler serves HTTP/1.x and h2c on the same port.
 
-- **TLS**: bind `fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(app))`
+- **TLS**: serve the binding with `fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(app))`
   instead. HTTP/2 is then negotiated over ALPN.
-- **HTTP/3**: bind a UDP engine (`config.Network = "udp"`) to `http3.NewHandler(tlsConfig, app)`,
+- **HTTP/3**: add a UDP binding (`fib.Binding{Network: "udp", ...}`) served by `http3.NewHandler(tlsConfig, app)`,
   with the same `app`.
 
 ### Standard library `http.Handler`
@@ -138,7 +139,7 @@ mux.Handle("/files/", stdhttp.StripPrefix("/files/", stdhttp.FileServer(stdhttp.
 std := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 	mux.ServeHTTP(c, c.Request) // c is the http.ResponseWriter
 })
-engine, err := fib.Bind(config, fibhttp.NewHandler(std))
+engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(std)})
 ```
 
 Any `http.Handler` can be served this way, including chi, gorilla/mux and gin's `*gin.Engine`,
@@ -178,7 +179,7 @@ r.Route("/users", func(r *fibhttp.Router) {
 	r.Get("/{id}/files/*", file) // c.Param("*") is the rest of the path
 })
 r.Mount("/api/{version}", apiRouter)
-engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(r)})
 ```
 
 Routes match in this order: static text first, then a parameter with a regexp, then a plain
@@ -212,7 +213,7 @@ app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 ```
 
 To serve only WebSocket, bind the WebSocket handler directly:
-`fib.Bind(config, websocket.NewHandlerWithConfig(cfg, handlers))`.
+`fib.New(config, fib.Binding{Addr: ":8080", Handler: websocket.NewHandlerWithConfig(cfg, handlers)})`.
 
 To send one message to many connections, prepare it once:
 
@@ -236,7 +237,7 @@ such peers yourself.
 ```go
 server := arpc.NewServer()
 server.Handler.Handle("/echo", func(ctx *arpc.Context) { ctx.Write(ctx.Body()) })
-engine, err := fib.Bind(config, server) // or fibtls.NewServer(tlsConfig, server)
+engine, err := fib.New(config, fib.Binding{Addr: ":9000", Handler: server}) // or fibtls.NewServer(tlsConfig, server)
 
 client, err := arpc.Dial(clientEngine, "tcp", addr, 3*time.Second, nil)
 var rsp string
@@ -252,7 +253,7 @@ read, or `Handler.SetTaskPool` names another pool.
 ```go
 server := grpc.NewServer()                    // grpc.TaskPool(pool) to run calls on your own pool
 pb.RegisterGreeterServer(server, &greeter{})  // protoc-gen-go-grpc code, imports pointed at fib/grpc
-engine, err := fib.Bind(config, server)       // h2c; fibtls.NewServer(grpc.ConfigureTLS(c), server) for TLS
+engine, err := fib.New(config, fib.Binding{Addr: ":50051", Handler: server}) // h2c; fibtls.NewServer(grpc.ConfigureTLS(c), server) for TLS
 
 conn, err := grpc.NewClient("127.0.0.1:50051", grpc.WithEngine(clientEngine))
 reply, err := pb.NewGreeterClient(conn).SayHello(ctx, &pb.HelloRequest{Name: "fib"})
@@ -271,7 +272,7 @@ To serve gRPC on the same port as HTTP, route the service's paths to the server.
 r := fibhttp.NewRouter()
 r.Handle("/helloworld.Greeter/*", server)
 r.Get("/", index)
-engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(r)})
 ```
 
 Each message a call sends goes out as it is sent, paced by the stream's flow control, so server
@@ -283,11 +284,10 @@ arriving rather than once it has arrived whole.
 
 ```go
 server := socks.NewServer(socks.Config{Authenticate: check}) // nil Authenticate: no login
-config.Bindings = []fib.Binding{
-	{Addr: ":1080", Handler: server},
-	{Network: "udp", Addr: ":1080", Handler: server}, // UDP ASSOCIATE
-}
-engine, err := fib.Bind(config, nil) // or mux.Route{Match: mux.SOCKS(), Handler: server} on a shared port
+engine, err := fib.New(config,
+	fib.Binding{Addr: ":1080", Handler: server},
+	fib.Binding{Network: "udp", Addr: ":1080", Handler: server}, // UDP ASSOCIATE
+) // or mux.Route{Match: mux.SOCKS(), Handler: server} on a shared port
 
 proxy, err := socks.ParseURL("socks5h://user:pass@127.0.0.1:1080")
 clientConfig := fibhttp.DefaultClientConfig()
@@ -308,42 +308,39 @@ An HTTP handler accepts a CONNECT with `Context.Connect`, over HTTP/1.x, HTTP/2 
 
 ```go
 proxy := fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{Authenticate: check})
-engine, err := fib.Bind(config, mux.New(
+engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: mux.New(
 	mux.Route{Match: mux.SOCKS(), Handler: socks.NewServer(socks.Config{Authenticate: check})},
 	mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(proxy)}, // curl -x http://host:port
-))
+)})
 ```
 
 ### Raw TCP
 
 ```go
-config := fib.DefaultConfig()
-config.Addr = "127.0.0.1:9000"
-engine, err := fib.Bind(config, fib.HandlerFuncs{
+engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:9000", Handler: fib.HandlerFuncs{
 	Data: func(c *fib.Connection, data []byte) { // data is only valid during the call
 		if c.Send(data) != nil {
 			c.Close()
 		}
 	},
-})
+}})
 ```
 
 ### Several protocols on one engine
 
 Each `Binding` is one address, or a group of them, on a network of its own, served by a handler
-of its own. A binding with no handler takes the one `Bind` was given.
+of its own, which every binding names; `fib.New` with no bindings makes a client engine that only
+dials.
 
 ```go
-config := fib.DefaultConfig()
-config.Bindings = []fib.Binding{
-	{Addr: ":80"}, // plain HTTP, the handler passed to Bind
-	{Addrs: []string{":443", ":8443"}, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
-	{Network: "udp", Addr: ":443", Handler: http3.NewHandler(tlsConfig, web)},
-	{Addr: ":8081", Handler: websocket.NewHandler(wsHandler)},
-	{Addr: ":9000", Handler: grpcServer},
-	{Network: "unix", Addr: "/run/app.sock", Handler: admin},
-}
-engine, err := fib.Bind(config, fibhttp.NewHandler(web))
+engine, err := fib.New(fib.DefaultConfig(),
+	fib.Binding{Addr: ":80", Handler: fibhttp.NewHandler(web)}, // plain HTTP
+	fib.Binding{Addrs: []string{":443", ":8443"}, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
+	fib.Binding{Network: "udp", Addr: ":443", Handler: http3.NewHandler(tlsConfig, web)},
+	fib.Binding{Addr: ":8081", Handler: websocket.NewHandler(wsHandler)},
+	fib.Binding{Addr: ":9000", Handler: grpcServer},
+	fib.Binding{Network: "unix", Addr: "/run/app.sock", Handler: admin},
+)
 addrs, err := engine.BindingAddrs(2) // where binding 2 listens, ports chosen for ":0" included
 ```
 
@@ -351,17 +348,30 @@ Every binding shares the engine's event loops, descriptor table, task pool and b
 its settings: backlog, buffers, watermarks, `IOPollers` and `ReusePort` apply to all of them.
 Binding fails as a whole: if one address cannot be taken, none is kept.
 
+Bindings can also come and go while the engine runs. `AddBinding` listens on a binding more and
+returns its index; `RemoveBinding` closes its listeners and leaves the connections they took open
+(a UDP binding's peers close with its socket); `ShutdownBinding` drains it the way `Shutdown`
+drains the whole engine, telling its connections to finish, with `Connection.ShuttingDown` true
+for them alone, and closing what is left once its context is done:
+
+```go
+i, err := engine.AddBinding(fib.Binding{Addr: ":8082", Handler: fibhttp.NewHandler(canary)})
+// ...
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+err = engine.ShutdownBinding(ctx, i) // the other bindings keep serving
+```
+
 Several protocols can also share one port. `mux` looks at the first bytes a client sends, picks
 the route that recognises them, and hands the connection over with `Connection.SetHandler`, after
 which the engine calls the chosen handler directly:
 
 ```go
-config.Addr = ":8000"
-engine, err := fib.Bind(config, mux.NewWithConfig(mux.Config{Fallback: rawEcho},
+engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: mux.NewWithConfig(mux.Config{Fallback: rawEcho},
 	mux.Route{Match: mux.TLS(), Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
 	mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(web)}, // HTTP/1.x and h2c
 	mux.Route{Match: mux.Prefix("PING"), Handler: pinger},
-))
+)})
 ```
 
 Only protocols whose client speaks first can be sniffed; one where the server greets first, such as
@@ -373,7 +383,7 @@ WebSocket handshake apart from other HTTP/1.x, the first HTTP/2 headers to set g
 h2c (sending the server's SETTINGS to clients that wait for them, as grpc-go's do):
 
 ```go
-engine, err := fib.Bind(config, multiproto.New(multiproto.Config{
+engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: multiproto.New(multiproto.Config{
 	TLS:       fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), web),
 	HTTP1:     web, // fibhttp.NewHandler(...)
 	HTTP2:     web,
@@ -382,7 +392,7 @@ engine, err := fib.Bind(config, multiproto.New(multiproto.Config{
 	SOCKS:     socks.NewServer(socks.Config{}),
 	HTTPProxy: fibhttp.NewHandler(fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{})), // CONNECT, absolute URLs
 	ARPC:      arpcServer,
-}))
+})})
 ```
 
 ### Examples

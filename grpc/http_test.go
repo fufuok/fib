@@ -284,7 +284,7 @@ func TestServeHTTPOverTLS(t *testing.T) {
 func BenchmarkServeHTTPUnary(b *testing.B) {
 	t := &testing.T{}
 	addr := startHandler(t, fibhttp.NewHandler(httpRouter(&echoImpl{})))
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		b.Fatal(err)
 	}

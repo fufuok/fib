@@ -209,10 +209,7 @@ func startScriptServer(t *testing.T, configure func(*quic.Config)) (*scriptServe
 	if configure != nil {
 		configure(&qconfig)
 	}
-	config := fib.DefaultConfig()
-	config.Network = "udp"
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, &scriptServerHandler{server: server, config: qconfig})
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: &scriptServerHandler{server: server, config: qconfig}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -88,6 +89,9 @@ type udpListenerPlatform struct {
 	fromLen int32
 	flags   uint32
 	closed  bool
+	// posted says a receive is outstanding on the socket, which keeps a
+	// closed one on its engine's retired list; see detachBinding.
+	posted bool
 }
 
 // acceptOp is one outstanding AcceptEx: the socket it will hand over, and the
@@ -116,13 +120,24 @@ type winListener struct {
 	// accepts holds the listener's AcceptEx operations. The kernel keeps only
 	// their addresses, which the garbage collector does not see, so without
 	// this reference an operation could be freed and its memory reused while
-	// its AcceptEx is still pending.
+	// its AcceptEx is still pending. pending counts those still posted.
 	accepts []*acceptOp
+	pending int
 }
 
 type enginePlatform struct {
-	port      syscall.Handle
+	port syscall.Handle
+	// listenMu guards the lists of listeners and UDP sockets, which the loop
+	// changes as bindings come and go and other goroutines read addresses
+	// from.
+	listenMu  sync.Mutex
 	listeners []*winListener
+	// retired and retiredUDP hold the sockets of removed bindings whose
+	// operations, cancelled by their closing, have yet to complete, which
+	// keeps the memory the kernel writes into reachable until they have.
+	// Event-loop ownership.
+	retired    []*winListener
+	retiredUDP []*udpListener
 	// conns holds every connection the engine owns, open or not. The kernel
 	// writes into a connection's OVERLAPPED structures until each operation it
 	// holds completes, so a closed connection stays here, and therefore stays
@@ -218,26 +233,40 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 	// binding that fails leaves nothing outstanding to wait for.
 	for i, b := range bindings {
 		for _, addr := range b.Addrs {
-			if err := e.openListener(config, b, i, addr); err != nil {
+			l, u, err := e.openListener(config, b, i, addr)
+			if err != nil {
 				e.abandon()
 				return err
 			}
+			if u != nil {
+				e.udpListeners = append(e.udpListeners, u)
+			} else {
+				e.listeners = append(e.listeners, l)
+			}
 		}
 	}
-	for _, l := range e.listeners {
+	if err := e.postListening(e.listeners, e.udpListeners); err != nil {
+		e.abandon()
+		return err
+	}
+	return nil
+}
+
+// postListening posts the operations that take connections and datagrams
+// on listeners and UDP sockets just opened. Callers own the loop's state.
+func (e *Engine) postListening(listeners []*winListener, udpListeners []*udpListener) error {
+	for _, l := range listeners {
 		for i := 0; i < acceptsPerListener; i++ {
 			op := &acceptOp{listener: l}
 			op.kind = opAccept
 			l.accepts = append(l.accepts, op)
 			if err := e.postAccept(op); err != nil {
-				e.abandon()
 				return err
 			}
 		}
 	}
-	for _, l := range e.udpListeners {
+	for _, l := range udpListeners {
 		if err := e.postRecvFrom(l); err != nil {
-			e.abandon()
 			return err
 		}
 	}
@@ -245,8 +274,9 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 }
 
 // openListener opens the socket of one of binding b's addresses, the i-th
-// binding, and associates it with the completion port.
-func (e *Engine) openListener(config Config, b Binding, i int, addr string) error {
+// binding, and associates it with the completion port: a TCP or Unix
+// listener, or, for a UDP binding, a UDP socket.
+func (e *Engine) openListener(config Config, b Binding, i int, addr string) (*winListener, *udpListener, error) {
 	if netaddr.IsUDP(b.Network) {
 		l, err := createUDPListener(b.Network, addr)
 		if err == nil {
@@ -255,11 +285,10 @@ func (e *Engine) openListener(config Config, b Binding, i int, addr string) erro
 			}
 		}
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		l.network, l.handler, l.binding = b.Network, b.Handler, i
-		e.udpListeners = append(e.udpListeners, l)
-		return nil
+		return nil, l, nil
 	}
 	l, err := createListener(config, b.Network, addr)
 	if err == nil {
@@ -268,12 +297,11 @@ func (e *Engine) openListener(config Config, b Binding, i int, addr string) erro
 		}
 	}
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	l.handler, l.binding = b.Handler, i
-	e.listeners = append(e.listeners, l)
-	e.noteUnixPath(b.Network, addr)
-	return nil
+	e.noteUnixPath(b.Network, addr, i)
+	return l, nil, nil
 }
 
 func createUDPListener(network, addr string) (*udpListener, error) {
@@ -317,6 +345,7 @@ func (e *Engine) postRecvFrom(l *udpListener) error {
 		err = syscall.WSARecvFrom(l.fd, &bufs[0], 1, &n, &l.flags, &l.from, &l.fromLen, &l.op.ov, nil)
 		if err == nil || err == syscall.ERROR_IO_PENDING {
 			e.udpRecvs++
+			l.posted = true
 			return nil
 		}
 		if err != sys.WSAEMSGSIZE && err != sys.WSAECONNRESET {
@@ -330,7 +359,12 @@ func (e *Engine) postRecvFrom(l *udpListener) error {
 // for a new peer, and posts the next receive.
 func (e *Engine) completeRecvFrom(l *udpListener, n int, err error) *Connection {
 	e.udpRecvs--
-	if l.closed || e.stopping.Load() {
+	l.posted = false
+	if l.closed {
+		e.retiredUDP = forget(e.retiredUDP, l)
+		return nil
+	}
+	if e.stopping.Load() {
 		return nil
 	}
 	var ready *Connection
@@ -397,7 +431,7 @@ func (c *Connection) armDatagramReadLocked() error {
 	return nil
 }
 
-// abandon tears down a Bind that failed after its AcceptEx calls went out.
+// abandon tears down a New that failed after its AcceptEx calls went out.
 func (e *Engine) abandon() {
 	e.stopping.Store(true)
 	for _, l := range e.listeners {
@@ -463,6 +497,7 @@ func (e *Engine) postAccept(op *acceptOp) error {
 		return err
 	}
 	e.accepts++
+	op.listener.pending++
 	return nil
 }
 
@@ -474,9 +509,8 @@ func (e *Engine) ListenAddrs() ([]net.Addr, error) {
 	return e.listenAddrsOf(-1)
 }
 
-// BindingAddrs returns the addresses of Config.Bindings[i], in the order the
-// binding lists them, as ListenAddrs reports them. An engine bound without
-// Bindings has the one binding, 0, that Network and Addr or Addrs make.
+// BindingAddrs returns the addresses of the i-th binding, as New and
+// AddBinding number them, in the order the binding lists them, as ListenAddrs reports them.
 func (e *Engine) BindingAddrs(i int) ([]net.Addr, error) {
 	if i < 0 {
 		return nil, errNoBinding
@@ -491,6 +525,8 @@ func (e *Engine) BindingAddrs(i int) ([]net.Addr, error) {
 // listenAddrsOf returns the addresses of binding's listeners, or of every
 // listener for a binding below zero.
 func (e *Engine) listenAddrsOf(binding int) ([]net.Addr, error) {
+	e.listenMu.Lock()
+	defer e.listenMu.Unlock()
 	addrs := make([]net.Addr, 0, len(e.listeners)+len(e.udpListeners))
 	for _, l := range e.listeners {
 		if binding < 0 || l.binding == binding {
@@ -514,6 +550,8 @@ func (e *Engine) listenAddrsOf(binding int) ([]net.Addr, error) {
 // leaving out the Unix ones, which ListenAddrs reports. Ports left at zero
 // report the port the kernel chose.
 func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
+	e.listenMu.Lock()
+	defer e.listenMu.Unlock()
 	addrs := make([]*net.TCPAddr, 0, len(e.listeners))
 	for _, l := range e.listeners {
 		if l.family == syscall.AF_UNIX {
@@ -540,15 +578,19 @@ func (e *Engine) beginShutdown() { e.draining.Store(true) }
 // stop taking connections, if they have yet to, each open connection is told
 // the engine is shutting down, and the answer is how many of those Shutdown
 // waits for remain. Callers run on the event loop.
-func (e *Engine) shutdownConnections() int {
-	_ = e.closeListeners()
+// With a binding of zero or more, the round is ShutdownBinding's, over the
+// connections that binding took, whose listeners it has closed itself.
+func (e *Engine) shutdownConnections(binding int) int {
+	if binding < 0 {
+		_ = e.closeListeners()
+	}
 	n := 0
 	for c := range e.conns {
-		if shutdownConnection(c) {
+		if c.inBinding(binding) && shutdownConnection(c) {
 			n++
 		}
 	}
-	return n + e.shutdownUDPPeers()
+	return n + e.shutdownUDPPeers(binding)
 }
 
 // closeListeners closes the TCP listeners, which stops them taking
@@ -570,6 +612,7 @@ func (e *Engine) closeListeners() error {
 
 func (e *Engine) Run() error {
 	e.logRun()
+	e.claimLoop()
 	// A client connecting once the engine stops is refused rather than left
 	// in a backlog nothing accepts from.
 	defer e.closeListeners()
@@ -636,9 +679,13 @@ func (e *Engine) complete(entry *sys.OverlappedEntry) *Connection {
 
 func (e *Engine) completeAccept(op *acceptOp, err error) {
 	e.accepts--
+	l := op.listener
+	if l.pending--; l.closed && l.pending == 0 {
+		e.retired = forget(e.retired, l)
+	}
 	s := op.socket
 	op.socket = syscall.InvalidHandle
-	if e.stopping.Load() || op.listener.closed {
+	if e.stopping.Load() || l.closed {
 		// A connection that arrives while the engine shuts down is refused
 		// rather than opened into a loop that no longer runs.
 		syscall.Closesocket(s)
@@ -681,7 +728,7 @@ func (e *Engine) adopt(l *winListener, s syscall.Handle) error {
 		// back until the peer's delayed ACK.
 		_ = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 	}
-	c := &Connection{engine: e, handler: l.handler}
+	c := &Connection{engine: e, handler: l.handler, bindingID: int32(l.binding + 1)}
 	c.flags.set(flagUnix, l.family == syscall.AF_UNIX)
 	c.handle.Store(uintptr(s))
 	c.readOp = ioOp{kind: opRead, conn: c}
@@ -849,6 +896,9 @@ func (e *Engine) Close() error {
 	e.closeOnce.Do(func() {
 		e.Stop()
 		e.stopUDPSweeper()
+		// Whatever a binding opens or closes from here on is Close's to
+		// release, through the loop's queue.
+		e.claimLoop()
 		for c := range e.conns {
 			e.cutConnection(c)
 		}
@@ -1422,6 +1472,8 @@ func (e *Engine) drainWake() {
 // acceptPlacements says the engine's one loop accepts and serves every
 // connection, which Config.AcceptPlacement has no say in.
 func (e *Engine) acceptPlacements() (string, bool) {
+	e.listenMu.Lock()
+	defer e.listenMu.Unlock()
 	if len(e.listeners) == 0 {
 		return "", false
 	}

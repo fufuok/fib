@@ -203,7 +203,7 @@ func TestClientSendsEarlyData(t *testing.T) {
 			server := NewServer(serverConfig, newEarlyEcho())
 			server.EarlyData = tc.serverEarly
 			_, addr := startEchoServer(t, fib.DefaultConfig(), server)
-			engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+			engine, err := fib.New(fib.DefaultConfig())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -278,7 +278,7 @@ func TestClientEarlyDataToOpenSSL(t *testing.T) {
 	t.Cleanup(func() { _ = stdin.Close(); _ = cmd.Process.Kill(); _ = cmd.Wait() })
 	time.Sleep(500 * time.Millisecond)
 
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

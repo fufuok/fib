@@ -438,7 +438,7 @@ func dialH3WireWith(t *testing.T, engine *fib.Engine, base string, config quic.C
 // newH3ClientEngine starts an engine for raw QUIC clients to dial from.
 func newH3ClientEngine(t *testing.T) *fib.Engine {
 	t.Helper()
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

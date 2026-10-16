@@ -72,15 +72,13 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 		return nil
 	}
 	server := socks.NewServer(config)
-	engineConfig := fib.DefaultConfig()
-	engineConfig.Bindings = []fib.Binding{
-		{Addr: *addr, Handler: mux.New(
+	engine, err := fib.New(fib.DefaultConfig(),
+		fib.Binding{Addr: *addr, Handler: mux.New(
 			mux.Route{Match: mux.SOCKS(), Handler: server},
 			mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(fibhttp.NewConnectProxy(connect))},
 		)},
-		{Network: "udp", Addr: *addr, Handler: server},
-	}
-	engine, err := fib.Bind(engineConfig, nil)
+		fib.Binding{Network: "udp", Addr: *addr, Handler: server},
+	)
 	if err != nil {
 		return err
 	}

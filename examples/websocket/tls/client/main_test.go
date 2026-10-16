@@ -32,12 +32,11 @@ func serveEcho(t *testing.T) (string, string) {
 	t.Helper()
 	serverTLS, _, certFile := uploadtest.TLS(t)
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	wsConfig := websocket.DefaultConfig()
 	wsConfig.EnableCompression = true
-	engine, err := fib.Bind(config, fibtls.NewServer(serverTLS, websocket.NewHandlerWithConfig(wsConfig, websocket.HandlerFuncs{
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: fibtls.NewServer(serverTLS, websocket.NewHandlerWithConfig(wsConfig, websocket.HandlerFuncs{
 		Message: func(c *websocket.Connection, opcode websocket.Opcode, data []byte) { _ = c.WriteMessage(opcode, data) },
-	})))
+	}))})
 	if err != nil {
 		t.Fatal(err)
 	}

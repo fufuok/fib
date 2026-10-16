@@ -186,7 +186,7 @@ func newLab(t *testing.T, options labOptions) *lab {
 	t.Cleanup(gateway.Close)
 
 	// The clients dial through an engine of their own.
-	clientEngine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	clientEngine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

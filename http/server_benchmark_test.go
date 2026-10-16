@@ -113,8 +113,7 @@ func benchmarkServerHandler(b *testing.B, config Config, request []byte, handler
 func startBenchServer(b *testing.B, httpConfig Config, handler Handler) (stop func(), addr string) {
 	b.Helper()
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, NewHandlerWithConfig(httpConfig, handler))
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: NewHandlerWithConfig(httpConfig, handler)})
 	if err != nil {
 		b.Fatal(err)
 	}

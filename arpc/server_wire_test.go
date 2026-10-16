@@ -190,17 +190,14 @@ func TestServerStopOnOwnEngine(t *testing.T) {
 func TestServeErrors(t *testing.T) {
 	config := fib.DefaultConfig()
 	config.Network = "bogus"
-	config.Addr = "127.0.0.1:0"
-	if err := NewServer().Serve(config); err == nil {
+	if err := NewServer().Serve(config, "127.0.0.1:0"); err == nil {
 		t.Fatal("Serve on a bogus network succeeded")
 	}
 
 	s := NewServer()
 	served := make(chan error, 1)
 	go func() {
-		config := fib.DefaultConfig()
-		config.Addr = "127.0.0.1:0"
-		served <- s.Serve(config)
+		served <- s.Serve(fib.DefaultConfig(), "127.0.0.1:0")
 	}()
 	waitArpc(t, "Serve to make its engine", func() bool { return s.Engine() != nil })
 	ctx, cancel := context.WithCancel(context.Background())

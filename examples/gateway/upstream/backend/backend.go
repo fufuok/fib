@@ -45,18 +45,16 @@ func NewEnginesFor(handler fibhttp.Handler, tlsConfig *tls.Config, addr, plainAd
 	httpConfig := fibhttp.DefaultConfig()
 	httpConfig.MaxBodyBytes = 256 << 20
 	tcpConfig := fib.DefaultConfig()
-	tcpConfig.Addr = addr
-	tcp, err := fib.Bind(tcpConfig, fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandlerWithConfig(httpConfig, handler)))
+	tcp, err := fib.New(tcpConfig, fib.Binding{Addr: addr, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandlerWithConfig(httpConfig, handler))})
 	if err != nil {
 		return nil, err
 	}
 	udpConfig := fib.DefaultConfig()
 	udpConfig.Network = "udp"
-	udpConfig.Addr = samePort(addr, tcp)
 	h3Config := http3.DefaultConfig()
 	h3Config.TLSConfig = tlsConfig
 	h3Config.MaxBodyBytes = 256 << 20
-	udp, err := fib.Bind(udpConfig, http3.NewHandlerWithConfig(h3Config, handler))
+	udp, err := fib.New(udpConfig, fib.Binding{Addr: samePort(addr, tcp), Handler: http3.NewHandlerWithConfig(h3Config, handler)})
 	if err != nil {
 		_ = tcp.Close()
 		return nil, err
@@ -64,8 +62,7 @@ func NewEnginesFor(handler fibhttp.Handler, tlsConfig *tls.Config, addr, plainAd
 	engines := []*fib.Engine{tcp, udp}
 	if plainAddr != "" {
 		plainConfig := fib.DefaultConfig()
-		plainConfig.Addr = plainAddr
-		plain, err := fib.Bind(plainConfig, fibhttp.NewHandlerWithConfig(httpConfig, handler))
+		plain, err := fib.New(plainConfig, fib.Binding{Addr: plainAddr, Handler: fibhttp.NewHandlerWithConfig(httpConfig, handler)})
 		if err != nil {
 			_ = udp.Close()
 			_ = tcp.Close()

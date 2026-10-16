@@ -19,8 +19,7 @@ import (
 func TestRunUploadsAFile(t *testing.T) {
 	dir := t.TempDir()
 	engineConfig := fib.DefaultConfig()
-	engineConfig.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(engineConfig, fibhttp.NewHandlerWithConfig(service.Config(0), service.Handler(dir)))
+	engine, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: fibhttp.NewHandlerWithConfig(service.Config(0), service.Handler(dir))})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -206,7 +206,7 @@ func covConnHeld(s string) [][]byte {
 // Dial with a nil Config takes the server name from the address, which the
 // test certificate's issuer, not being trusted by the system, fails; one
 // without a port, a Unix socket's path, is taken whole; and a nil handler
-// means the engine's.
+// means the engine's, which does nothing.
 func TestCovConnDialDefaults(t *testing.T) {
 	serverConfig, clientConfig := tlsConfigs(t)
 	t.Run("nil config", func(t *testing.T) {
@@ -229,8 +229,7 @@ func TestCovConnDialDefaults(t *testing.T) {
 		defer os.RemoveAll(dir)
 		path := filepath.Join(dir, "s.sock")
 		config := fib.DefaultConfig()
-		config.Network, config.Addr = "unix", path
-		server, err := fib.Bind(config, NewServer(serverConfig, echoHandler()))
+		server, err := fib.New(config, fib.Binding{Network: "unix", Addr: path, Handler: NewServer(serverConfig, echoHandler())})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -255,9 +254,11 @@ func TestCovConnDialDefaults(t *testing.T) {
 		}
 	})
 	t.Run("engine handler", func(t *testing.T) {
-		_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, echoHandler()))
+		// The engine's handler does nothing, so it is the server that hears
+		// the connection it serves.
 		h := newCovConnRecorder()
-		client, _ := startEchoServer(t, fib.DefaultConfig(), h)
+		_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, h))
+		client, _ := startEchoServer(t, fib.DefaultConfig(), nil)
 		err := Dial(client, "tcp", addr, 5*time.Second, clientConfig, nil, func(c *fib.Connection, err error) {
 			if err == nil {
 				_ = c.Send([]byte("engine's"))
@@ -268,7 +269,7 @@ func TestCovConnDialDefaults(t *testing.T) {
 		}
 		h.waitData(t, "engine's")
 		if _, _, n, _ := h.snapshot(); n != 1 {
-			t.Fatalf("OnHandshake ran %d times on the engine's handler", n)
+			t.Fatalf("OnHandshake ran %d times on the server's handler", n)
 		}
 	})
 }

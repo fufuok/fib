@@ -43,9 +43,8 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 
 	config := fib.DefaultConfig()
 	config.Network = "udp"
-	config.Addr = *addr
 	config.UDPIdleTimeout = *idle
-	engine, err := fib.Bind(config, fib.HandlerFuncs{
+	engine, err := fib.New(config, fib.Binding{Addr: *addr, Handler: fib.HandlerFuncs{
 		// Every peer address is a connection of its own: OnOpen runs on its
 		// first datagram and OnClose once it has been idle too long.
 		Open: func(c *fib.Connection) { fmt.Fprintf(out, "peer %s: open\n", c.RemoteAddr()) },
@@ -56,7 +55,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 			}
 		},
 		Close: func(c *fib.Connection, err error) { fmt.Fprintf(out, "peer %s: closed: %v\n", c.RemoteAddr(), err) },
-	})
+	}})
 	if err != nil {
 		return err
 	}

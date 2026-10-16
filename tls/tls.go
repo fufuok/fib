@@ -144,7 +144,7 @@ type Handler struct {
 }
 
 // NewServer returns a handler that serves TLS with config in front of
-// handler, for fib.Bind.
+// handler, for a fib.Binding.
 func NewServer(config *stdtls.Config, handler fib.Handler) *Handler {
 	return &Handler{Config: config, Handler: handler}
 }
@@ -159,9 +159,9 @@ func NewClient(config *stdtls.Config, handler fib.Handler) *Handler {
 
 // Dial is engine.DialWithHandler over TLS. When config names no server, the
 // host in addr is used, as crypto/tls.Dial does, or the whole of a unix
-// address. A nil handler means the
-// engine's. done runs once the connect completes, as it does for
-// fib.Engine.Dial; the handshake follows, and what done sends waits for it.
+// address. A nil handler means the engine's, which does nothing. done runs
+// once the connect completes, as it does for fib.Engine.Dial; the handshake
+// follows, and what done sends waits for it.
 func Dial(engine *fib.Engine, network, addr string, timeout time.Duration, config *stdtls.Config,
 	handler fib.Handler, done func(*fib.Connection, error)) error {
 	return DialWithOptions(engine, network, addr, timeout, config, DialOptions{}, handler, done)

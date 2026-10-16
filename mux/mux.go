@@ -4,14 +4,12 @@
 // if it had accepted it itself:
 //
 //	tlsHandler := fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))
-//	config := fib.DefaultConfig()
-//	config.Addr = ":8000"
-//	engine, err := fib.Bind(config, mux.New(
+//	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: ":8000", Handler: mux.New(
 //		mux.Route{Match: mux.TLS(), Handler: tlsHandler},
 //		mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(web)}, // HTTP/1.x and h2c
 //		mux.Route{Match: mux.SOCKS(), Handler: socks.NewServer(socks.Config{})},
 //		mux.Route{Match: mux.Prefix("PING"), Handler: pinger},
-//	))
+//	)})
 //
 // The handoff goes through fib.Connection.SetHandler, so once a connection's
 // protocol is known the mux is out of its way: the engine calls the chosen

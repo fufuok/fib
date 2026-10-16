@@ -11,9 +11,9 @@ import (
 )
 
 // Server serves arpc on the connections an engine accepts, each one a Client
-// sharing the Server's Codec and Handler. It is the fib.Handler to Bind:
+// sharing the Server's Codec and Handler. It is the fib.Handler of a binding:
 //
-//	engine, err := fib.Bind(config, server)
+//	engine, err := fib.New(config, fib.Binding{Addr: ":8888", Handler: server})
 //
 // or, for TLS, tls.NewServer(tlsConfig, server). Run and Serve make the
 // engine themselves.
@@ -104,15 +104,14 @@ func (s *Server) CurrLoad() int64 { return s.currLoad.Load() }
 
 // Run serves addr over TCP, on an engine of fib.DefaultConfig, until Stop.
 func (s *Server) Run(addr string) error {
-	config := fib.DefaultConfig()
-	config.Addr = addr
-	return s.Serve(config)
+	return s.Serve(fib.DefaultConfig(), addr)
 }
 
-// Serve binds an engine of config to the Server and runs it until Stop, after
-// which it closes the engine and returns.
-func (s *Server) Serve(config fib.Config) error {
-	engine, err := fib.Bind(config, s)
+// Serve makes an engine of config listening on addr, on config.Network, and
+// serving the Server, and runs it until Stop, after which it closes the
+// engine and returns.
+func (s *Server) Serve(config fib.Config, addr string) error {
+	engine, err := fib.New(config, fib.Binding{Addr: addr, Handler: s})
 	if err != nil {
 		return err
 	}

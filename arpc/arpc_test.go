@@ -37,9 +37,7 @@ func startServer(t *testing.T, s *Server) string {
 // startHandler runs handler on an engine listening on a loopback port.
 func startHandler(t *testing.T, handler fib.Handler) string {
 	t.Helper()
-	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, handler)
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +58,7 @@ func startHandler(t *testing.T, handler fib.Handler) string {
 // startClientEngine runs an engine with no listener, for dialing.
 func startClientEngine(t *testing.T) *fib.Engine {
 	t.Helper()
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -627,9 +625,7 @@ func TestReconnect(t *testing.T) {
 
 func TestReconnectGivesUp(t *testing.T) {
 	s := NewServer()
-	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, s)
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:0", Handler: s})
 	if err != nil {
 		t.Fatal(err)
 	}

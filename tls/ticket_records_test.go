@@ -63,7 +63,7 @@ func TestTicketLongerThanRecord(t *testing.T) {
 	chain := longClientChain(t, 2*maxPlaintext)
 	clientConfig.GetClientCertificate = func(*stdtls.CertificateRequestInfo) (*stdtls.Certificate, error) { return chain, nil }
 
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

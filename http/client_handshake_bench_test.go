@@ -33,7 +33,7 @@ func benchTLSServer(b *testing.B) (*httptest.Server, *stdtls.Config) {
 
 func benchEngine(b *testing.B) *fib.Engine {
 	b.Helper()
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		b.Fatal(err)
 	}

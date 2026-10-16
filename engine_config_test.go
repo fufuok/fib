@@ -22,12 +22,11 @@ import (
 // reads nothing or pauses at once.
 func TestBindFillsInZeroSizes(t *testing.T) {
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	config.MaxEvents = 0
 	config.ReadBufferSize = 0
 	config.WriteBufferHighWatermark = 0
 	config.Backlog = 0
-	e, err := Bind(config, nil)
+	e, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,16 +43,14 @@ func TestBindFillsInZeroSizes(t *testing.T) {
 // refused when the engine is made.
 func TestBindRefusesAnUnusablePool(t *testing.T) {
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	config.WorkerCount = 0
-	if e, err := Bind(config, nil); err == nil {
+	if e, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}}); err == nil {
 		e.Close()
 		t.Error("an engine with no workers was made")
 	}
 	config = DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	config.TaskPoolMode = taskpool.Mode(99)
-	if e, err := Bind(config, nil); err == nil {
+	if e, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}}); err == nil {
 		e.Close()
 		t.Error("an engine with an invalid pool mode was made")
 	}
@@ -126,7 +123,7 @@ func TestLogStatusLogsTheEngine(t *testing.T) {
 	config.Name = "logged"
 	config.LogStatus = true
 	server, addr := startEchoServer(t, config, echoHandler())
-	client, err := NewEngine(config, nil)
+	client, err := New(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,10 +176,10 @@ func TestConnectionsThePoolRefusesAreClosed(t *testing.T) {
 func TestUnixListenerHandsConnectionsToPollers(t *testing.T) {
 	config := DefaultConfig()
 	config.Network = "unix"
-	config.Addr = unixSocketPath(t)
 	config.IOPollers = true
 	config.IOPollerCount = 2
-	server, err := Bind(config, echoHandler())
+	path := unixSocketPath(t)
+	server, err := New(config, Binding{Addr: path, Handler: echoHandler()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +191,7 @@ func TestUnixListenerHandsConnectionsToPollers(t *testing.T) {
 		server.Close()
 	}()
 	for i := range 4 {
-		conn, err := net.Dial("unix", config.Addr)
+		conn, err := net.Dial("unix", path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -241,9 +238,10 @@ func TestUDPConnectionAddressesAndSends(t *testing.T) {
 		_ = c.Send(b)
 	}})
 	got := make(chan string, 16)
-	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{Data: func(_ *Connection, b []byte) { got <- string(b) }})
+	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{})
+	handler := HandlerFuncs{Data: func(_ *Connection, b []byte) { got <- string(b) }}
 	dialed := make(chan *Connection, 1)
-	if err := client.Dial("udp", addr.String(), 5*time.Second, func(c *Connection, err error) {
+	if err := client.DialWithHandler("udp", addr.String(), 5*time.Second, handler, func(c *Connection, err error) {
 		if err != nil {
 			t.Error(err)
 		}

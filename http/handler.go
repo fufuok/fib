@@ -305,11 +305,12 @@ func (c *Context) closeAfterResponse() {
 	closeAfterResponse(c.Conn, c.lingers || stream != nil && stream.unfinished())
 }
 
-// draining reports whether the HTTP/1 connection's engine is shutting down,
-// in which case the response closes the connection, as net/http's do once
-// Shutdown has begun, rather than keep it for a request it would not wait
-// for; see fib.Engine.Shutdown.
-func (c *Context) draining() bool { return c.Conn != nil && c.Conn.Engine().ShuttingDown() }
+// draining reports whether the HTTP/1 connection is to finish, its engine
+// shutting down or its binding drained, in which case the response closes
+// the connection, as net/http's do once Shutdown has begun, rather than keep
+// it for a request it would not wait for; see fib.Engine.Shutdown and
+// fib.Engine.ShutdownBinding.
+func (c *Context) draining() bool { return c.Conn != nil && c.Conn.ShuttingDown() }
 
 func (c *Context) Respond(status int, contentType string, body []byte) error {
 	if contentType == "" {

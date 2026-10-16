@@ -19,8 +19,7 @@ func TestServerHandlerKeepAliveAndClose(t *testing.T) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.URL.Path))
 	}))
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, handler)
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,8 +87,7 @@ func TestServerHandlerSetsRemoteAddr(t *testing.T) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.RemoteAddr))
 	}))
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, handler)
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}

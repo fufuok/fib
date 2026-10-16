@@ -67,8 +67,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	greeter.RegisterGreeterServer(s, server{})
 
 	config := fib.DefaultConfig()
-	config.Addr = *addr
-	engine, err := fib.Bind(config, s)
+	engine, err := fib.New(config, fib.Binding{Addr: *addr, Handler: s})
 	if err != nil {
 		return err
 	}

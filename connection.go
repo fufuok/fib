@@ -86,6 +86,10 @@ type Connection struct {
 	deadlines *connectionDeadlines
 	// flags holds the connFlag bits, which are read without the mutex.
 	flags connFlags
+	// bindingID is the index of the Binding that took the connection, plus
+	// one, so that zero, a dialed connection's, names none; it never
+	// changes. It sits beside flags, in what would be padding.
+	bindingID int32
 	// pendingEvents is the readiness, in the ev bits, that the connection's
 	// next round is to act on. Guarded by mu.
 	pendingEvents uint16
@@ -132,6 +136,12 @@ type Connection struct {
 	// peer is the address the connection was accepted from, when accepting
 	// it told; see RemoteAddrPort.
 	peer packedAddrPort
+}
+
+// inBinding reports whether the binding-th binding took c, or, for a binding
+// below zero, whether any did.
+func (c *Connection) inBinding(binding int) bool {
+	return binding < 0 || int(c.bindingID)-1 == binding
 }
 
 // The ev bits have to fit pendingEvents.

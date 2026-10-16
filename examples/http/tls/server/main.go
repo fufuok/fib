@@ -55,11 +55,10 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 		return err
 	}
 	config := fib.DefaultConfig()
-	config.Addr = *addr
 	// The HTTP handler is the same one the plain server uses: fibtls.NewServer
 	// decrypts in front of it and encrypts what it sends. ConfigureTLS offers
 	// h2 through ALPN; the handler serves HTTP/2 and HTTP/1.1 alike.
-	engine, err := fib.Bind(config, fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(echo())))
+	engine, err := fib.New(config, fib.Binding{Addr: *addr, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(echo()))})
 	if err != nil {
 		return err
 	}

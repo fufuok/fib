@@ -29,7 +29,7 @@ import (
 // startClientEngine runs an engine with no listener, for clients only.
 func startClientEngine(t *testing.T) *fib.Engine {
 	t.Helper()
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,8 +49,7 @@ func startClientEngine(t *testing.T) *fib.Engine {
 func startWebSocketServer(t testing.TB, config Config, handler Handler) string {
 	t.Helper()
 	engineConfig := fib.DefaultConfig()
-	engineConfig.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(engineConfig, NewHandlerWithConfig(config, handler))
+	server, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: NewHandlerWithConfig(config, handler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,11 +169,10 @@ func TestClientEchoesOverTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	engineConfig := fib.DefaultConfig()
-	engineConfig.Addr = "127.0.0.1:0"
 	serverConfig := DefaultConfig()
 	serverConfig.EnableCompression = true
-	server, err := fib.Bind(engineConfig, fibtls.NewServer(serverTLS,
-		NewHandlerWithConfig(serverConfig, echoServerHandler())))
+	server, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: fibtls.NewServer(serverTLS,
+		NewHandlerWithConfig(serverConfig, echoServerHandler()))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,8 +548,7 @@ func TestClientEchoesOverTLS13(t *testing.T) {
 	}
 	clientTLS.MinVersion = tls.VersionTLS13
 	engineConfig := fib.DefaultConfig()
-	engineConfig.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(engineConfig, fibtls.NewServer(serverTLS, NewHandler(echoServerHandler())))
+	server, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: fibtls.NewServer(serverTLS, NewHandler(echoServerHandler()))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,8 +589,7 @@ func TestClientEchoesOverTLSEitherHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	engineConfig := fib.DefaultConfig()
-	engineConfig.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(engineConfig, fibtls.NewServer(serverTLS, NewHandler(echoServerHandler())))
+	server, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: fibtls.NewServer(serverTLS, NewHandler(echoServerHandler()))})
 	if err != nil {
 		t.Fatal(err)
 	}

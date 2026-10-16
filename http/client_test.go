@@ -27,7 +27,7 @@ import (
 // startClientEngine runs an engine with no listener, for clients only.
 func startClientEngine(t *testing.T) *fib.Engine {
 	t.Helper()
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,8 +386,7 @@ func TestClientHTTPSToTLSServer(t *testing.T) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", append([]byte(c.Request.URL.Path+" "), body...))
 	}))
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, fibtls.NewServer(serverConfig, handler))
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: fibtls.NewServer(serverConfig, handler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,10 +473,9 @@ func TestClientConcurrentRequestsRespectConnectionCap(t *testing.T) {
 // other's traffic.
 func TestClientSharesEngineWithServer(t *testing.T) {
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, NewHandler(HandlerFunc(func(c *Context) {
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: NewHandler(HandlerFunc(func(c *Context) {
 		_ = c.Respond(200, "text/plain", []byte("served "+c.Request.URL.Path))
-	})))
+	}))})
 	if err != nil {
 		t.Fatal(err)
 	}

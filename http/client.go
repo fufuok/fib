@@ -147,7 +147,7 @@ func DefaultClientConfig() ClientConfig {
 // through ALPN and HTTP/1.1 over TLS otherwise, and http:// speaks HTTP/1.1
 // unless ClientConfig.UnencryptedHTTP2 is set.
 //
-// The engine may be one made by fib.NewEngine for clients alone, or a server's
+// The engine may be one fib.New made for clients alone, with no bindings, or a server's
 // own engine: client connections carry their own handler, so the two never
 // see each other's traffic. The engine has to be running. Close the client
 // before closing the engine: closing the engine drops its connections without

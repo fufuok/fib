@@ -125,12 +125,11 @@ func proxyWith(t *testing.T, configure func(*fib.Config), config Config) (string
 	t.Helper()
 	server := NewServer(config)
 	engineConfig := fib.DefaultConfig()
-	engineConfig.Bindings = []fib.Binding{
-		{Addr: "127.0.0.1:0", Handler: server},
-		{Network: "udp", Addr: "127.0.0.1:0", Handler: server},
-	}
 	configure(&engineConfig)
-	engine := run(t, engineConfig, nil, true)
+	engine := run(t, engineConfig,
+		fib.Binding{Addr: "127.0.0.1:0", Handler: server},
+		fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: server},
+	)
 	addrs, err := engine.BindingAddrs(0)
 	if err != nil {
 		t.Fatal(err)
@@ -740,11 +739,10 @@ func TestServerShutdown(t *testing.T) {
 	server := NewServer(Config{})
 	config := fib.DefaultConfig()
 	config.Name = "socks-" + t.Name()
-	config.Bindings = []fib.Binding{
-		{Addr: "127.0.0.1:0", Handler: server},
-		{Network: "udp", Addr: "127.0.0.1:0", Handler: server},
-	}
-	engine, err := fib.Bind(config, nil)
+	engine, err := fib.New(config,
+		fib.Binding{Addr: "127.0.0.1:0", Handler: server},
+		fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: server},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,9 +781,7 @@ func TestServerShutdown(t *testing.T) {
 // A server bound to a Unix socket has no IP to bind or relay on.
 func TestServerOnAUnixSocket(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s")
-	config := fib.DefaultConfig()
-	config.Network, config.Addr = "unix", path
-	run(t, config, NewServer(Config{}), true)
+	run(t, fib.DefaultConfig(), fib.Binding{Network: "unix", Addr: path, Handler: NewServer(Config{})})
 	for _, cmd := range []byte{2, 3} {
 		conn, err := net.Dial("unix", path)
 		if err != nil {
@@ -816,12 +812,11 @@ func TestRelayAddrFamilies(t *testing.T) {
 	} {
 		server := NewServer(Config{})
 		config := fib.DefaultConfig()
-		config.Bindings = []fib.Binding{
-			{Addr: tc.tcp, Handler: server},
-			{Network: "udp", Addr: tc.udp, Handler: server},
-		}
 		config.Name = "socks-" + t.Name()
-		engine, err := fib.Bind(config, nil)
+		engine, err := fib.New(config,
+			fib.Binding{Addr: tc.tcp, Handler: server},
+			fib.Binding{Network: "udp", Addr: tc.udp, Handler: server},
+		)
 		if err != nil {
 			t.Logf("%s and %s: %v", tc.tcp, tc.udp, err)
 			continue

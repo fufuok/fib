@@ -33,12 +33,11 @@ func TestEngineLoopListensForPollers(t *testing.T) {
 				},
 				Data: prefixEcho("t:").(HandlerFuncs).Data,
 			}
-			config.Bindings = []Binding{
-				{Addr: "127.0.0.1:0", Handler: tcp},
-				{Network: "unix", Addr: unixSocketPath(t), Handler: prefixEcho("x:")},
-				{Network: "udp", Addr: "127.0.0.1:0", Handler: prefixEcho("u:")},
-			}
-			server, err := Bind(config, nil)
+			server, err := New(config,
+				Binding{Addr: "127.0.0.1:0", Handler: tcp},
+				Binding{Network: "unix", Addr: unixSocketPath(t), Handler: prefixEcho("x:")},
+				Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: prefixEcho("u:")},
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -89,17 +88,16 @@ func TestNoEngineLoopSharesUnixListener(t *testing.T) {
 	const pollers, conns = 3, 60
 	config := pollerConfig("no-engine-loop-unix", pollers)
 	config.Network = "unix"
-	config.Addr = unixSocketPath(t)
 	var mu sync.Mutex
 	served := map[*Engine]int{}
-	server, err := Bind(config, HandlerFuncs{
+	server, err := New(config, Binding{Addr: unixSocketPath(t), Handler: HandlerFuncs{
 		Open: func(c *Connection) {
 			mu.Lock()
 			served[c.engine]++
 			mu.Unlock()
 		},
 		Data: prefixEcho("x:").(HandlerFuncs).Data,
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,8 +147,7 @@ func TestNoEngineLoopSharesUnixListener(t *testing.T) {
 // from a poller.
 func TestNoEngineLoopShutdownAndDialFailure(t *testing.T) {
 	config := pollerConfig("no-engine-loop-shutdown", 2)
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, prefixEcho(""))
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: prefixEcho("")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,12 +204,11 @@ func TestNoEngineLoopPlacesAcceptedByDescriptor(t *testing.T) {
 	const pollers, conns = 3, 30
 	config := pollerConfig("no-engine-loop-fd", pollers)
 	config.Network = "unix"
-	config.Addr = unixSocketPath(t)
 	opened := make(chan *Connection, conns)
-	server, err := Bind(config, HandlerFuncs{
+	server, err := New(config, Binding{Addr: unixSocketPath(t), Handler: HandlerFuncs{
 		Open: func(c *Connection) { opened <- c },
 		Data: prefixEcho("").(HandlerFuncs).Data,
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,13 +234,12 @@ func TestNoEngineLoopPlacesAcceptedByDescriptor(t *testing.T) {
 func TestPollersKeepOwnAccepts(t *testing.T) {
 	const pollers, conns = 3, 30
 	config := pollerConfig("pollers-keep-own", pollers)
-	config.Addr = "127.0.0.1:0"
 	config.AcceptPlacement = AcceptKernelHash
 	accepted := make(chan *Connection, conns)
-	server, err := Bind(config, HandlerFuncs{
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{
 		Open: func(c *Connection) { accepted <- c },
 		Data: prefixEcho("").(HandlerFuncs).Data,
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,13 +274,12 @@ func TestPollersKeepOwnAccepts(t *testing.T) {
 func TestAcceptFDModuloOnOwnSockets(t *testing.T) {
 	const pollers, conns = 3, 30
 	config := pollerConfig("accept-fd-modulo", pollers)
-	config.Addr = "127.0.0.1:0"
 	config.AcceptPlacement = AcceptFDModulo
 	accepted := make(chan *Connection, conns)
-	server, err := Bind(config, HandlerFuncs{
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{
 		Open: func(c *Connection) { accepted <- c },
 		Data: prefixEcho("").(HandlerFuncs).Data,
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,9 +304,8 @@ func TestAcceptFDModuloOnOwnSockets(t *testing.T) {
 
 func TestAcceptPlacementInvalid(t *testing.T) {
 	config := pollerConfig("accept-invalid", 2)
-	config.Addr = "127.0.0.1:0"
 	config.AcceptPlacement = AcceptKernelHash + 1
-	if server, err := Bind(config, nil); err == nil {
+	if server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}}); err == nil {
 		server.Close()
 		t.Fatal("an unknown AcceptPlacement was accepted")
 	}
@@ -362,11 +355,10 @@ func TestAcceptPlacementLogged(t *testing.T) {
 			config.EngineLoop = tc.engineLoop
 			config.AcceptPlacement = tc.placement
 			config.LogStatus = tc.logStatus
-			config.Bindings = []Binding{
-				{Addr: "127.0.0.1:0"},
-				{Network: "unix", Addr: unixSocketPath(t)},
-			}
-			server, err := Bind(config, prefixEcho(""))
+			server, err := New(config,
+				Binding{Addr: "127.0.0.1:0", Handler: prefixEcho("")},
+				Binding{Network: "unix", Addr: unixSocketPath(t), Handler: prefixEcho("")},
+			)
 			if err != nil {
 				t.Fatal(err)
 			}

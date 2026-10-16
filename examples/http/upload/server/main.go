@@ -60,7 +60,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	if err != nil {
 		return err
 	}
-	// Bind has opened the listener, so there is an address to report.
+	// New has opened the listener, so there is an address to report.
 	local, _ := engine.LocalAddr()
 	running := make(chan error, 1)
 	go func() { running <- engine.Run() }()
@@ -82,6 +82,5 @@ func newEngine(addr, dir string, maxSize int64) (*fib.Engine, error) {
 		return nil, err
 	}
 	config := fib.DefaultConfig()
-	config.Addr = addr
-	return fib.Bind(config, fibhttp.NewHandlerWithConfig(service.Config(maxSize), service.Handler(dir)))
+	return fib.New(config, fib.Binding{Addr: addr, Handler: fibhttp.NewHandlerWithConfig(service.Config(maxSize), service.Handler(dir))})
 }

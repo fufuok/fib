@@ -273,8 +273,7 @@ func (f taskFunc) RunTask() { f() }
 // connections the closing engine ended without OnClose.
 func TestServeLifecycle(t *testing.T) {
 	config := fib.DefaultConfig()
-	config.Addr = "not an address"
-	if err := NewServer().Serve(config); err == nil {
+	if err := NewServer().Serve(config, "not an address"); err == nil {
 		t.Fatal("Serve of a bad address succeeded")
 	}
 
@@ -287,11 +286,11 @@ func TestServeLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config.Addr = ln.Addr().String()
+	addr := ln.Addr().String()
 	ln.Close()
 	served := make(chan error, 1)
-	go func() { served <- s.Serve(config) }()
-	cc, c := dial(t, config.Addr)
+	go func() { served <- s.Serve(config, addr) }()
+	cc, c := dial(t, addr)
 	ctx := testCtx(t)
 	if _, err := c.Unary(ctx, &Req{Msg: "x"}, WaitForReady(true)); err != nil {
 		t.Fatal(err)
@@ -552,7 +551,7 @@ func TestClientConnDialing(t *testing.T) {
 	// An engine that has stopped refuses every connect, at once. Such a call
 	// used to wait on a nil channel until its context ended, forever without
 	// a deadline, instead of failing Unavailable.
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

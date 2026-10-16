@@ -24,8 +24,7 @@ func TestRunUploadsOverHTTP2(t *testing.T) {
 	httpConfig := service.Config(0)
 	httpConfig.HTTP2Only = true
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandlerWithConfig(httpConfig, service.Handler(dir))))
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandlerWithConfig(httpConfig, service.Handler(dir)))})
 	if err != nil {
 		t.Fatal(err)
 	}

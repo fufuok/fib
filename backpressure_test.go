@@ -26,8 +26,7 @@ import (
 // plus a shutdown function that fails the test if the loop errored.
 func startEchoServer(t *testing.T, config Config, handler Handler) (*Engine, string) {
 	t.Helper()
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, handler)
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,8 +278,7 @@ func TestDrainedItemReturnsBufferToPool(t *testing.T) {
 func newOfflineServer(t *testing.T) *Engine {
 	t.Helper()
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, HandlerFuncs{})
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -627,13 +625,12 @@ func TestEngineServesOnAdaptivePool(t *testing.T) {
 func TestBindRejectsAdaptiveFloorAboveCeiling(t *testing.T) {
 	for _, floor := range []int{-1, 65} {
 		config := DefaultConfig()
-		config.Addr = "127.0.0.1:0"
 		config.SetTaskPoolMode(taskpool.ModeAdaptive)
 		config.SetPoolSizing(64, 0)
 		config.MinWorkerCount = floor
-		if server, err := Bind(config, nil); err == nil {
+		if server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}}); err == nil {
 			server.Close()
-			t.Fatalf("Bind accepted MinWorkerCount %d with WorkerCount 64", floor)
+			t.Fatalf("New accepted MinWorkerCount %d with WorkerCount 64", floor)
 		}
 	}
 }
@@ -741,17 +738,17 @@ func TestSocketSyscallsEcho(t *testing.T) {
 			t.Run(network+"/"+mode.name, func(t *testing.T) {
 				config := DefaultConfig()
 				config.Network = network
-				config.Addr = "127.0.0.1:0"
+				addr := "127.0.0.1:0"
 				if network == "unix" {
-					config.Addr = unixSocketPath(t)
+					addr = unixSocketPath(t)
 				}
 				config.UseWritev = mode.useWritev
 				config.SocketSyscalls = mode.socketSyscalls
-				server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+				server, err := New(config, Binding{Addr: addr, Handler: HandlerFuncs{Data: func(c *Connection, b []byte) {
 					if c.Send(b) != nil {
 						c.Close()
 					}
-				}})
+				}}})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -816,8 +813,7 @@ func startServer(t *testing.T, network, addr string, handler Handler) string {
 	t.Helper()
 	config := DefaultConfig()
 	config.Network = network
-	config.Addr = addr
-	server, err := Bind(config, handler)
+	server, err := New(config, Binding{Addr: addr, Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -967,8 +963,7 @@ func TestSendFileRejectsBadRangeAndDatagrams(t *testing.T) {
 func startUDPServer(t *testing.T, config Config, handler Handler) (*Engine, *net.UDPAddr) {
 	t.Helper()
 	config.Network = "udp"
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, handler)
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1068,10 +1063,9 @@ func TestUDPPeersAreSeparateConnections(t *testing.T) {
 func TestUDPPeersOverIPv6(t *testing.T) {
 	config := DefaultConfig()
 	config.Network = "udp6"
-	config.Addr = "[::1]:0"
-	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+	server, err := New(config, Binding{Addr: "[::1]:0", Handler: HandlerFuncs{Data: func(c *Connection, b []byte) {
 		_ = c.Send(append([]byte(c.RemoteAddr().String()+" "), b...))
-	}})
+	}}})
 	if err != nil {
 		t.Skipf("no IPv6 loopback: %v", err)
 	}
@@ -1149,7 +1143,7 @@ func TestUDPIdlePeerTimesOut(t *testing.T) {
 // parts into a single datagram.
 func TestDialUDP(t *testing.T) {
 	_, addr := startUDPServer(t, DefaultConfig(), echoHandler())
-	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{})
 	received := make(chan []byte, 8)
 	handler := HandlerFuncs{Data: func(_ *Connection, b []byte) { received <- append([]byte(nil), b...) }}
 	dialed := make(chan *Connection, 1)

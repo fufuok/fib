@@ -382,7 +382,7 @@ func cvH2cEngine(t *testing.T, readBuffer int) *fib.Engine {
 	t.Helper()
 	config := fib.DefaultConfig()
 	config.ReadBufferSize = readBuffer
-	engine, err := fib.NewEngine(config, nil)
+	engine, err := fib.New(config)
 	if err != nil {
 		t.Fatal(err)
 	}

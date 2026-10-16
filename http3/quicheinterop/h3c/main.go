@@ -39,7 +39,7 @@ func main() {
 	wantEarly := flag.Bool("want-early", false, "with -resume, require the requests after the first to go as 0-RTT data the server accepts")
 	flag.Parse()
 
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		panic(err)
 	}

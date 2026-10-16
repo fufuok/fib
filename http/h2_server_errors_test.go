@@ -334,11 +334,10 @@ func TestH2ServerWithoutRecycledHeaders(t *testing.T) {
 // and the buffer is let go of rather than kept with the connection.
 func TestH2ServerLargeRead(t *testing.T) {
 	engineConfig := fib.DefaultConfig()
-	engineConfig.Addr = "127.0.0.1:0"
 	engineConfig.ReadBufferSize = 512 << 10
-	server, err := fib.Bind(engineConfig, NewHandler(HandlerFunc(func(c *Context) {
+	server, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: NewHandler(HandlerFunc(func(c *Context) {
 		_ = c.Respond(200, "text/plain", []byte(strconv.Itoa(len(c.Body()))))
-	})))
+	}))})
 	if err != nil {
 		t.Fatal(err)
 	}

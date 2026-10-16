@@ -98,22 +98,19 @@ func newGatewayLab(t *testing.T) gatewayLab {
 	engines := bindPair(t, func(addr string) ([]*fib.Engine, error) {
 		handler, httpConfig := gateway.Handler(), gateway.HTTPConfig()
 		tcpConfig := fib.DefaultConfig()
-		tcpConfig.Addr = addr
-		tcp, err := fib.Bind(tcpConfig, fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandlerWithConfig(httpConfig, handler)))
+		tcp, err := fib.New(tcpConfig, fib.Binding{Addr: addr, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandlerWithConfig(httpConfig, handler))})
 		if err != nil {
 			return nil, err
 		}
 		udpConfig := fib.DefaultConfig()
 		udpConfig.Network = "udp"
-		udpConfig.Addr = example.Addr(tcp)
-		udp, err := fib.Bind(udpConfig, http3.NewHandlerWithConfig(gateway.HTTP3Config(serverTLS), handler))
+		udp, err := fib.New(udpConfig, fib.Binding{Addr: example.Addr(tcp), Handler: http3.NewHandlerWithConfig(gateway.HTTP3Config(serverTLS), handler)})
 		if err != nil {
 			_ = tcp.Close()
 			return nil, err
 		}
 		plainConfig := fib.DefaultConfig()
-		plainConfig.Addr = "127.0.0.1:0"
-		plain, err := fib.Bind(plainConfig, fibhttp.NewHandlerWithConfig(httpConfig, handler))
+		plain, err := fib.New(plainConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: fibhttp.NewHandlerWithConfig(httpConfig, handler)})
 		if err != nil {
 			_ = udp.Close()
 			_ = tcp.Close()
@@ -264,8 +261,7 @@ func misbehaving(c *fibhttp.Context) {
 func TestChecksCatchAMisbehavingGateway(t *testing.T) {
 	shortenTimeouts(t)
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, fibhttp.NewHandler(fibhttp.HandlerFunc(misbehaving)))
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: fibhttp.NewHandler(fibhttp.HandlerFunc(misbehaving))})
 	if err != nil {
 		t.Fatal(err)
 	}

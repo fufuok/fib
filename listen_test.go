@@ -17,10 +17,9 @@ import (
 func TestStopListeningRefusesConnections(t *testing.T) {
 	for _, pollers := range []int{0, 2} {
 		config := DefaultConfig()
-		config.Addr = "127.0.0.1:0"
 		config.IOPollers = pollers > 0
 		config.IOPollerCount = pollers
-		engine, err := Bind(config, HandlerFuncs{})
+		engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 		if err != nil {
 			t.Fatal(err)
 		}

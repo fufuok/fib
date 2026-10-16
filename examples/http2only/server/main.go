@@ -60,7 +60,6 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	handler := fibhttp.NewHandlerWithConfig(httpConfig, echo())
 
 	config := fib.DefaultConfig()
-	config.Addr = *addr
 
 	scheme, engine, err := "http", (*fib.Engine)(nil), error(nil)
 	if *useTLS {
@@ -69,9 +68,9 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 		if cfgErr != nil {
 			return cfgErr
 		}
-		engine, err = fib.Bind(config, fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), handler))
+		engine, err = fib.New(config, fib.Binding{Addr: *addr, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), handler)})
 	} else {
-		engine, err = fib.Bind(config, handler)
+		engine, err = fib.New(config, fib.Binding{Addr: *addr, Handler: handler})
 	}
 	if err != nil {
 		return err

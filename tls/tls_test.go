@@ -245,8 +245,7 @@ func TestOverUnixSocket(t *testing.T) {
 	path := filepath.Join(dir, "s.sock")
 	config := fib.DefaultConfig()
 	config.Network = "unix"
-	config.Addr = path
-	server, err := fib.Bind(config, NewServer(serverConfig, echoHandler()))
+	server, err := fib.New(config, fib.Binding{Addr: path, Handler: NewServer(serverConfig, echoHandler())})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,17 +399,25 @@ func TestReadStopsAtRecordEnds(t *testing.T) {
 }
 
 // startEchoServer runs an engine listening on a loopback port, or, with a nil
-// handler, one that only dials, and returns it with its address.
+// handler, one that only dials, and returns it with its address, empty for
+// one that only dials.
 func startEchoServer(t testing.TB, config fib.Config, handler fib.Handler) (*fib.Engine, string) {
 	t.Helper()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, handler)
+	var bindings []fib.Binding
+	if handler != nil {
+		bindings = append(bindings, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
+	}
+	engine, err := fib.New(config, bindings...)
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr, err := engine.LocalAddr()
-	if err != nil {
-		t.Fatal(err)
+	var addr string
+	if handler != nil {
+		local, err := engine.LocalAddr()
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr = local.String()
 	}
 	runDone := make(chan error, 1)
 	go func() { runDone <- engine.Run() }()
@@ -421,7 +428,7 @@ func startEchoServer(t testing.TB, config fib.Config, handler fib.Handler) (*fib
 		}
 		_ = engine.Close()
 	})
-	return engine, addr.String()
+	return engine, addr
 }
 
 func echoHandler() fib.Handler {

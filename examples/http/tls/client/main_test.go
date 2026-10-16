@@ -23,11 +23,10 @@ func serveEcho(t *testing.T) (string, string) {
 	t.Helper()
 	serverTLS, _, certFile := uploadtest.TLS(t)
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandler(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandler(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		body, _ := io.ReadAll(c.Request.Body)
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", body)
-	}))))
+	})))})
 	if err != nil {
 		t.Fatal(err)
 	}

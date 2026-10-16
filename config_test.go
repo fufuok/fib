@@ -331,16 +331,14 @@ func TestPollersRefuseAddressInUse(t *testing.T) {
 	defer held.Close()
 	config := pollerConfig("pollers-in-use", 2)
 	config.ReusePort = false
-	config.Addr = held.Addr().String()
-	if e, err := Bind(config, HandlerFuncs{}); err == nil {
+	if e, err := New(config, Binding{Addr: held.Addr().String(), Handler: HandlerFuncs{}}); err == nil {
 		e.Close()
-		t.Fatalf("bound %s, which a listener holds", config.Addr)
+		t.Fatalf("bound %s, which a listener holds", held.Addr())
 	} else if !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("bind error = %v, want EADDRINUSE", err)
 	}
 
-	config.Addr = "127.0.0.1:0"
-	first, err := Bind(config, HandlerFuncs{})
+	first, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,26 +347,23 @@ func TestPollersRefuseAddressInUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config.Addr = addr.String()
-	if e, err := Bind(config, HandlerFuncs{}); err == nil {
+	if e, err := New(config, Binding{Addr: addr.String(), Handler: HandlerFuncs{}}); err == nil {
 		e.Close()
-		t.Fatalf("a second engine bound %s", config.Addr)
+		t.Fatalf("a second engine bound %s", addr)
 	} else if !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("second bind error = %v, want EADDRINUSE", err)
 	}
 	// With ReusePort both ask to share it, and do.
 	config.ReusePort = true
-	config.Addr = "127.0.0.1:0"
-	a, err := Bind(config, HandlerFuncs{})
+	a, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer a.Close()
 	addr, _ = a.LocalAddr()
-	config.Addr = addr.String()
-	b, err := Bind(config, HandlerFuncs{})
+	b, err := New(config, Binding{Addr: addr.String(), Handler: HandlerFuncs{}})
 	if err != nil {
-		t.Fatalf("ReusePort engines could not share %s: %v", config.Addr, err)
+		t.Fatalf("ReusePort engines could not share %s: %v", addr, err)
 	}
 	b.Close()
 }
@@ -380,8 +375,7 @@ func TestReusePortLeavesUnixListenersOnEngine(t *testing.T) {
 	config.ReusePort = true
 	config.EngineLoop = true
 	config.Network = "unix"
-	config.Addr = filepath.Join(t.TempDir(), "fib.sock")
-	server, err := Bind(config, nil)
+	server, err := New(config, Binding{Addr: filepath.Join(t.TempDir(), "fib.sock"), Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -509,10 +503,9 @@ func TestPollersOnChosenPortsShareNone(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			config := DefaultConfig()
-			config.Addr = "127.0.0.1:0"
 			config.IOPollers, config.IOPollerCount = true, 8
 			reply := []byte(strconv.Itoa(i))
-			engine, err := Bind(config, HandlerFuncs{Data: func(c *Connection, _ []byte) { _ = c.Send(reply) }})
+			engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{Data: func(c *Connection, _ []byte) { _ = c.Send(reply) }}})
 			if err != nil {
 				t.Error(err)
 				return
@@ -562,9 +555,8 @@ func TestPollersOnChosenPortsShareNone(t *testing.T) {
 // let into a listener of a poller still waiting its turn to close.
 func TestCloseStopsListeningFirst(t *testing.T) {
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	config.IOPollers, config.IOPollerCount = true, 32
-	engine, err := Bind(config, HandlerFuncs{})
+	engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +650,7 @@ func TestUDPSendBatchSegments(t *testing.T) {
 			}
 			defer sink.Close()
 			_ = sink.SetReadBuffer(4 << 20)
-			engine, _ := startEchoServer(t, DefaultConfig(), nil)
+			engine, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{})
 			dialed := make(chan *Connection, 1)
 			if err := engine.Dial("udp", sink.LocalAddr().String(), 5*time.Second, func(c *Connection, err error) {
 				if err != nil {

@@ -67,7 +67,7 @@ func TestRunServesHTTP3AndHTTPS(t *testing.T) {
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(pem)
 
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

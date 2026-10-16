@@ -76,20 +76,18 @@ func bindingConfigs() map[string]Config {
 }
 
 // One engine serves every binding, each with its own handler: a lone TCP
-// address, a group of TCP addresses, a Unix socket that takes the handler Bind
-// was given, and a UDP address.
+// address, a group of TCP addresses, a Unix socket and a UDP address.
 func TestBindingsServeEachWithItsOwnHandler(t *testing.T) {
 	for name, config := range bindingConfigs() {
 		t.Run(name, func(t *testing.T) {
 			config.Name = "bindings-" + name
 			unixPath := unixSocketPath(t)
-			config.Bindings = []Binding{
-				{Addr: "127.0.0.1:0", Handler: prefixEcho("a:")},
-				{Network: "tcp4", Addrs: []string{"127.0.0.1:0", "127.0.0.1:0"}, Handler: prefixEcho("b:")},
-				{Network: "unix", Addr: unixPath},
-				{Network: "udp", Addr: "127.0.0.1:0", Handler: prefixEcho("u:")},
-			}
-			server, err := Bind(config, prefixEcho("d:"))
+			server, err := New(config,
+				Binding{Addr: "127.0.0.1:0", Handler: prefixEcho("a:")},
+				Binding{Network: "tcp4", Addrs: []string{"127.0.0.1:0", "127.0.0.1:0"}, Handler: prefixEcho("b:")},
+				Binding{Network: "unix", Addr: unixPath, Handler: prefixEcho("x:")},
+				Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: prefixEcho("u:")},
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -98,7 +96,7 @@ func TestBindingsServeEachWithItsOwnHandler(t *testing.T) {
 			want := []struct {
 				network, prefix string
 				addrs           int
-			}{{"tcp", "a:", 1}, {"tcp", "b:", 2}, {"unix", "d:", 1}, {"udp", "u:", 1}}
+			}{{"tcp", "a:", 1}, {"tcp", "b:", 2}, {"unix", "x:", 1}, {"udp", "u:", 1}}
 			total := 0
 			for i, w := range want {
 				addrs, err := server.BindingAddrs(i)
@@ -143,13 +141,12 @@ func TestBindingsServeEachWithItsOwnHandler(t *testing.T) {
 	}
 }
 
-// Without Bindings an engine has the one binding Network and Addr make, and a
-// binding that names no network takes Config.Network.
+// An engine given one binding has that binding alone, and a binding that
+// names no network takes Config.Network.
 func TestBindingDefaults(t *testing.T) {
 	config := DefaultConfig()
 	config.Name = "binding-defaults"
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, prefixEcho("x:"))
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: prefixEcho("x:")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,16 +159,13 @@ func TestBindingDefaults(t *testing.T) {
 		t.Fatalf("answered %q", got)
 	}
 	if _, err := server.BindingAddrs(1); err == nil {
-		t.Fatal("an engine without Bindings has a second binding")
+		t.Fatal("an engine given one binding has a second")
 	}
 
 	udp := DefaultConfig()
 	udp.Name = "binding-defaults-udp"
 	udp.Network = "udp"
-	// Addr is ignored once there are Bindings.
-	udp.Addr = "256.0.0.1:1"
-	udp.Bindings = []Binding{{Addr: "127.0.0.1:0"}}
-	server, err = Bind(udp, prefixEcho("y:"))
+	server, err = New(udp, Binding{Addr: "127.0.0.1:0", Handler: prefixEcho("y:")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +179,7 @@ func TestBindingDefaults(t *testing.T) {
 	}
 }
 
-// A binding that cannot listen fails Bind, and gives up what the bindings
+// A binding that cannot listen fails New, and gives up what the bindings
 // before it had opened.
 func TestBindingFailureReleasesTheRest(t *testing.T) {
 	busy, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -203,14 +197,13 @@ func TestBindingFailureReleasesTheRest(t *testing.T) {
 	for name, config := range bindingConfigs() {
 		t.Run(name, func(t *testing.T) {
 			config.Name = "binding-failure-" + name
-			config.Bindings = []Binding{
-				{Network: "tcp4", Addr: free},
-				{Network: "udp4", Addr: "127.0.0.1:0"},
-				{Network: "tcp4", Addr: busy.Addr().String()},
-			}
-			if server, err := Bind(config, nil); err == nil {
+			if server, err := New(config,
+				Binding{Network: "tcp4", Addr: free, Handler: HandlerFuncs{}},
+				Binding{Network: "udp4", Addr: "127.0.0.1:0", Handler: HandlerFuncs{}},
+				Binding{Network: "tcp4", Addr: busy.Addr().String(), Handler: HandlerFuncs{}},
+			); err == nil {
 				_ = server.Close()
-				t.Fatal("Bind took an address in use")
+				t.Fatal("New took an address in use")
 			}
 			l, err := net.Listen("tcp4", free)
 			if err != nil {
@@ -221,19 +214,19 @@ func TestBindingFailureReleasesTheRest(t *testing.T) {
 	}
 }
 
-// Bind keeps no hold on the caller's Bindings.
+// New keeps no hold on the caller's bindings.
 func TestBindingsAreCopied(t *testing.T) {
 	config := DefaultConfig()
 	config.Name = "bindings-copied"
 	addrs := []string{"127.0.0.1:0"}
-	config.Bindings = []Binding{{Addrs: addrs}}
-	server, err := Bind(config, prefixEcho("c:"))
+	bindings := []Binding{{Addrs: addrs, Handler: prefixEcho("c:")}}
+	server, err := New(config, bindings...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	runEngine(t, server)
 	addrs[0] = "changed"
-	config.Bindings[0].Handler = prefixEcho("changed:")
+	bindings[0].Handler = prefixEcho("changed:")
 	bound, err := server.BindingAddrs(0)
 	if err != nil {
 		t.Fatal(err)

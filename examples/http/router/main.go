@@ -74,8 +74,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	r.Mount("/api/{version}", api())
 
 	config := fib.DefaultConfig()
-	config.Addr = *addr
-	engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+	engine, err := fib.New(config, fib.Binding{Addr: *addr, Handler: fibhttp.NewHandler(r)})
 	if err != nil {
 		return err
 	}

@@ -109,11 +109,11 @@ type service struct {
 // Server is a gRPC server. It is a fib.Handler, serving HTTP/2 with prior
 // knowledge (h2c) on the connections of the engine it is bound to:
 //
-//	engine, err := fib.Bind(config, server)
+//	engine, err := fib.New(config, fib.Binding{Addr: ":50051", Handler: server})
 //
 // and gRPC over TLS wrapped in package tls, with ALPN offering h2:
 //
-//	engine, err := fib.Bind(config, fibtls.NewServer(grpc.ConfigureTLS(tlsConfig), server))
+//	engine, err := fib.New(config, fib.Binding{Addr: ":50051", Handler: fibtls.NewServer(grpc.ConfigureTLS(tlsConfig), server)})
 //
 // Serve and ServeTLS make the engine themselves.
 type Server struct {
@@ -249,17 +249,18 @@ func (s *Server) removeTransport(t *transport) {
 // GracefulStop has been called.
 var ErrServerStopped = errors.New("grpc: the server has been stopped")
 
-// Serve binds an engine of config, serving gRPC over h2c, and runs it until
-// Stop or GracefulStop, after which it closes the engine and returns.
-func (s *Server) Serve(config fib.Config) error { return s.serve(config, s) }
+// Serve makes an engine of config listening on addr, on config.Network,
+// serving gRPC over h2c, and runs it until Stop or GracefulStop, after which
+// it closes the engine and returns.
+func (s *Server) Serve(config fib.Config, addr string) error { return s.serve(config, addr, s) }
 
 // ServeTLS is Serve over TLS, with ALPN offering h2.
-func (s *Server) ServeTLS(config fib.Config, tlsConfig *stdtls.Config) error {
-	return s.serve(config, fibtls.NewServer(ConfigureTLS(tlsConfig), s))
+func (s *Server) ServeTLS(config fib.Config, addr string, tlsConfig *stdtls.Config) error {
+	return s.serve(config, addr, fibtls.NewServer(ConfigureTLS(tlsConfig), s))
 }
 
-func (s *Server) serve(config fib.Config, handler fib.Handler) error {
-	engine, err := fib.Bind(config, handler)
+func (s *Server) serve(config fib.Config, addr string, handler fib.Handler) error {
+	engine, err := fib.New(config, fib.Binding{Addr: addr, Handler: handler})
 	if err != nil {
 		return err
 	}

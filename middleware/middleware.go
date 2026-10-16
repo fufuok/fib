@@ -13,7 +13,7 @@
 //		compress.New(),
 //		etag.New(),
 //	)
-//	engine, err := fib.Bind(config, fibhttp.NewHandler(handler))
+//	engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(handler)})
 //
 // A middleware that changes the response a handler writes does so through
 // the hooks Context has — OnHeader, OnResponse and OnFinish — so that it

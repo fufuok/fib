@@ -24,8 +24,7 @@ func serveArpc(t *testing.T, register func(h *arpc.Handler)) string {
 	server := arpc.NewServer()
 	register(server.Handler)
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, server)
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: server})
 	if err != nil {
 		t.Fatal(err)
 	}

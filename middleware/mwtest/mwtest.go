@@ -17,9 +17,7 @@ import (
 // Serve serves handler until the test ends, and returns its base URL.
 func Serve(t testing.TB, handler fibhttp.Handler) string {
 	t.Helper()
-	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, fibhttp.NewHandler(handler))
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:0", Handler: fibhttp.NewHandler(handler)})
 	if err != nil {
 		t.Fatal(err)
 	}

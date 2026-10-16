@@ -25,7 +25,7 @@
 //
 //	server := grpc.NewServer()
 //	pb.RegisterGreeterServer(server, &greeter{})
-//	engine, err := fib.Bind(config, server)
+//	engine, err := fib.New(config, fib.Binding{Addr: ":50051", Handler: server})
 //
 // For TLS, wrap it: fibtls.NewServer(grpc.ConfigureTLS(tlsConfig), server).
 // Serve and ServeTLS make the engine themselves.

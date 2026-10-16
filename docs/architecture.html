@@ -140,7 +140,7 @@ body{margin:0}
   <p class="lede">An Engine owns the listeners, the event loop, its command queue and the worker pool. With <code>IOPollers</code>, the default on more than four CPUs, it also owns pollers: each is an Engine without listeners, with a loop, command queue and descriptor table of its own, sharing its parent's settings, handler, worker pool and server-wide budget.</p>
   <div class="diagram"><pre class="mermaid">
 flowchart LR
-  subgraph ENG["Engine (fib.Bind / fib.NewEngine)"]
+  subgraph ENG["Engine (fib.New)"]
     ROOT["root loop&lt;br/&gt;accept · UDP reads · commands"]
     P0["poller 0&lt;br/&gt;waits · registers · closes fds"]
     P1["poller N-1"]

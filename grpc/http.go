@@ -30,7 +30,7 @@ import (
 //	r := fibhttp.NewRouter()
 //	r.Handle("/helloworld.Greeter/*", server)
 //	r.Get("/", index)
-//	engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+//	engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(r)})
 //
 // The calls are served by the Server's methods, codecs, compressors and
 // interceptors, as on its own connections; its MaxConcurrentStreams and

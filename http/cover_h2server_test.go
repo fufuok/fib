@@ -374,9 +374,8 @@ func cvH2sServe(t *testing.T, handler *ServerHandler, tune func(*fib.Config)) st
 		setReuse(&handler.config, false)
 	}
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	tune(&config)
-	server, err := fib.Bind(config, handler)
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}

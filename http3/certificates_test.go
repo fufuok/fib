@@ -50,15 +50,13 @@ func TestGetCertificateAndClientCertificates(t *testing.T) {
 		t.Fatal("the server Config does not qualify for the handshake without a goroutine")
 	}
 
-	fc := fib.DefaultConfig()
-	fc.Network, fc.Addr = "udp", "127.0.0.1:0"
-	engine, err := fib.Bind(fc, NewHandlerWithConfig(Config{TLSConfig: serverTLS}, fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: NewHandlerWithConfig(Config{TLSConfig: serverTLS}, fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		peer := "none"
 		if c.Request.TLS != nil && len(c.Request.TLS.PeerCertificates) == 1 {
 			peer = c.Request.TLS.PeerCertificates[0].Subject.CommonName
 		}
 		_ = c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusOK, Body: []byte(peer)})
-	})))
+	}))})
 	if err != nil {
 		t.Fatal(err)
 	}

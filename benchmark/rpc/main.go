@@ -71,7 +71,6 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	config := fib.DefaultConfig()
 	config.CoalesceWrites = *coalesce
 	if *role == "server" {
-		config.Addr = *addr
 		var h fib.Handler
 		if *proto == "arpc" {
 			s := arpc.NewServer()
@@ -89,7 +88,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 			greeter.RegisterGreeterServer(s, gsrv{})
 			h = s
 		}
-		engine, err := fib.Bind(config, h)
+		engine, err := fib.New(config, fib.Binding{Addr: *addr, Handler: h})
 		if err != nil {
 			return err
 		}
@@ -103,7 +102,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	default:
 		return fmt.Errorf("-client-coalesce must be true or false, not %q", *clientCoalesce)
 	}
-	engine, err := fib.NewEngine(config, nil)
+	engine, err := fib.New(config)
 	if err != nil {
 		return err
 	}

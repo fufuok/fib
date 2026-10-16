@@ -40,9 +40,8 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	}
 
 	config := fib.DefaultConfig()
-	config.Addr = *addr
 	config.UseWritev = *writev
-	engine, err := fib.Bind(config, fib.HandlerFuncs{
+	engine, err := fib.New(config, fib.Binding{Addr: *addr, Handler: fib.HandlerFuncs{
 		// TCP is a byte stream: data is whatever arrived in one read, not
 		// necessarily one of the client's writes. An echo does not care.
 		Data: func(c *fib.Connection, data []byte) {
@@ -50,7 +49,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 				c.Close()
 			}
 		},
-	})
+	}})
 	if err != nil {
 		return err
 	}

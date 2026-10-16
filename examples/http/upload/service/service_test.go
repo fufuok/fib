@@ -41,8 +41,7 @@ func startServer(t *testing.T, maxSize int64) (base, dir string) {
 	t.Helper()
 	dir = t.TempDir()
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, fibhttp.NewHandlerWithConfig(Config(maxSize), Handler(dir)))
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: fibhttp.NewHandlerWithConfig(Config(maxSize), Handler(dir))})
 	if err != nil {
 		t.Fatal(err)
 	}

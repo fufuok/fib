@@ -220,9 +220,7 @@ func startServer(t *testing.T, impl *echoImpl, opts ...ServerOption) (*Server, s
 
 func startHandler(t *testing.T, handler fib.Handler) string {
 	t.Helper()
-	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, handler)
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +240,7 @@ func startHandler(t *testing.T, handler fib.Handler) string {
 
 func startClientEngine(t *testing.T) *fib.Engine {
 	t.Helper()
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,21 +661,19 @@ func TestTLS(t *testing.T) {
 	}
 	s := NewServer()
 	s.RegisterService(&echoDesc, &echoImpl{})
-	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	ln, err := net.Listen("tcp", config.Addr)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	config.Addr = ln.Addr().String()
+	addr := ln.Addr().String()
 	ln.Close()
 	served := make(chan error, 1)
-	go func() { served <- s.ServeTLS(config, serverTLS) }()
+	go func() { served <- s.ServeTLS(fib.DefaultConfig(), addr, serverTLS) }()
 	t.Cleanup(func() {
 		s.Stop()
 		<-served
 	})
-	_, c := dial(t, config.Addr, WithTLSConfig(clientTLS))
+	_, c := dial(t, addr, WithTLSConfig(clientTLS))
 	ctx := testCtx(t)
 	var r *Rsp
 	for {
@@ -701,10 +697,8 @@ func TestGracefulStop(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 	ln.Close()
-	config := fib.DefaultConfig()
-	config.Addr = addr
 	served := make(chan error, 1)
-	go func() { served <- s.Serve(config) }()
+	go func() { served <- s.Serve(fib.DefaultConfig(), addr) }()
 	_, c := dial(t, addr)
 	ctx := testCtx(t)
 	inFlight := make(chan error, 1)
@@ -756,10 +750,8 @@ func TestReconnect(t *testing.T) {
 	serve := func() (*Server, chan error) {
 		s := NewServer()
 		s.RegisterService(&echoDesc, &echoImpl{})
-		config := fib.DefaultConfig()
-		config.Addr = addr
 		served := make(chan error, 1)
-		go func() { served <- s.Serve(config) }()
+		go func() { served <- s.Serve(fib.DefaultConfig(), addr) }()
 		return s, served
 	}
 	s, served := serve()
@@ -799,10 +791,8 @@ func TestReconnect(t *testing.T) {
 func TestServeAfterStop(t *testing.T) {
 	s := NewServer()
 	s.Stop()
-	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	served := make(chan error, 1)
-	go func() { served <- s.Serve(config) }()
+	go func() { served <- s.Serve(fib.DefaultConfig(), "127.0.0.1:0") }()
 	select {
 	case err := <-served:
 		if err != ErrServerStopped {

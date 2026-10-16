@@ -19,11 +19,10 @@ import (
 func serveEcho(t *testing.T) string {
 	t.Helper()
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, fibhttp.NewHandler(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: fibhttp.NewHandler(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		body, _ := io.ReadAll(c.Request.Body)
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", body)
-	})))
+	}))})
 	if err != nil {
 		t.Fatal(err)
 	}

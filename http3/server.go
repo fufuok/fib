@@ -8,10 +8,8 @@
 // same http.Handler that serves HTTP/1 and HTTP/2 in package http, answered
 // through the same Context:
 //
-//	config := fib.DefaultConfig()
-//	config.Network = "udp"
-//	config.Addr = ":443"
-//	engine, err := fib.Bind(config, http3.NewHandler(tlsConfig, handler))
+//	engine, err := fib.New(fib.DefaultConfig(),
+//		fib.Binding{Network: "udp", Addr: ":443", Handler: http3.NewHandler(tlsConfig, handler)})
 //
 // The engine demultiplexes datagrams by peer address, and each address that
 // sends a QUIC Initial gets a connection of its own; connection migration is
@@ -316,10 +314,10 @@ func (h *ServerHandler) pathFor(peer *udpPeer, cid, data []byte) *peerPath {
 		peer.closeIfUnused()
 		return nil
 	}
-	if c.Engine().ShuttingDown() {
-		// No connection starts while the engine shuts down, as no TCP one
-		// is accepted; the client's Initial is dropped, as one from an
-		// address the engine does not know is.
+	if c.ShuttingDown() {
+		// No connection starts while the engine shuts down, or the
+		// binding drains, as no TCP one is accepted; the client's Initial
+		// is dropped, as one from an address the engine does not know is.
 		peer.closeIfUnused()
 		return nil
 	}

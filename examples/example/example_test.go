@@ -20,10 +20,9 @@ func bindForTest(t *testing.T, network string) *fib.Engine {
 	t.Helper()
 	config := fib.DefaultConfig()
 	config.Network = network
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, fib.HandlerFuncs{
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: fib.HandlerFuncs{
 		Data: func(c *fib.Connection, data []byte) { _ = c.Send(data) },
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}

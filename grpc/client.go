@@ -100,7 +100,7 @@ func sharedEngine() (*fib.Engine, error) {
 	defaultEngineOnce.Do(func() {
 		config := fib.DefaultConfig()
 		config.Name = "fib-grpc-client"
-		defaultEngine, defaultEngineErr = fib.NewEngine(config, nil)
+		defaultEngine, defaultEngineErr = fib.New(config)
 		if defaultEngineErr == nil {
 			go func() { _ = defaultEngine.Run() }()
 		}

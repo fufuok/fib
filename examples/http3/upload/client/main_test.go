@@ -25,8 +25,7 @@ func TestRunUploadsOverHTTP3(t *testing.T) {
 	config.StreamRequestBody = true
 	engineConfig := fib.DefaultConfig()
 	engineConfig.Network = "udp"
-	engineConfig.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(engineConfig, http3.NewHandlerWithConfig(config, service.Handler(dir)))
+	engine, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: http3.NewHandlerWithConfig(config, service.Handler(dir))})
 	if err != nil {
 		t.Fatal(err)
 	}

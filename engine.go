@@ -5,6 +5,7 @@ package fib
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -76,9 +77,10 @@ const (
 	// commandDetach releases the descriptor of a connection whose last
 	// round has run its OnClose; see closeConnection.
 	commandDetach
-	// commandShutdown has the loop tell its connections the engine is
-	// shutting down and count the ones still open; see Shutdown.
-	commandShutdown
+	// commandRun runs a function on the loop, for the rare changes to
+	// what the loop owns that come from elsewhere: a Shutdown round, or a
+	// binding opened or closed; see runOrQueue.
+	commandRun
 )
 
 type command struct {
@@ -86,7 +88,7 @@ type command struct {
 	connection *Connection
 	dial       *dialRequest
 	err        error
-	round      *shutdownRound
+	run        func()
 }
 type commandBatch struct{ items []command }
 
@@ -101,6 +103,7 @@ type commandBatch struct{ items []command }
 // budget are the parent's.
 type Engine struct {
 	enginePlatform
+	bindingState
 	// parent is the engine a poller serves connections for, and nil for an
 	// engine the application created.
 	parent *Engine
@@ -110,6 +113,12 @@ type Engine struct {
 	// noLoop says the engine has no event loop of its own, and its pollers
 	// listen, dial and serve everything; see Config.EngineLoop.
 	noLoop bool
+	// loopMu guards loopOwned, which says the loop's state is no longer
+	// anyone else's to change directly: Run has started the loop, which
+	// owns it from then on, or Close is releasing it. Until then, a change
+	// another goroutine makes to it is made on the spot; see runOrQueue.
+	loopMu    sync.Mutex
+	loopOwned bool
 	// acceptPlacement is Config.AcceptPlacement.
 	acceptPlacement    AcceptPlacement
 	name               string
@@ -178,22 +187,45 @@ type Engine struct {
 	udpSweepMu     sync.Mutex
 	udpSweep       *time.Timer
 	// unixPaths are the socket files the engine's Unix listeners created,
-	// which it removes when it closes, as net.UnixListener does.
-	unixPaths []string
+	// which it removes when it closes, as net.UnixListener does, or when
+	// their binding is removed. Guarded by unixPathMu.
+	unixPathMu sync.Mutex
+	unixPaths  []unixPath
+}
+
+// unixPath is a socket file a listener of the binding-th binding created.
+type unixPath struct {
+	path    string
+	binding int
 }
 
 // removeUnixPaths removes the socket files the engine created.
-func (e *Engine) removeUnixPaths() {
-	for _, path := range e.unixPaths {
-		_ = os.Remove(path)
+func (e *Engine) removeUnixPaths() { e.removeUnixPathsOf(-1) }
+
+// removeUnixPathsOf removes the socket files the binding-th binding's
+// listeners created, or every one for a binding below zero.
+func (e *Engine) removeUnixPathsOf(binding int) {
+	e.unixPathMu.Lock()
+	defer e.unixPathMu.Unlock()
+	kept := e.unixPaths[:0]
+	for _, p := range e.unixPaths {
+		if binding >= 0 && p.binding != binding {
+			kept = append(kept, p)
+			continue
+		}
+		_ = os.Remove(p.path)
 	}
-	e.unixPaths = nil
+	clear(e.unixPaths[len(kept):])
+	e.unixPaths = kept
 }
 
-// noteUnixPath records a socket file a listener just created.
-func (e *Engine) noteUnixPath(network, path string) {
+// noteUnixPath records a socket file a listener of the binding-th binding
+// just created.
+func (e *Engine) noteUnixPath(network, path string, binding int) {
 	if netaddr.IsUnix(network) && !netaddr.IsAbstractUnixPath(path) {
-		e.unixPaths = append(e.unixPaths, path)
+		e.unixPathMu.Lock()
+		e.unixPaths = append(e.unixPaths, unixPath{path: path, binding: binding})
+		e.unixPathMu.Unlock()
 	}
 }
 
@@ -220,25 +252,9 @@ func (e *Engine) releaseSendBuffer(data []byte) {
 	bufferpool.Put(data)
 }
 
-// Bind creates an engine that listens on config.Addr, or on every address in
-// config.Addrs, and serves the connections it accepts with handler. With
-// config.Bindings, it listens on every binding's addresses instead, and
-// serves each binding's connections with the binding's own handler, or with
-// handler for a binding that names none.
-func Bind(config Config, handler Handler) (*Engine, error) {
-	return newEngine(config, handler, true)
-}
-
-// NewEngine creates an engine with no listeners. Its connections are the ones
-// it dials, which makes it a client engine; config.Addr, config.Addrs and
-// config.Bindings are ignored. handler serves connections dialed with Dial,
-// and may be nil when every dial names its own handler through
-// DialWithHandler.
-func NewEngine(config Config, handler Handler) (*Engine, error) {
-	return newEngine(config, handler, false)
-}
-
-func newEngine(config Config, handler Handler, listen bool) (*Engine, error) {
+// newEngine creates the engine New describes, listening on bindings, which
+// bindingsOf has resolved.
+func newEngine(config Config, bindings []Binding) (*Engine, error) {
 	if err := config.validateTaskPool(); err != nil {
 		return nil, err
 	}
@@ -257,14 +273,10 @@ func newEngine(config Config, handler Handler, listen bool) (*Engine, error) {
 	if config.Backlog <= 0 {
 		config.Backlog = sys.DefaultBacklog()
 	}
-	if handler == nil {
-		handler = HandlerFuncs{}
-	}
-	var bindings []Binding
-	if listen {
-		bindings = bindingsOf(config, handler)
-	}
-	if preforkChild && listen {
+	// Dialed connections are served by the handler each dial names; one
+	// that names none gets this, which does nothing.
+	var handler Handler = HandlerFuncs{}
+	if preforkChild && len(bindings) > 0 {
 		config.ReusePort = true
 	}
 
@@ -302,6 +314,8 @@ func newEngine(config Config, handler Handler, listen bool) (*Engine, error) {
 		pendingTotal:   new(atomic.Int64),
 		handler:        handler}
 	e.readBufferSize = config.ReadBufferSize
+	e.bindConfig = config
+	e.bindingCount = len(bindings)
 	e.taskPool, e.releaseTaskPool = acquireTaskPool(config)
 	if err := e.open(config, bindings); err != nil {
 		e.releaseTaskPool()
@@ -359,7 +373,7 @@ func (e *Engine) root() *Engine {
 	return e
 }
 
-// errNoListener is what LocalAddr reports for an engine made by NewEngine.
+// errNoListener is what LocalAddr reports for an engine that listens nowhere.
 var errNoListener = errors.New("fib: engine has no listener")
 
 // LocalAddr returns the address of the server's first listener.
@@ -540,20 +554,88 @@ func (e *Engine) Stop() {
 
 // shutdownRound has each of the engine's loops tell its connections the
 // engine is shutting down, and reports how many connections the engine
-// accepted are still open between them; see Shutdown.
-func (e *Engine) shutdownRound(ctx context.Context) (int, error) {
-	loops := e.pollers
-	if !e.noLoop {
-		loops = append([]*Engine{e}, loops...)
-	}
+// accepted are still open between them; see Shutdown. With a binding of
+// zero or more, it covers only the connections that binding took; see
+// ShutdownBinding.
+func (e *Engine) shutdownRound(ctx context.Context, binding int) (int, error) {
+	loops := e.loops()
 	round := newShutdownRound(len(loops))
 	for _, l := range loops {
-		if !l.request(command{kind: commandShutdown, round: round}) {
+		if !l.runOrQueue(func() { round.report(l.shutdownConnections(binding)) }) {
 			// Closed: nothing is left open on it.
 			round.report(0)
 		}
 	}
 	return round.await(ctx, e)
+}
+
+// loops returns the engine's event loops: its own, if it has one, and its
+// pollers.
+func (e *Engine) loops() []*Engine {
+	if e.noLoop {
+		return e.pollers
+	}
+	return append([]*Engine{e}, e.pollers...)
+}
+
+// claimLoop hands the loop's state to the loop, or to Close, for good; see
+// loopOwned.
+func (e *Engine) claimLoop() {
+	e.loopMu.Lock()
+	e.loopOwned = true
+	e.loopMu.Unlock()
+}
+
+// runOrQueue has fn change what the loop owns: at once, on this goroutine,
+// if the loop has yet to start, and otherwise on the loop, which runs it
+// with its commands. It reports false, and runs nothing, once the loop's
+// queue has closed.
+func (e *Engine) runOrQueue(fn func()) bool {
+	e.loopMu.Lock()
+	if !e.loopOwned {
+		defer e.loopMu.Unlock()
+		fn()
+		return true
+	}
+	e.loopMu.Unlock()
+	return e.request(command{kind: commandRun, run: fn})
+}
+
+// errLoopClosed is what onLoop reports when the loop's queue has closed,
+// so that fn never ran and never will.
+var errLoopClosed = fmt.Errorf("fib: the engine's loop has closed: %w", net.ErrClosed)
+
+// onLoop is runOrQueue that waits for fn to have run. It reports
+// errLoopClosed if fn will never run, and net.ErrClosed if the engine stops
+// before it has, after which it may still run, as Close drains the queue,
+// or never.
+func (e *Engine) onLoop(fn func()) error {
+	done := make(chan struct{})
+	if !e.runOrQueue(func() { fn(); close(done) }) {
+		return errLoopClosed
+	}
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	check := time.NewTicker(shutdownStopCheck)
+	defer check.Stop()
+	for {
+		select {
+		case <-done:
+			return nil
+		case <-check.C:
+			if e.stopping.Load() {
+				select {
+				case <-done:
+					return nil
+				default:
+					return net.ErrClosed
+				}
+			}
+		}
+	}
 }
 
 // shutdownConnection tells c's handler, if it is a ShutdownHandler, that the
@@ -791,8 +873,8 @@ func (e *Engine) drainCommands() {
 			e.admitAccepted(cmd.connection)
 		case commandDetach:
 			e.detach(cmd.connection)
-		case commandShutdown:
-			cmd.round.report(e.shutdownConnections())
+		case commandRun:
+			cmd.run()
 		default:
 			e.refreshConnection(cmd.connection)
 		}
@@ -1011,42 +1093,9 @@ type Config struct {
 	// off by default. The task pools' own lines are switched separately, with
 	// taskpool.SetLogStatus.
 	LogStatus bool
-	// Network and Addr name the listener the way net.Listen does: Network is
-	// "tcp", "tcp4" or "tcp6", and Addr is a "host:port" such as ":9000",
-	// "127.0.0.1:9000" or "[::1]:9000". A host resolves through the net
-	// package, and a zero port asks the kernel to choose one. An empty Network
-	// means "tcp", and an empty Addr means ":0", again as net.Listen reads
-	// them.
-	//
-	// "tcp" with no host listens on both families where the kernel has IPv6,
-	// "tcp4" and "tcp6" pin it to one. This is the same choice net.Listen
-	// makes from the same arguments.
-	//
-	// "unix" listens on a Unix domain stream socket, with Addr as its path, as
-	// net.Listen does: the path must not exist yet, it is removed when the
-	// engine closes, and on Linux a leading '@' names an abstract socket.
-	// Connections on it behave exactly like TCP ones.
-	//
-	// "udp", "udp4" and "udp6" bind UDP sockets instead, as net.ListenPacket
-	// does. Each peer address that sends a datagram becomes a connection of
-	// its own, whose OnData receives one datagram per call and whose Send
-	// sends one; see UDPIdleTimeout for how such a connection ends.
-	Network string
-	Addr    string
-	// Addrs, when it is not empty, is the complete set of addresses to listen
-	// on and Addr is ignored; they all share Network. One server spanning
-	// several addresses shares a single event loop, descriptor table, task
-	// pool and buffer pool across all of them, where a server per address
-	// gives each its own copy of all four.
-	Addrs []string
-	// Bindings, when it is not empty, is the complete set of what to listen
-	// on, and Addr and Addrs are ignored: each Binding is a group of
-	// addresses on a network of its own, served by a handler of its own, so
-	// that one engine serves TCP, Unix and UDP addresses together, and a
-	// different protocol on each; see Binding. A binding that leaves its
-	// Network empty takes Network, and one that leaves its Handler nil takes
-	// the handler Bind was given.
-	Bindings       []Binding
+	// Network is the network of every Binding that leaves its own empty;
+	// see Binding.Network. Empty means "tcp".
+	Network        string
 	Backlog        int
 	WorkerCount    int
 	MaxEvents      int
@@ -1258,7 +1307,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
-	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: sys.DefaultBacklog(), WorkerCount: sizing.WorkerCount,
+	return Config{Name: DefaultName, Network: "tcp", Backlog: sys.DefaultBacklog(), WorkerCount: sizing.WorkerCount,
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
 		UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,
@@ -1321,6 +1370,9 @@ type udpListener struct {
 	network string
 	handler Handler
 	binding int
+	// draining says ShutdownBinding is draining the socket's binding, which
+	// opens no connection for a peer it does not know. Event-loop ownership.
+	draining bool
 	// peers maps an address to its open connection. Event-loop ownership.
 	peers map[netip.AddrPort]*Connection
 }
@@ -1373,11 +1425,11 @@ func (e *Engine) udpPeer(l *udpListener, from *syscall.RawSockaddrAny) *Connecti
 	if c := l.peers[key]; c != nil {
 		return c
 	}
-	if e.stopping.Load() || e.draining.Load() {
+	if e.stopping.Load() || e.draining.Load() || l.draining {
 		return nil
 	}
 	sa := keySockaddr(key, zone)
-	c := &Connection{engine: e, handler: l.handler,
+	c := &Connection{engine: e, handler: l.handler, bindingID: int32(l.binding + 1),
 		udp: &udpState{listener: l, sa: sa, key: key, raddr: sockaddrToUDPAddr(sa)}}
 	c.initUDPPeer()
 	c.udp.lastActive.Store(time.Now().UnixNano())
@@ -1536,6 +1588,11 @@ func (e *Engine) startUDPSweeper() {
 	interval := udpSweepInterval(e.udpIdleTimeout)
 	e.udpSweepMu.Lock()
 	defer e.udpSweepMu.Unlock()
+	if e.udpSweep != nil || e.stopping.Load() {
+		// Already armed, as it is for an engine that had UDP sockets
+		// before AddBinding gave it another, or stopped for good.
+		return
+	}
 	e.udpSweep = time.AfterFunc(interval, func() {
 		if e.stopping.Load() || !e.request(command{kind: commandUDPSweep}) {
 			return
@@ -1575,10 +1632,14 @@ func (e *Engine) sweepUDP() {
 }
 
 // shutdownUDPPeers is shutdownConnections for the peers of the engine's UDP
-// listeners. Callers run on the event loop.
-func (e *Engine) shutdownUDPPeers() int {
+// listeners, or of the binding-th binding's for a binding of zero or more.
+// Callers run on the event loop.
+func (e *Engine) shutdownUDPPeers(binding int) int {
 	n := 0
 	for _, l := range e.udpListeners {
+		if binding >= 0 && l.binding != binding {
+			continue
+		}
 		for _, c := range l.peers {
 			if shutdownConnection(c) {
 				n++
@@ -1613,15 +1674,23 @@ func (e *Engine) LocalUDPAddrs() ([]*net.UDPAddr, error) {
 	return addrs, nil
 }
 
+// udpOwn says the engine's loop reads the sockets it binds to its UDP
+// addresses, where an engine without a loop of its own hands them to its
+// first poller; see openUDPBeside.
+func (e *Engine) udpOwn() bool { return !e.noLoop }
+
 // udpSockets returns the sockets the engine bound to its UDP addresses, in
 // configured order.
 func (e *Engine) udpSockets() []*udpListener {
-	if len(e.udpListeners) == 0 && len(e.pollers) > 0 {
+	holder := e
+	if !e.udpOwn() {
 		// The pollers read the engine's addresses themselves, and the first
 		// holds the sockets the engine bound; see Config.ReusePort.
-		return e.pollers[0].udpListeners
+		holder = e.pollers[0]
 	}
-	return e.udpListeners
+	holder.listenMu.Lock()
+	defer holder.listenMu.Unlock()
+	return append([]*udpListener(nil), holder.udpListeners...)
 }
 
 // udpListenerAddr returns the address l is bound to.

@@ -62,7 +62,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	if err != nil {
 		return err
 	}
-	// Bind has opened the socket, so there is an address to report.
+	// New has opened the socket, so there is an address to report.
 	local, _ := engine.LocalUDPAddr()
 	running := make(chan error, 1)
 	go func() { running <- engine.Run() }()
@@ -92,6 +92,5 @@ func newEngine(addr, dir string, maxSize int64, tlsConfig *tls.Config) (*fib.Eng
 	config.MaxStreamedBodyBytes = maxSize
 	engineConfig := fib.DefaultConfig()
 	engineConfig.Network = "udp"
-	engineConfig.Addr = addr
-	return fib.Bind(engineConfig, http3.NewHandlerWithConfig(config, service.Handler(dir)))
+	return fib.New(engineConfig, fib.Binding{Addr: addr, Handler: http3.NewHandlerWithConfig(config, service.Handler(dir))})
 }

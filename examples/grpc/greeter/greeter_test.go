@@ -44,8 +44,7 @@ func connect(t *testing.T, opts ...grpc.ServerOption) (*GreeterClient, *grpc.Cli
 	s := grpc.NewServer(opts...)
 	RegisterGreeterServer(s, server{})
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, s)
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: s})
 	if err != nil {
 		t.Fatal(err)
 	}

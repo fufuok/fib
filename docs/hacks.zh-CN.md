@@ -562,14 +562,14 @@ fib 的 client（`Engine.Dial`、`fibhttp.Client`、`websocket.Dialer`、`http3`
 同一套背压。
 
 ```go
-engine, _ := fib.Bind(config, handler)           // server
+engine, _ := fib.New(config, fib.Binding{Addr: ":8080", Handler: handler}) // server
 client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig()) // 复用 server 的 Engine
 ```
 
 - 做网关/代理时，上游 client 用**同一个 Engine**，不需要第二套线程/池。
-- `Engine.DialWithHandler(...)`：这条连接用**自己的 handler**，Engine 的 handler 收不到——
-  同一个 Engine 因此能同时承载使用不同协议的 server 和 client。
-- `fib.NewEngine(config, nil)` 创建**不监听**的 Engine，只用于 dial。
+- `Engine.DialWithHandler(...)`：这条连接用**自己的 handler**，就像每个 binding 的连接用各自的
+  handler——同一个 Engine 因此能同时承载使用不同协议的 server 和 client。
+- 不传 binding 的 `fib.New(config)` 创建**不监听**的 Engine，只用于 dial。
 - `client.Go(req).Wait()` 是 Future 形式，需要阻塞的地方（比如 `main`、测试）用。**不要在 handler 里
   `Wait()`**——那会占 worker。handler 里请用回调 + `Retain`/`Release`。
 - 回调可能在任意 goroutine 上执行（读响应的 worker、定时器 goroutine、`fib-client` 池、调用方

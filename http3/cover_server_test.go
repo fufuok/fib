@@ -104,10 +104,7 @@ func (csHold) OnShutdown(*fib.Connection) {}
 // csBind starts an engine serving handler on a UDP port of its own.
 func csBind(t *testing.T, handler fib.Handler) (*fib.Engine, *net.UDPAddr) {
 	t.Helper()
-	fc := fib.DefaultConfig()
-	fc.Network = "udp"
-	fc.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(fc, handler)
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}

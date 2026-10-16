@@ -15,12 +15,11 @@ func TestBindingsUnderPollers(t *testing.T) {
 	for _, reusePort := range []bool{false, true} {
 		config := pollerConfig("bindings-pollers", 3)
 		config.ReusePort = reusePort
-		config.Bindings = []Binding{
-			{Addr: "127.0.0.1:0", Handler: prefixEcho("t:")},
-			{Network: "unix", Addr: unixSocketPath(t), Handler: prefixEcho("x:")},
-			{Network: "udp", Addr: "127.0.0.1:0", Handler: prefixEcho("u:")},
-		}
-		server, err := Bind(config, nil)
+		server, err := New(config,
+			Binding{Addr: "127.0.0.1:0", Handler: prefixEcho("t:")},
+			Binding{Network: "unix", Addr: unixSocketPath(t), Handler: prefixEcho("x:")},
+			Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: prefixEcho("u:")},
+		)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -227,7 +227,7 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 			e.listeners = append(e.listeners, streamListener{fd: fd, network: b.Network,
 				unix: netaddr.IsUnix(b.Network), spread: spread, shared: shared, handler: b.Handler, binding: i})
 			e.pollersListen = e.pollersListen || spread || shared
-			e.noteUnixPath(b.Network, addr)
+			e.noteUnixPath(b.Network, addr, i)
 		}
 	}
 	// Without a loop of its own, the engine has the first poller read the
@@ -316,24 +316,25 @@ func (e *Engine) beginShutdown() {
 
 // shutdownConnections runs one round of Shutdown on the loop: each open
 // connection is told the engine is shutting down, and the answer is how many
-// of those Shutdown waits for remain. Callers run on the event loop.
-func (e *Engine) shutdownConnections() int {
+// of those Shutdown waits for remain. With a binding of zero or more, the
+// round is ShutdownBinding's, over the connections that binding took.
+// Callers run on the event loop.
+func (e *Engine) shutdownConnections(binding int) int {
 	n := 0
 	for _, entries := range e.connections {
 		for _, c := range entries {
-			if c != nil && shutdownConnection(c) {
+			if c != nil && c.inBinding(binding) && shutdownConnection(c) {
 				n++
 			}
 		}
 	}
-	return n + e.shutdownUDPPeers()
+	return n + e.shutdownUDPPeers(binding)
 }
 
-// listenSockname returns the address of the i-th listener, fd, which is the
-// one it had before it stopped listening if it has.
-func (e *Engine) listenSockname(i, fd int) (syscall.Sockaddr, error) {
-	e.listenMu.Lock()
-	defer e.listenMu.Unlock()
+// listenSocknameLocked returns the address of the i-th listener, fd, which
+// is the one it had before it stopped listening if it has. Callers hold
+// listenMu.
+func (e *Engine) listenSocknameLocked(i, fd int) (syscall.Sockaddr, error) {
 	if e.listenStopped && i < len(e.listenAddrs) {
 		if sa := e.listenAddrs[i]; sa != nil {
 			return sa, nil
@@ -553,9 +554,8 @@ func (e *Engine) ListenAddrs() ([]net.Addr, error) {
 	return e.listenAddrsOf(-1)
 }
 
-// BindingAddrs returns the addresses of Config.Bindings[i], in the order the
-// binding lists them, as ListenAddrs reports them. An engine bound without
-// Bindings has the one binding, 0, that Network and Addr or Addrs make.
+// BindingAddrs returns the addresses of the i-th binding, as New and
+// AddBinding number them, in the order the binding lists them, as ListenAddrs reports them.
 func (e *Engine) BindingAddrs(i int) ([]net.Addr, error) {
 	if i < 0 {
 		return nil, errNoBinding
@@ -570,17 +570,20 @@ func (e *Engine) BindingAddrs(i int) ([]net.Addr, error) {
 // listenAddrsOf returns the addresses of binding's listeners, or of every
 // listener for a binding below zero.
 func (e *Engine) listenAddrsOf(binding int) ([]net.Addr, error) {
+	e.listenMu.Lock()
 	addrs := make([]net.Addr, 0, len(e.listeners)+len(e.udpListeners))
 	for i, l := range e.listeners {
 		if binding >= 0 && l.binding != binding {
 			continue
 		}
-		sa, err := e.listenSockname(i, l.fd)
+		sa, err := e.listenSocknameLocked(i, l.fd)
 		if err != nil {
+			e.listenMu.Unlock()
 			return nil, err
 		}
 		addrs = append(addrs, netaddr.ToAddr(sa))
 	}
+	e.listenMu.Unlock()
 	for _, l := range e.udpSockets() {
 		if binding >= 0 && l.binding != binding {
 			continue
@@ -598,12 +601,14 @@ func (e *Engine) listenAddrsOf(binding int) ([]net.Addr, error) {
 // leaving out the Unix ones, which ListenAddrs reports. Ports left at zero
 // report the port the kernel chose.
 func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
+	e.listenMu.Lock()
+	defer e.listenMu.Unlock()
 	addrs := make([]*net.TCPAddr, 0, len(e.listeners))
 	for i, l := range e.listeners {
 		if l.unix {
 			continue
 		}
-		sa, err := e.listenSockname(i, l.fd)
+		sa, err := e.listenSocknameLocked(i, l.fd)
 		if err != nil {
 			return nil, err
 		}
@@ -623,10 +628,12 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 func (e *Engine) Run() error {
 	e.logRun()
 	if len(e.pollers) == 0 {
+		e.claimLoop()
 		return e.runLoop()
 	}
 	errs := make(chan error, len(e.pollers))
 	for _, p := range e.pollers {
+		p.claimLoop()
 		go func(p *Engine) {
 			err := p.runLoop()
 			if err != nil {
@@ -637,6 +644,7 @@ func (e *Engine) Run() error {
 	}
 	var err error
 	if !e.noLoop {
+		e.claimLoop()
 		err = e.runLoop()
 		e.Stop()
 	}
@@ -680,12 +688,12 @@ func (e *Engine) acceptConnections(listenFD int) {
 			p = root.pollers[fd%len(root.pollers)]
 		}
 		if p == e {
-			e.admit(newAccepted(e, l.handler, l.unix, peer), fd)
+			e.admit(newAccepted(e, l, peer), fd)
 			continue
 		}
 		// The poller registers the descriptor itself, since its table and
 		// its backend are its loop's alone.
-		c := newAccepted(p, l.handler, l.unix, peer)
+		c := newAccepted(p, l, peer)
 		c.fd.Store(int32(fd))
 		if !p.request(command{kind: commandAccept, connection: c}) {
 			syscall.Close(fd)
@@ -781,6 +789,9 @@ func (e *Engine) Close() error {
 		e.stopUDPSweeper()
 		loops := append([]*Engine{e}, e.pollers...)
 		for _, l := range loops {
+			// Whatever a binding opens or closes from here on is Close's
+			// to release, through the loop's queue.
+			l.claimLoop()
 			l.cutConnections()
 		}
 		closeErr = afterRounds(func() {
@@ -870,6 +881,8 @@ func (e *Engine) release() error {
 // is the one Config.AcceptPlacement chose, which only a poller accepting on
 // a socket of its own takes.
 func (e *Engine) acceptPlacements() (string, bool) {
+	e.listenMu.Lock()
+	defer e.listenMu.Unlock()
 	parts := make([]string, 0, len(e.listeners))
 	applies := false
 	for i, l := range e.listeners {
@@ -886,7 +899,7 @@ func (e *Engine) acceptPlacements() (string, bool) {
 			how = "engine-loop," + AcceptFDModulo.String()
 		}
 		addr := l.network
-		if sa, err := e.listenSockname(i, l.fd); err == nil {
+		if sa, err := e.listenSocknameLocked(i, l.fd); err == nil {
 			addr = l.network + "://" + netaddr.ToAddr(sa).String()
 		}
 		parts = append(parts, addr+"="+how)
@@ -1343,8 +1356,8 @@ func fileName(local, remote net.Addr) string {
 }
 
 // newAccepted returns a connection for a socket a listener accepted from peer.
-func newAccepted(e *Engine, handler Handler, unix bool, peer netip.AddrPort) *Connection {
-	c := &Connection{engine: e, handler: handler, peer: packAddrPort(peer)}
-	c.flags.set(flagUnix, unix)
+func newAccepted(e *Engine, l *streamListener, peer netip.AddrPort) *Connection {
+	c := &Connection{engine: e, handler: l.handler, peer: packAddrPort(peer), bindingID: int32(l.binding + 1)}
+	c.flags.set(flagUnix, l.unix)
 	return c
 }

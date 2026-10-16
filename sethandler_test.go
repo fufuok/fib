@@ -44,8 +44,7 @@ func TestSetHandler(t *testing.T) {
 	}}
 	config := DefaultConfig()
 	config.Name = "set-handler"
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, first)
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: first})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -44,8 +44,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	}
 
 	config := fib.DefaultConfig()
-	config.Addr = *addr
-	engine, err := fib.Bind(config, echo(out, *compress))
+	engine, err := fib.New(config, fib.Binding{Addr: *addr, Handler: echo(out, *compress)})
 	if err != nil {
 		return err
 	}

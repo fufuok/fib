@@ -72,7 +72,7 @@ func TestRunServesEveryBinding(t *testing.T) {
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(pem)
 
-	// Plain HTTP, served by the handler Bind was given.
+	// Plain HTTP, on the first binding.
 	resp, err := http.Post("http://"+httpAddr+"/plain", "text/plain", strings.NewReader("hi"))
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +98,7 @@ func TestRunServesEveryBinding(t *testing.T) {
 		t.Fatalf("HTTPS: %q %v", body, resp.Header)
 	}
 
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

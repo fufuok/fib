@@ -153,10 +153,9 @@ type Layer interface {
 // such as a failed handshake. Only the first close's error is reported.
 func (c *Connection) CloseWithError(err error) { c.closeWithError(err) }
 
-// Handler returns the handler the engine serves accepted connections with,
-// which is also what a dial that names no handler of its own gets: the one
-// Bind or NewEngine was given. A Binding with a handler of its own serves
-// its connections with that one instead.
+// Handler returns the handler a dial that names no handler of its own gets,
+// which does nothing: every Binding serves its connections with its own, and
+// a dial names its own through DialWithHandler.
 func (e *Engine) Handler() Handler { return e.handler }
 
 // SetHandler hands the connection to h: every callback from here on goes to h

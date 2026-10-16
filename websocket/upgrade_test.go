@@ -47,8 +47,7 @@ func upgradeServerWith(t *testing.T, config Config, echo func(*Connection, Opcod
 		}
 	})
 	engineConfig := fib.DefaultConfig()
-	engineConfig.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(engineConfig, epollhttp.NewHandler(handler))
+	server, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: epollhttp.NewHandler(handler)})
 	if err != nil {
 		t.Fatal(err)
 	}

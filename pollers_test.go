@@ -146,11 +146,7 @@ func TestPollersServeDialedConnections(t *testing.T) {
 
 	replies := make(chan *Connection, 16)
 	var client *Engine
-	client, err := NewEngine(pollerConfig("pollers-dial", 4), HandlerFuncs{Data: func(c *Connection, b []byte) {
-		if string(b) == "dialed" {
-			replies <- c
-		}
-	}})
+	client, err := New(pollerConfig("pollers-dial", 4))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,11 +162,16 @@ func TestPollersServeDialedConnections(t *testing.T) {
 		}
 	}()
 
+	handler := HandlerFuncs{Data: func(c *Connection, b []byte) {
+		if string(b) == "dialed" {
+			replies <- c
+		}
+	}}
 	const perNetwork = 4
 	dialed := make(chan error, 2*perNetwork)
 	for _, target := range []struct{ network, addr string }{{"tcp4", tcpAddr}, {"udp4", udpAddr.String()}} {
 		for i := 0; i < perNetwork; i++ {
-			err := client.Dial(target.network, target.addr, 5*time.Second, func(c *Connection, err error) {
+			err := client.DialWithHandler(target.network, target.addr, 5*time.Second, handler, func(c *Connection, err error) {
 				if err == nil {
 					checkPoller(t, client, c, c.FD())
 					err = c.Send([]byte("dialed"))
@@ -297,9 +298,8 @@ func TestPollerSurvivesHandlerPanic(t *testing.T) {
 // hold connections paused on it, whichever loop drained it.
 func TestBudgetDrainWakesWaitingPollers(t *testing.T) {
 	config := pollerConfig("pollers-budget-wake", 3)
-	config.Addr = "127.0.0.1:0"
 	config.MaxPendingBytes = 1000
-	server, err := Bind(config, nil)
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,8 +479,7 @@ func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 			defaultCPUs(), config.IOPollers, config.TaskPoolMode)
 	}
 	config.Name = "default-config"
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, nil)
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -656,7 +655,7 @@ func TestUDPSendBatch(t *testing.T) {
 			}
 			defer sink.Close()
 			_ = sink.SetReadBuffer(1 << 20)
-			engine, _ := startEchoServer(t, DefaultConfig(), nil)
+			engine, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{})
 			dialed := make(chan *Connection, 1)
 			if err := engine.Dial("udp", sink.LocalAddr().String(), 5*time.Second, func(c *Connection, err error) {
 				if err != nil {
@@ -812,11 +811,10 @@ func TestPriorityDataUsesDedicatedCallback(t *testing.T) {
 	regular := make(chan []byte, 1)
 	priority := make(chan []byte, 1)
 	config := DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := Bind(config, HandlerFuncs{
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{
 		Data:         func(_ *Connection, data []byte) { regular <- append([]byte(nil), data...) },
 		PriorityData: func(_ *Connection, data []byte) { priority <- append([]byte(nil), data...) },
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1014,11 +1012,11 @@ func acceptOne(t *testing.T, network string, handler HandlerFuncs) (*Connection,
 	}
 	config := DefaultConfig()
 	config.Network = network
-	config.Addr = "127.0.0.1:0"
+	addr := "127.0.0.1:0"
 	if network == "unix" {
-		config.Addr = filepath.Join(t.TempDir(), "s")
+		addr = filepath.Join(t.TempDir(), "s")
 	}
-	server, err := Bind(config, handler)
+	server, err := New(config, Binding{Addr: addr, Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1435,8 +1433,7 @@ func TestDialedConnectionProtocol(t *testing.T) {
 	unixPath := filepath.Join(t.TempDir(), "s")
 	unixConfig := DefaultConfig()
 	unixConfig.Network = "unix"
-	unixConfig.Addr = unixPath
-	unixServer, err := Bind(unixConfig, HandlerFuncs{})
+	unixServer, err := New(unixConfig, Binding{Addr: unixPath, Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1525,9 +1522,8 @@ func TestOnHangupReachesARunningRound(t *testing.T) {
 		t.Run(fmt.Sprintf("pollers=%v", pollers), func(t *testing.T) {
 			serve := func(h Handler) string {
 				config := DefaultConfig()
-				config.Addr = "127.0.0.1:0"
 				config.IOPollers = pollers
-				server, err := Bind(config, h)
+				server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: h})
 				if err != nil {
 					t.Fatal(err)
 				}

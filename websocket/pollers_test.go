@@ -27,10 +27,9 @@ func TestWebSocketRoundsRunOnWorkers(t *testing.T) {
 	})
 	config := fib.DefaultConfig()
 	config.Name = "websocket-pollers"
-	config.Addr = "127.0.0.1:0"
 	config.IOPollers = true
 	config.IOPollerCount = 1
-	server, err := fib.Bind(config, handler)
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}

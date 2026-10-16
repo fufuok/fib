@@ -79,9 +79,7 @@ func TestServerAndClient(t *testing.T) {
 // the rate is of the calls that succeeded.
 func TestClientCountsFailures(t *testing.T) {
 	serve := func(h fib.Handler) string {
-		config := fib.DefaultConfig()
-		config.Addr = "127.0.0.1:0"
-		engine, err := fib.Bind(config, h)
+		engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:0", Handler: h})
 		if err != nil {
 			t.Fatal(err)
 		}

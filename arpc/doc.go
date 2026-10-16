@@ -3,7 +3,7 @@
 // message coders, service registration and singleflight, on the same wire
 // format, so a client or server of either package talks to one of the other.
 //
-// A Server is a fib.Handler. Bind it to an engine, wrap it with tls.NewServer
+// A Server is a fib.Handler. Give it to an engine's binding, wrap it with tls.NewServer
 // first for TLS, or let Run and Serve make the engine:
 //
 //	server := arpc.NewServer()
@@ -13,7 +13,7 @@
 //			ctx.Write(s)
 //		}
 //	})
-//	engine, err := fib.Bind(config, server)
+//	engine, err := fib.New(config, fib.Binding{Addr: ":8888", Handler: server})
 //
 // A Client is one connection, on either side: Dial and NewClient open one on
 // an engine and reconnect it when it breaks, and a Server makes one for every

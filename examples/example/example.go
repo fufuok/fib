@@ -60,7 +60,7 @@ func Addr(engine *fib.Engine) string {
 // ClientEngine starts an engine with no listener, for dialing, and returns a
 // function that stops and closes it.
 func ClientEngine() (*fib.Engine, func()) {
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		Fatal(err)
 	}

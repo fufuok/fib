@@ -67,7 +67,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	if err != nil {
 		return err
 	}
-	// Bind has opened the listener, so there is an address to report.
+	// New has opened the listener, so there is an address to report.
 	local, _ := engine.LocalAddr()
 	running := make(chan error, 1)
 	go func() { running <- engine.Run() }()
@@ -93,8 +93,7 @@ func newEngine(addr, dir string, maxSize int64, tlsConfig *tls.Config) (*fib.Eng
 	// ended with GOAWAY rather than answered in HTTP/1.
 	httpConfig.HTTP2Only = true
 	config := fib.DefaultConfig()
-	config.Addr = addr
 	// fibtls decrypts in front of the HTTP handler; ConfigureTLS offers h2
 	// through ALPN.
-	return fib.Bind(config, fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandlerWithConfig(httpConfig, service.Handler(dir))))
+	return fib.New(config, fib.Binding{Addr: addr, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandlerWithConfig(httpConfig, service.Handler(dir)))})
 }

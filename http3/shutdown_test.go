@@ -27,9 +27,7 @@ func shutdownServer(t *testing.T, handler fibhttp.HandlerFunc) (*fib.Engine, str
 	}
 	config := DefaultConfig()
 	config.TLSConfig = serverTLS
-	fc := fib.DefaultConfig()
-	fc.Network, fc.Addr = "udp", "127.0.0.1:0"
-	engine, err := fib.Bind(fc, NewHandlerWithConfig(config, handler))
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: NewHandlerWithConfig(config, handler)})
 	if err != nil {
 		t.Fatal(err)
 	}

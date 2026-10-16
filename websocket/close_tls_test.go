@@ -26,8 +26,7 @@ func TestCloseAnsweredOverTLSWithFramesBehind(t *testing.T) {
 		t.Fatal(err)
 	}
 	engineConfig := fib.DefaultConfig()
-	engineConfig.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(engineConfig, fibtls.NewServer(serverTLS, NewHandler(echoServerHandler())))
+	server, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: fibtls.NewServer(serverTLS, NewHandler(echoServerHandler()))})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -70,7 +70,7 @@ func dialRaw(t *testing.T, base string) *rawConn {
 		t.Fatal(err)
 	}
 	clientTLS.NextProtos = []string{NextProto}
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,10 +276,8 @@ func startRawServer(t *testing.T, setup func(control *quic.Stream)) (*rawServer,
 	}
 	server := &rawServer{closed: make(chan error, 4), setup: setup}
 	config := fib.DefaultConfig()
-	config.Network = "udp"
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, &rawServerHandler{t: t, server: server,
-		config: quic.Config{TLSConfig: ConfigureTLS(serverTLS)}})
+	engine, err := fib.New(config, fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: &rawServerHandler{t: t, server: server,
+		config: quic.Config{TLSConfig: ConfigureTLS(serverTLS)}}})
 	if err != nil {
 		t.Fatal(err)
 	}

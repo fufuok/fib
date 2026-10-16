@@ -18,16 +18,10 @@ import (
 	"github.com/lesismal/fib/websocket"
 )
 
-func run(t *testing.T, config fib.Config, handler fib.Handler, listen bool) *fib.Engine {
+func run(t *testing.T, config fib.Config, bindings ...fib.Binding) *fib.Engine {
 	t.Helper()
 	config.Name = "socks-" + t.Name()
-	var engine *fib.Engine
-	var err error
-	if listen {
-		engine, err = fib.Bind(config, handler)
-	} else {
-		engine, err = fib.NewEngine(config, handler)
-	}
+	engine, err := fib.New(config, bindings...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,11 +39,11 @@ func run(t *testing.T, config fib.Config, handler fib.Handler, listen bool) *fib
 // the ports' addresses in order.
 func serve(t *testing.T, handlers ...fib.Handler) []string {
 	t.Helper()
-	config := fib.DefaultConfig()
-	for _, h := range handlers {
-		config.Bindings = append(config.Bindings, fib.Binding{Addr: "127.0.0.1:0", Handler: h})
+	bindings := make([]fib.Binding, len(handlers))
+	for i, h := range handlers {
+		bindings[i] = fib.Binding{Addr: "127.0.0.1:0", Handler: h}
 	}
-	engine := run(t, config, nil, true)
+	engine := run(t, fib.DefaultConfig(), bindings...)
 	addrs := make([]string, len(handlers))
 	for i := range handlers {
 		a, err := engine.BindingAddrs(i)
@@ -105,7 +99,7 @@ func TestHTTPClientThroughProxy(t *testing.T) {
 	config := fibhttp.DefaultClientConfig()
 	config.Dial = proxy.Dial
 	config.TLSConfig = clientTLS
-	client := fibhttp.NewClient(run(t, fib.DefaultConfig(), nil, false), config)
+	client := fibhttp.NewClient(run(t, fib.DefaultConfig()), config)
 	t.Cleanup(client.Close)
 
 	if got := get(t, client, "http://"+addrs[1]+"/hello"); got != "HTTP/1.1 tls=no" {
@@ -128,7 +122,7 @@ func TestWebSocketThroughProxy(t *testing.T) {
 	handler := websocket.HandlerFuncs{Message: func(_ *websocket.Connection, _ websocket.Opcode, data []byte) {
 		got <- string(data)
 	}}
-	conn, _, err := websocket.NewDialer(run(t, fib.DefaultConfig(), nil, false), config).
+	conn, _, err := websocket.NewDialer(run(t, fib.DefaultConfig()), config).
 		Go("ws://"+addrs[1]+"/", nil, handler).Wait()
 	if err != nil {
 		t.Fatal(err)
@@ -154,7 +148,7 @@ func TestMuxRoutesSOCKS(t *testing.T) {
 		mux.Route{Match: mux.SOCKS(), Handler: socks.NewServer(socks.Config{})},
 		mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(web())},
 	))
-	engine := run(t, fib.DefaultConfig(), nil, false)
+	engine := run(t, fib.DefaultConfig())
 	for _, url := range []string{"socks5h://", "socks4://"} {
 		proxy, err := socks.ParseURL(url + addrs[0])
 		if err != nil {

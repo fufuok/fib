@@ -17,10 +17,9 @@ func servePollers(t *testing.T, name string, handler fib.Handler) string {
 	t.Helper()
 	config := fib.DefaultConfig()
 	config.Name = name
-	config.Addr = "127.0.0.1:0"
 	config.IOPollers = true
 	config.IOPollerCount = 1
-	server, err := fib.Bind(config, handler)
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,12 +74,11 @@ func TestHandlerPoolIsTheStreamPool(t *testing.T) {
 		got := make(chan string, 2)
 		config := fib.DefaultConfig()
 		config.Name = name
-		config.Addr = "127.0.0.1:0"
 		config.IOPollers = pollers
-		server, err := fib.Bind(config, NewHandler(HandlerFunc(func(c *Context) {
+		server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: NewHandler(HandlerFunc(func(c *Context) {
 			got <- c.Conn.Engine().HandlerPool().Name()
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.Proto))
-		})))
+		}))})
 		if err != nil {
 			t.Fatal(err)
 		}

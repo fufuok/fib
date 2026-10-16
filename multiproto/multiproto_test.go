@@ -36,17 +36,11 @@ func web(c *fibhttp.Context) {
 	}
 }
 
-// startEngine runs an engine of config and h until the test ends.
-func startEngine(t *testing.T, config fib.Config, h fib.Handler) *fib.Engine {
+// startEngine runs an engine of config and bindings until the test ends.
+func startEngine(t *testing.T, config fib.Config, bindings ...fib.Binding) *fib.Engine {
 	t.Helper()
 	config.Name = "multiproto-" + t.Name()
-	var engine *fib.Engine
-	var err error
-	if h == nil {
-		engine, err = fib.NewEngine(config, nil)
-	} else {
-		engine, err = fib.Bind(config, h)
-	}
+	engine, err := fib.New(config, bindings...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,9 +57,7 @@ func startEngine(t *testing.T, config fib.Config, h fib.Handler) *fib.Engine {
 // serve binds h on a port of its own and returns where it listens.
 func serve(t *testing.T, h fib.Handler) string {
 	t.Helper()
-	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	addr, err := startEngine(t, config, h).LocalAddr()
+	addr, err := startEngine(t, fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:0", Handler: h}).LocalAddr()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +334,7 @@ func TestOnePortServesEveryProtocol(t *testing.T) {
 	})
 
 	t.Run("GRPC", func(t *testing.T) {
-		cc, err := grpc.NewClient(addr, grpc.WithEngine(startEngine(t, fib.DefaultConfig(), nil)),
+		cc, err := grpc.NewClient(addr, grpc.WithEngine(startEngine(t, fib.DefaultConfig())),
 			grpc.WithDefaultCallOptions(grpc.CallContentSubtype("json")))
 		if err != nil {
 			t.Fatal(err)
@@ -432,7 +424,7 @@ func TestOnePortServesEveryProtocol(t *testing.T) {
 	})
 
 	t.Run("ARPC", func(t *testing.T) {
-		client, err := arpc.NewClient(arpc.TCPDialer(startEngine(t, fib.DefaultConfig(), nil), "tcp", addr, 3*time.Second), nil)
+		client, err := arpc.NewClient(arpc.TCPDialer(startEngine(t, fib.DefaultConfig()), "tcp", addr, 3*time.Second), nil)
 		if err != nil {
 			t.Fatal(err)
 		}

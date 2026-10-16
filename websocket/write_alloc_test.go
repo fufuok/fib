@@ -20,10 +20,9 @@ import (
 func TestServerWriteMessageAllocs(t *testing.T) {
 	opened := make(chan *Connection, 1)
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, NewHandler(HandlerFuncs{
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: NewHandler(HandlerFuncs{
 		Open: func(c *Connection, _ *stdhttp.Request) { opened <- c },
-	}))
+	})})
 	if err != nil {
 		t.Fatal(err)
 	}

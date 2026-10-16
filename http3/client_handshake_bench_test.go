@@ -41,7 +41,7 @@ func BenchmarkClientNewConnection(b *testing.B) {
 				b.Fatal(err)
 			}
 			clientTLS.ServerName = "localhost"
-			engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+			engine, err := fib.New(fib.DefaultConfig())
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -92,7 +92,7 @@ func BenchmarkClientStalledHandshakes(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		b.Fatal(err)
 	}

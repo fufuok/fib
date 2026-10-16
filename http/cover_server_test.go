@@ -426,10 +426,9 @@ func TestCoverServerUnixSocketRemoteAddr(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	path := filepath.Join(dir, "s")
 	config := fib.DefaultConfig()
-	config.Network, config.Addr = "unix", path
-	server, err := fib.Bind(config, NewHandler(HandlerFunc(func(c *Context) {
+	server, err := fib.New(config, fib.Binding{Network: "unix", Addr: path, Handler: NewHandler(HandlerFunc(func(c *Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("remote="+c.Request.RemoteAddr))
-	})))
+	}))})
 	if err != nil {
 		t.Fatal(err)
 	}

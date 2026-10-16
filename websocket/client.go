@@ -79,7 +79,7 @@ func DefaultDialerConfig() DialerConfig {
 // is: the same Handler callbacks, run by the engine's workers, and the same
 // Connection methods, which mask what the client sends as RFC 6455 requires.
 //
-// The engine may be one made by fib.NewEngine for clients alone, or a server's
+// The engine may be one fib.New made for clients alone, with no bindings, or a server's
 // own: each client connection carries its own handler. The engine has to be
 // running. ws:// and wss:// are supported.
 type Dialer struct {

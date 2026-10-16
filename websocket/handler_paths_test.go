@@ -137,10 +137,9 @@ func TestServerOverUnixSocket(t *testing.T) {
 	opened := make(chan *stdhttp.Request, 1)
 	engineConfig := fib.DefaultConfig()
 	engineConfig.Network = "unix"
-	engineConfig.Addr = path
-	server, err := fib.Bind(engineConfig, NewHandler(HandlerFuncs{
+	server, err := fib.New(engineConfig, fib.Binding{Addr: path, Handler: NewHandler(HandlerFuncs{
 		Open: func(_ *Connection, r *stdhttp.Request) { opened <- r },
-	}))
+	})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +203,7 @@ func TestElsewhereAfterPoolStopped(t *testing.T) {
 	// of its own.
 	config := fib.DefaultConfig()
 	config.Name = "ws-elsewhere-test"
-	engine, err := fib.NewEngine(config, nil)
+	engine, err := fib.New(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,8 +229,7 @@ func TestElsewhereAfterPoolStopped(t *testing.T) {
 func serveHTTP(t *testing.T, handler epollhttp.HandlerFunc) string {
 	t.Helper()
 	engineConfig := fib.DefaultConfig()
-	engineConfig.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(engineConfig, epollhttp.NewHandler(handler))
+	server, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: epollhttp.NewHandler(handler)})
 	if err != nil {
 		t.Fatal(err)
 	}

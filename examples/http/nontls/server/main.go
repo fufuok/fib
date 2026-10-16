@@ -53,8 +53,7 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 		handler = withFiles(*dir, handler)
 	}
 	config := fib.DefaultConfig()
-	config.Addr = *addr
-	engine, err := fib.Bind(config, fibhttp.NewHandler(handler))
+	engine, err := fib.New(config, fib.Binding{Addr: *addr, Handler: fibhttp.NewHandler(handler)})
 	if err != nil {
 		return err
 	}

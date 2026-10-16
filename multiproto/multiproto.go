@@ -5,7 +5,7 @@
 // found:
 //
 //	web := fibhttp.NewHandler(router)
-//	engine, err := fib.Bind(config, multiproto.New(multiproto.Config{
+//	engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: multiproto.New(multiproto.Config{
 //		TLS:       fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), web),
 //		HTTP1:     web,
 //		HTTP2:     web,
@@ -14,7 +14,7 @@
 //		SOCKS:     socks.NewServer(socks.Config{}),
 //		HTTPProxy: fibhttp.NewHandler(fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{})),
 //		ARPC:      arpcServer,
-//	}))
+//	})})
 //
 // A protocol whose handler is nil is not served: its connections go to
 // Config.Fallback, or are closed. Each protocol is recognised by what its

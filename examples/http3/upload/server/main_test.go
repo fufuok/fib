@@ -50,7 +50,7 @@ func startServer(t *testing.T, maxSize int64) (base, dir string, newClient func(
 		<-done
 		_ = engine.Close()
 	})
-	clientEngine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	clientEngine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

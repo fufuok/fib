@@ -29,8 +29,7 @@ func TestServerHandshakeEchoPingAndClose(t *testing.T) {
 		},
 	})
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, handler)
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,8 +164,7 @@ func BenchmarkServerEcho1KiB(b *testing.B) {
 		},
 	})
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, handler)
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -285,12 +283,11 @@ func TestReadsPauseForPeerThatNeverReadsAndResumeWhenItDoes(t *testing.T) {
 		},
 	})
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
 	config.WriteBufferHighWatermark = watermark
 	// Leave the server-wide budget off, so the per-connection watermark is the
 	// only thing that can stop these reads.
 	config.MaxPendingBytes = 0
-	server, err := fib.Bind(config, handler)
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,8 +401,7 @@ func TestServerDeliversFramesToFrameHandler(t *testing.T) {
 		},
 	})
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, handler)
+	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}

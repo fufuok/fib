@@ -77,23 +77,19 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 
 	plain := fibhttp.NewHandler(web)
 	secure := fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))
-	config := fib.DefaultConfig()
-	config.Bindings = []fib.Binding{
-		// The handler Bind is given serves the bindings that name none:
-		// here, plain HTTP.
-		{Addr: *httpAddr},
-		{Addr: *httpsAddr, Handler: secure},
-		{Network: "udp", Addr: *httpsAddr, Handler: http3.NewHandler(tlsConfig, web)},
-		{Addr: *wsAddr, Handler: wsEcho()},
-		{Addrs: strings.Split(*tcpAddrs, ","), Handler: tcpEcho()},
+	engine, err := fib.New(fib.DefaultConfig(),
+		fib.Binding{Addr: *httpAddr, Handler: plain},
+		fib.Binding{Addr: *httpsAddr, Handler: secure},
+		fib.Binding{Network: "udp", Addr: *httpsAddr, Handler: http3.NewHandler(tlsConfig, web)},
+		fib.Binding{Addr: *wsAddr, Handler: wsEcho()},
+		fib.Binding{Addrs: strings.Split(*tcpAddrs, ","), Handler: tcpEcho()},
 		// Every protocol whose client speaks first can share a port. The echo
 		// takes whatever is neither TLS nor HTTP.
-		{Addr: *sharedAddr, Handler: mux.NewWithConfig(mux.Config{Fallback: tcpEcho()},
+		fib.Binding{Addr: *sharedAddr, Handler: mux.NewWithConfig(mux.Config{Fallback: tcpEcho()},
 			mux.Route{Match: mux.TLS(), Handler: secure},
 			mux.Route{Match: mux.HTTP(), Handler: plain},
 		)},
-	}
-	engine, err := fib.Bind(config, plain)
+	)
 	if err != nil {
 		return err
 	}

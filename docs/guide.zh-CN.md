@@ -26,7 +26,7 @@
   合法的 Mode。`taskpool.ModeInline`（`taskpool.NewInline`）
   不起 worker，也没有队列，直接在提交任务的 goroutine 上带 recover 执行；它只作为
   独立的库功能保留，Engine 不接受它（`TaskPoolMode` 设为 `ModeInline`，或 `SetTaskPool`
-  传入 inline 池，`Bind` 都会报错），因为那样连接的一轮会在事件循环上执行。
+  传入 inline 池，`New` 都会报错），因为那样连接的一轮会在事件循环上执行。
 - `taskpool.ModeAdaptive` 按 worker 数分片，常驻数量随负载在下限和上限之间变化：
   - 唤醒：每个空闲 worker 有自己的唤醒通道，按后进先出压在空闲栈上，被唤醒的总是
     最近停下、栈和缓存都还热的那个。唤醒的对象是"队列"而不是"某个任务"：到达队列的
@@ -147,13 +147,11 @@ Windows 后端不会调用 `OnPriorityData`：零字节读不报告带外数据�
 import fib "github.com/lesismal/fib"
 
 config := fib.DefaultConfig()
-// Network、Addr 与标准库 net.Listen 的参数含义一致：
-// Network 取 "tcp"、"tcp4"、"tcp6"，Addr 形如 ":9000"、"127.0.0.1:9000"、"[::1]:9000"，
-// 端口为 0 时由内核分配。Network 为空按 "tcp" 处理，Addr 为空按 ":0" 处理。
-config.Network = "tcp"
-config.Addr = "127.0.0.1:9000"
 config.ReadBufferSize = 32 * 1024
-server, err := fib.Bind(config, fib.HandlerFuncs{
+// Binding 的 Network、Addr 与标准库 net.Listen 的参数含义一致：
+// Network 取 "tcp"、"tcp4"、"tcp6"，Addr 形如 ":9000"、"127.0.0.1:9000"、"[::1]:9000"，
+// 端口为 0 时由内核分配。Network 为空时取 Config.Network（默认 "tcp"），Addr 为空按 ":0" 处理。
+server, err := fib.New(config, fib.Binding{Network: "tcp", Addr: "127.0.0.1:9000", Handler: fib.HandlerFuncs{
     Data: func(c *fib.Connection, data []byte) {
         if c.Send(data) != nil { c.Close() }
     },
@@ -164,18 +162,18 @@ server, err := fib.Bind(config, fib.HandlerFuncs{
 		// 主动 Close 时 err 为 nil；对端正常关闭时为 io.EOF；
 		// 网络或系统调用失败时为对应的原始错误。
 	},
-})
+}})
 if err != nil { panic(err) }
 defer server.Close()
 if err := server.Run(); err != nil { panic(err) }
 ```
 
-一个 server 监听多个地址时用 `Addrs`（此时 `Addr` 被忽略），它们共用同一个事件循环、
-描述符表、任务池和缓冲池；`LocalAddrs()` 按配置顺序返回各监听地址，端口为 0 的会
+一个 binding 监听多个地址时用 `Addrs`（此时 `Addr` 被忽略），它们共用同一个事件循环、
+描述符表、任务池和缓冲池；`LocalAddrs()` 按顺序返回各监听地址，端口为 0 的会
 返回内核实际分配的端口：
 
 ```go
-config.Addrs = []string{"127.0.0.1:9000", "127.0.0.1:9001"}
+fib.Binding{Addrs: []string{"127.0.0.1:9000", "127.0.0.1:9001"}, Handler: handler}
 ```
 
 ### 优雅停机（Shutdown）
@@ -366,28 +364,27 @@ err := server.Dial("tcp", "127.0.0.1:9001", 3*time.Second, func(c *fib.Connectio
 - 兼容后端（如 FreeBSD）用 `net.DialTimeout` 在 goroutine 里连接，done 在该
   goroutine 上执行。
 - `DialWithHandler` 让这条连接使用自己的 handler，`OnOpen`、`OnData`、`OnClose`
-  都只交给它，Engine 的 handler 收不到；同一个 Engine 因此可以同时承载 server 和
-  使用不同协议的 client 连接。`Dial` 等价于 handler 传 nil，即使用 Engine 的。
-- `fib.NewEngine(config, handler)` 创建不监听任何地址的 Engine，只用于 Dial 出去
+  都只交给它；同一个 Engine 因此可以同时承载 server 和使用不同协议的 client 连接。
+  `Dial` 等价于 handler 传 nil，连接得到一个什么都不做的 handler，所以拨号时请用
+  `DialWithHandler` 指定 handler。
+- 不传 binding 的 `fib.New(config)` 创建不监听任何地址的 Engine，只用于 Dial 出去
   的连接；它的 `LocalAddr` 返回错误。
 
 ### Unix Socket
 
-`Config.Network` 设为 `"unix"` 时，`Config.Addr` 是 socket 文件路径，Engine 在
+Binding 的 `Network` 为 `"unix"` 时，`Addr` 是 socket 文件路径，Engine 在
 Unix domain stream socket 上监听；`Dial`/`DialWithHandler` 的 network 传 `"unix"`、
 addr 传路径即可拨号。连接的调度、发送队列、背压、TLS 以及 http/websocket 子
 package 与 TCP 完全相同：
 
 ```go
-config.Network = "unix"
-config.Addr = "/tmp/fib.sock"
-server, err := fib.Bind(config, handler)
+server, err := fib.New(config, fib.Binding{Network: "unix", Addr: "/tmp/fib.sock", Handler: handler})
 
 err = engine.Dial("unix", "/tmp/fib.sock", 3*time.Second, done)
 ```
 
-- 语义与 `net.Listen("unix", path)` 一致：路径已存在时 `Bind` 失败（不会删除别人的
-  socket 文件），Engine `Close` 时删除自己创建的文件；Linux 上以 `@` 开头的路径是
+- 语义与 `net.Listen("unix", path)` 一致：路径已存在时 `New`（或 `AddBinding`）失败（不会删除别人的
+  socket 文件），Engine `Close` 或该 binding 被移除时删除自己创建的文件；Linux 上以 `@` 开头的路径是
   abstract socket，没有文件。
 - `Connection.RemoteAddr()` 返回 `*net.UnixAddr`（对端未 bind 时名字为空）；
   `Engine.ListenAddrs()` 返回所有监听地址（TCP、Unix、UDP 均可），`LocalAddr` 只
@@ -399,16 +396,14 @@ err = engine.Dial("unix", "/tmp/fib.sock", 3*time.Second, done)
 
 ### UDP
 
-`Config.Network` 设为 `"udp"`、`"udp4"` 或 `"udp6"` 时，`Bind` 绑定 UDP socket；
+Binding 的 `Network` 为 `"udp"`、`"udp4"` 或 `"udp6"` 时，Engine 绑定 UDP socket；
 `Dial`/`DialWithHandler` 的 network 传 `"udp"` 时拨号一个已 connect 的 UDP socket。
 UDP 沿用同一套 Handler、worker 和 `Connection`：
 
 ```go
-config.Network = "udp"
-config.Addr = "127.0.0.1:9001"
-server, err := fib.Bind(config, fib.HandlerFuncs{
+server, err := fib.New(config, fib.Binding{Network: "udp", Addr: "127.0.0.1:9001", Handler: fib.HandlerFuncs{
     Data: func(c *fib.Connection, datagram []byte) { _ = c.Send(datagram) },
-})
+}})
 addr, _ := server.LocalUDPAddr()
 ```
 
@@ -450,7 +445,7 @@ go test ./...
 import fibtls "github.com/lesismal/fib/tls"
 
 // server：把任意 handler 包在 fibtls.NewServer 里
-server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, handler))
+server, err := fib.New(config, fib.Binding{Addr: ":443", Handler: fibtls.NewServer(tlsConfig, handler)})
 
 // client：config 没有 ServerName 时取 addr 的 host
 err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, handler, done)
@@ -572,7 +567,7 @@ handler := epollhttp.NewHandler(epollhttp.HandlerFunc(
         _ = c.Respond(http.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
     },
 ))
-server, err := fib.Bind(config, handler)
+server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: handler})
 ```
 
 完整示例：
@@ -857,7 +852,7 @@ preface 开头时按 HTTP/2 处理，否则按 HTTP/1。这覆盖了三种场景
 
 ```go
 tlsConfig = fibhttp.ConfigureTLS(tlsConfig) // ALPN: h2, http/1.1
-server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(handler)))
+server, err := fib.New(config, fib.Binding{Addr: ":443", Handler: fibtls.NewServer(tlsConfig, fibhttp.NewHandler(handler))})
 ```
 
 - Handler 不用改：每个 stream 就是一个普通的 `*http.Request`（`Proto` 为 `HTTP/2.0`），
@@ -879,7 +874,7 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
   ```go
   httpConfig := fibhttp.DefaultConfig()
   httpConfig.StreamPool.MaxConcurrentHandlers = 8 // 单连接最多并发 8 个请求，0 表示不限
-  server, err := fib.Bind(config, fibhttp.NewHandlerWithConfig(httpConfig, handler))
+  server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandlerWithConfig(httpConfig, handler)})
   ```
 
   `MaxConcurrentHandlers` 为 N（>0）时限制单个连接同时处理的请求数：第 N 个请求在读取
@@ -952,7 +947,7 @@ HTTP/2 的一致性测试（h2spec 145 项全部通过，另有与 `net/http`、
 worker 读取，body 完整缓存后再交给回调；也可以用 `Go` 拿到 Future 等待结果：
 
 ```go
-engine, _ := fib.NewEngine(fib.DefaultConfig(), nil) // 或直接复用 server 的 Engine
+engine, _ := fib.New(fib.DefaultConfig()) // 或直接复用 server 的 Engine
 go engine.Run()
 client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig())
 
@@ -1067,7 +1062,7 @@ r.Route("/users", func(r *fibhttp.Router) {   // 前缀 /users 下的一切都�
 r.Handle("DELETE /users/{id}", deleteUser)    // 与 ServeMux 相同的 "METHOD /path" 写法
 r.Mount("/api/{version}", apiRouter)          // 挂载的 Router 路由剩余路径，带自己的中间件
 r.Mount("/debug/", pprofHandler)              // 非 Router 的 handler 拿到完整请求
-server, err := fib.Bind(config, fibhttp.NewHandler(r))
+server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(r)})
 ```
 
 pattern 语法：
@@ -1125,7 +1120,7 @@ handler := middleware.Chain(app,
     compress.New(),     // gzip / deflate
     etag.New(),         // ETag 与 If-None-Match → 304
 )
-server, err := fib.Bind(config, fibhttp.NewHandler(handler))
+server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(handler)})
 ```
 
 每个 Config 都有 `Next`，返回 true 时跳过该中间件。中间件通过 `Context` 的三个钩子改写
@@ -1149,13 +1144,11 @@ etag 外面，这样 ETag 按原始 body 计算，压缩后再改成弱 ETag。
 同一个 `fibhttp.Handler` 可以同时服务 HTTP/1.1、HTTP/2 和 HTTP/3：
 
 ```go
-config := fib.DefaultConfig()
-config.Network = "udp"
-config.Addr = ":443"
-server, err := fib.Bind(config, http3.NewHandler(tlsConfig, handler))
+server, err := fib.New(fib.DefaultConfig(),
+    fib.Binding{Network: "udp", Addr: ":443", Handler: http3.NewHandler(tlsConfig, handler)})
 ```
 
-- 服务端就是一个 UDP Engine，handler 用 `http3.NewHandler`（或 `NewHandlerWithConfig`
+- 服务端就是 Engine 的一个 UDP binding，handler 用 `http3.NewHandler`（或 `NewHandlerWithConfig`
   调整 `MaxHeaderBytes`、`MaxBodyBytes`、`MaxConcurrentStreams`、`MaxIdleTimeout`）。
   TLS 配置里的 ALPN 会自动加上 `h3`。
 - Engine 按对端地址区分 UDP 连接，每个发来 QUIC Initial 的地址对应一个 QUIC 连接，挂在
@@ -1253,7 +1246,7 @@ handler := websocket.NewHandler(websocket.HandlerFuncs{
         _ = c.WriteMessage(opcode, data)
     },
 })
-server, err := fib.Bind(config, handler)
+server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: handler})
 ```
 
 收到的 Ping 默认自动回复同样 payload 的 Pong，收到的 Pong 默认丢弃。
@@ -1410,7 +1403,7 @@ client 连接与 server 端连接走同一套 `Handler` 回调、同一个 worke
 `Connection` 类型：
 
 ```go
-engine, _ := fib.NewEngine(fib.DefaultConfig(), nil) // 或直接复用 server 的 Engine
+engine, _ := fib.New(fib.DefaultConfig()) // 或直接复用 server 的 Engine
 go engine.Run()
 dialer := websocket.NewDialer(engine, websocket.DefaultDialerConfig())
 
@@ -1585,13 +1578,13 @@ echo 和 p99 在等于核数时最好或持平，内存随 GOMAXPROCS 升高而�
 
 `prefork` 包把一个程序拆到多个进程上服务，做法同 fasthttp/fiber 的 prefork：调用 `prefork.Run`
 的进程成为 master，按同样的参数重新执行本程序启动若干子进程，自己不监听也不服务，只负责等待子
-进程、把 SIGINT/SIGTERM 转给它们；每个子进程里 `Run` 调用传入的 `serve`，`serve` 照常 `fib.Bind`
+进程、把 SIGINT/SIGTERM 转给它们；每个子进程里 `Run` 调用传入的 `serve`，`serve` 照常 `fib.New`
 各个 Engine。子进程里绑定的每个 Engine 都自动带 `SO_REUSEPORT`（相当于设置了
 `Config.ReusePort`），于是所有子进程监听同样的端口，内核按连接（UDP 按数据报）的地址哈希分给它们。
 
 ```go
 func run(ctx context.Context) error {
-	engine, err := fib.Bind(config, handler) // 每个子进程各自加载数据、绑定 Engine
+	engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: handler}) // 每个子进程各自加载数据、创建 Engine
 	if err != nil {
 		return err
 	}

@@ -49,27 +49,15 @@ func (e *Engine) openBackend() error {
 			// Its pollers accept for it; see Config.ReusePort.
 			continue
 		}
-		events := uint32(syscall.EPOLLIN) | epollET
-		if l.shared {
-			// Every poller waits on the engine's socket; see
-			// Config.EngineLoop. Exclusive, a connection arriving wakes one
-			// of them that is waiting rather than all.
-			events |= epollExclusive
-		}
-		if err = e.addFD(l.fd, listenerToken(l.fd), events); err != nil && l.shared && err == syscall.EINVAL {
-			// Kernels before 4.5 know no EPOLLEXCLUSIVE, and wake them all.
-			err = e.addFD(l.fd, listenerToken(l.fd), events&^epollExclusive)
-		}
-		if err != nil {
+		if err = e.watchListener(l); err != nil {
 			break
 		}
 	}
-	// UDP sockets are level-triggered, so the loop can stop reading one after
-	// its share of a round and still hear about the rest. Those of an engine
-	// whose pollers read for it go to the first poller; see openUDPBeside.
+	// Those of an engine whose pollers read for it go to the first poller;
+	// see openUDPBeside.
 	for _, l := range e.udpListeners {
 		if err == nil && !e.udpSpread {
-			err = e.addFD(l.fd, udpToken(l.fd), uint32(syscall.EPOLLIN))
+			err = e.watchUDP(l.fd)
 		}
 	}
 	if err == nil {
@@ -350,6 +338,35 @@ func (e *Engine) registerDatagram(fd int, token uint64) error {
 func (e *Engine) unregister(fd int) {
 	_ = syscall.EpollCtl(e.epollFD, syscall.EPOLL_CTL_DEL, fd, nil)
 }
+
+// watchListener has the loop wait on a TCP or Unix listener for the
+// connections it takes.
+func (e *Engine) watchListener(l streamListener) error {
+	events := uint32(syscall.EPOLLIN) | epollET
+	if l.shared {
+		// Every poller waits on the engine's socket; see
+		// Config.EngineLoop. Exclusive, a connection arriving wakes one
+		// of them that is waiting rather than all.
+		events |= epollExclusive
+	}
+	err := e.addFD(l.fd, listenerToken(l.fd), events)
+	if err == syscall.EINVAL && l.shared {
+		// Kernels before 4.5 know no EPOLLEXCLUSIVE, and wake them all.
+		err = e.addFD(l.fd, listenerToken(l.fd), events&^epollExclusive)
+	}
+	return err
+}
+
+// watchUDP has the loop read a UDP socket's datagrams. UDP sockets are
+// level-triggered, so the loop can stop reading one after its share of a
+// round and still hear about the rest.
+func (e *Engine) watchUDP(fd int) error {
+	return e.addFD(fd, udpToken(fd), uint32(syscall.EPOLLIN))
+}
+
+// unwatch has the loop stop waiting on a listener or a UDP socket, which
+// another loop may go on waiting on.
+func (e *Engine) unwatch(fd int) { e.unregister(fd) }
 
 // pausesInPlace says reads pause by the connection's readPaused flag alone:
 // the socket stays registered for input, an edge it raises while paused is

@@ -10,12 +10,10 @@
 // goroutine in between:
 //
 //	server := socks.NewServer(socks.Config{})
-//	config := fib.DefaultConfig()
-//	config.Bindings = []fib.Binding{
-//		{Addr: ":1080", Handler: server},
-//		{Network: "udp", Addr: ":1080", Handler: server}, // for UDP ASSOCIATE
-//	}
-//	engine, err := fib.Bind(config, nil)
+//	engine, err := fib.New(fib.DefaultConfig(),
+//		fib.Binding{Addr: ":1080", Handler: server},
+//		fib.Binding{Network: "udp", Addr: ":1080", Handler: server}, // for UDP ASSOCIATE
+//	)
 //
 // A Dialer opens connections through a SOCKS proxy without blocking, the way
 // fib.Engine.DialWithHandler opens them directly: the handler it is given

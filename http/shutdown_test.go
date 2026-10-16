@@ -23,8 +23,7 @@ import (
 func shutdownServer(t *testing.T, handler fib.Handler) (*fib.Engine, string, chan error) {
 	t.Helper()
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, handler)
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,5 +365,81 @@ func TestShutdownDeadlineThenClose(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the client still waits after Close")
+	}
+}
+
+// TestShutdownBindingHTTP1 checks ShutdownBinding against HTTP/1: the
+// binding's idle connection is closed, its request in flight is answered
+// with Connection: close, and another binding's connection is kept alive.
+func TestShutdownBindingHTTP1(t *testing.T) {
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	handler := NewHandler(slowHandler(entered, release))
+	engine, addr, _ := shutdownServer(t, handler)
+	i, err := engine.AddBinding(fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrs, err := engine.BindingAddrs(i)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drained := addrs[0].String()
+
+	get := func(c net.Conn, reader *bufio.Reader, path string) *stdhttp.Response {
+		t.Helper()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.WriteString(c, "GET "+path+" HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := stdhttp.ReadResponse(reader, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp
+	}
+	dial := func(addr string) (net.Conn, *bufio.Reader) {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c, bufio.NewReader(c)
+	}
+	idle, idleReader := dial(drained)
+	get(idle, idleReader, "/fast")
+	kept, keptReader := dial(addr)
+	get(kept, keptReader, "/fast")
+
+	busy, busyReader := dial(drained)
+	_ = busy.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(busy, "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		done <- engine.ShutdownBinding(ctx, i)
+	}()
+	expectClosed(t, idle, "the binding's idle connection")
+	close(release)
+	resp, err := stdhttp.ReadResponse(busyReader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !resp.Close {
+		t.Error("the request in flight was not answered with Connection: close")
+	}
+	expectClosed(t, busy, "the binding's busy connection")
+	if err := <-done; err != nil {
+		t.Fatalf("ShutdownBinding: %v", err)
+	}
+	if resp := get(kept, keptReader, "/fast"); resp.Close {
+		t.Error("another binding's connection was closed")
 	}
 }

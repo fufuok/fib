@@ -48,7 +48,7 @@ func TestRunEchoes(t *testing.T) {
 			go func() { done <- run(ctx, args, out, func(addr string) { addrs <- addr }) }()
 			addr := <-addrs
 
-			engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+			engine, err := fib.New(fib.DefaultConfig())
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -41,7 +41,7 @@ const (
 // not know is dropped rather than opening a connection.
 func (e *Engine) Shutdown(ctx context.Context) error {
 	e.beginShutdown()
-	err := e.awaitDrained(ctx)
+	err := e.awaitDrained(ctx, -1)
 	e.Stop()
 	return err
 }
@@ -53,10 +53,10 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 func (e *Engine) ShuttingDown() bool { return e.root().draining.Load() }
 
 // awaitDrained waits until no connection the engine accepted is left open,
-// asking the loops at a falling rate, each time telling the connections that
-// remain the engine is shutting down. It returns ctx.Err() if ctx is done
-// first.
-func (e *Engine) awaitDrained(ctx context.Context) error {
+// or none the binding-th binding took for a binding of zero or more, asking
+// the loops at a falling rate, each time telling the connections that remain
+// they are to finish. It returns ctx.Err() if ctx is done first.
+func (e *Engine) awaitDrained(ctx context.Context, binding int) error {
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -64,7 +64,7 @@ func (e *Engine) awaitDrained(ctx context.Context) error {
 		}
 	}()
 	for wait := shutdownPollMin; ; wait = min(2*wait, shutdownPollMax) {
-		left, err := e.shutdownRound(ctx)
+		left, err := e.shutdownRound(ctx, binding)
 		if err != nil || left == 0 {
 			return err
 		}

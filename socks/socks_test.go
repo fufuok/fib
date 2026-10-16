@@ -21,18 +21,12 @@ import (
 
 const testTimeout = 10 * time.Second
 
-// run binds handler with config, or makes an engine that only dials when
-// config listens nowhere, and runs it until the test ends.
-func run(t *testing.T, config fib.Config, handler fib.Handler, listen bool) *fib.Engine {
+// run makes an engine with config that listens on bindings, or only dials
+// when there are none, and runs it until the test ends.
+func run(t *testing.T, config fib.Config, bindings ...fib.Binding) *fib.Engine {
 	t.Helper()
 	config.Name = "socks-" + t.Name()
-	var engine *fib.Engine
-	var err error
-	if listen {
-		engine, err = fib.Bind(config, handler)
-	} else {
-		engine, err = fib.NewEngine(config, handler)
-	}
+	engine, err := fib.New(config, bindings...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,12 +45,10 @@ func run(t *testing.T, config fib.Config, handler fib.Handler, listen bool) *fib
 func proxy(t *testing.T, config Config) (string, *Server) {
 	t.Helper()
 	server := NewServer(config)
-	engineConfig := fib.DefaultConfig()
-	engineConfig.Bindings = []fib.Binding{
-		{Addr: "127.0.0.1:0", Handler: server},
-		{Network: "udp", Addr: "127.0.0.1:0", Handler: server},
-	}
-	engine := run(t, engineConfig, nil, true)
+	engine := run(t, fib.DefaultConfig(),
+		fib.Binding{Addr: "127.0.0.1:0", Handler: server},
+		fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: server},
+	)
 	addrs, err := engine.BindingAddrs(0)
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +57,7 @@ func proxy(t *testing.T, config Config) (string, *Server) {
 }
 
 func clientEngine(t *testing.T) *fib.Engine {
-	return run(t, fib.DefaultConfig(), nil, false)
+	return run(t, fib.DefaultConfig())
 }
 
 // echo is a TCP echo server of the net package's, so that what the proxy
@@ -825,9 +817,7 @@ func TestUDPThroughServer(t *testing.T) {
 // UDP associations away on an engine without UDP.
 func TestUDPWithoutUDPBinding(t *testing.T) {
 	server := NewServer(Config{})
-	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine := run(t, config, server, true)
+	engine := run(t, fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:0", Handler: server})
 	addr, err := engine.LocalAddr()
 	if err != nil {
 		t.Fatal(err)

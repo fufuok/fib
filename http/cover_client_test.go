@@ -167,7 +167,7 @@ func TestCvCliDoRejectsUnframable(t *testing.T) {
 
 // A dial the engine refuses at once fails the request, over http and https.
 func TestCvCliDialOnStoppedEngine(t *testing.T) {
-	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

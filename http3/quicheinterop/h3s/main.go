@@ -57,10 +57,8 @@ func main() {
 		addrs = append(addrs, fmt.Sprintf("0.0.0.0:%d", p))
 	}
 	ec := fib.DefaultConfig()
-	ec.Network = "udp"
-	ec.Addrs = addrs
 	ec.UDPIdleTimeout = 150 * time.Second
-	engine, err := fib.Bind(ec, handler)
+	engine, err := fib.New(ec, fib.Binding{Network: "udp", Addrs: addrs, Handler: handler})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

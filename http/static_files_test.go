@@ -29,8 +29,7 @@ func serveStatic(t *testing.T, secure bool, handler fibhttp.HandlerFunc) string 
 		h = fibtls.NewServer(fibhttp.ConfigureTLS(serverConfig), h)
 	}
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, h)
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: h})
 	if err != nil {
 		t.Fatal(err)
 	}

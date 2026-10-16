@@ -62,12 +62,10 @@ func runChild() int {
 			time.Sleep(time.Minute)
 			return nil
 		}
-		config := fib.DefaultConfig()
-		config.Addr = os.Getenv(addrEnv)
 		reply := fmt.Sprintf("%d %d %d", prefork.Child(), runtime.GOMAXPROCS(0), prefork.Children())
-		engine, err := fib.Bind(config, fib.HandlerFuncs{Data: func(c *fib.Connection, _ []byte) {
+		engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: os.Getenv(addrEnv), Handler: fib.HandlerFuncs{Data: func(c *fib.Connection, _ []byte) {
 			_ = c.Send([]byte(reply))
-		}})
+		}}})
 		if err != nil {
 			return err
 		}

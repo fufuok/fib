@@ -44,8 +44,7 @@ func serve(t *testing.T, h fib.Handler) (*fib.Engine, string) {
 	t.Helper()
 	config := fib.DefaultConfig()
 	config.Name = "mux-" + t.Name()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, h)
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: h})
 	if err != nil {
 		t.Fatal(err)
 	}

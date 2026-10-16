@@ -23,8 +23,7 @@ func serveTLS(t *testing.T, handler fib.Handler) (addr, certFile string) {
 	t.Helper()
 	serverTLS, _, certFile := uploadtest.TLS(t)
 	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:0"
-	engine, err := fib.Bind(config, fibtls.NewServer(serverTLS, handler))
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: fibtls.NewServer(serverTLS, handler)})
 	if err != nil {
 		t.Fatal(err)
 	}

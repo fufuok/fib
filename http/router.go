@@ -26,7 +26,7 @@ import (
 //		r.Get("/{id}/files/*", getFile) // c.Param("*")
 //	})
 //	r.Mount("/debug", pprof.New())
-//	engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+//	engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(r)})
 //
 // A pattern is a path of static text, parameters and an optional catch-all:
 //

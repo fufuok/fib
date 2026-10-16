@@ -56,7 +56,7 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
 - **背压**：每连接有写水位线（64 KiB），满了就暂停读取；全服务待发字节预算（`MaxPendingBytes`）
   可选、默认关闭，用来限制总量；`HoldReads` 提供读端流控。
 - **池**：随负载伸缩的自适应 worker 池；按 Go 分配器 size class 对齐的分级 buffer 池。
-- **一个引擎，多种协议**：`Config.Bindings` 为每组地址（TCP、Unix 或 UDP）各配一个 handler，
+- **一个引擎，多种协议**：传给 `fib.New` 的每个 `Binding` 为一组地址（TCP、Unix 或 UDP）各配一个 handler，
   一个引擎即可同时提供 HTTP、HTTPS、HTTP/3、WebSocket、gRPC 和裸 TCP，共享事件循环、池和 buffer。
   `mux` 包更进一步：按客户端最先发送的字节识别协议，让多种协议共用同一个端口。
 - **异步客户端**：非阻塞 dial，以及 HTTP/1.x、HTTP/2、HTTP/3、WebSocket 客户端，结果通过回调或
@@ -98,9 +98,10 @@ func main() {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
 	})
 
-	config := fib.DefaultConfig()
-	config.Addr = "127.0.0.1:8080"
-	engine, err := fib.Bind(config, fibhttp.NewHandler(middleware.Chain(app, recover.New(), logger.New())))
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
+		Addr:    "127.0.0.1:8080",
+		Handler: fibhttp.NewHandler(middleware.Chain(app, recover.New(), logger.New())),
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -113,9 +114,9 @@ func main() {
 
 这一个 handler 在同一端口上同时提供 HTTP/1.x 和 h2c。
 
-- **TLS**：改为 bind `fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(app))`，
+- **TLS**：binding 的 handler 改为 `fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(app))`，
   HTTP/2 通过 ALPN 协商。
-- **HTTP/3**：用一个 UDP engine（`config.Network = "udp"`）bind `http3.NewHandler(tlsConfig, app)`，
+- **HTTP/3**：加一个 UDP binding（`fib.Binding{Network: "udp", ...}`），handler 用 `http3.NewHandler(tlsConfig, app)`，
   `app` 不变。
 
 ### 兼容标准库 `http.Handler`
@@ -134,7 +135,7 @@ mux.Handle("/files/", stdhttp.StripPrefix("/files/", stdhttp.FileServer(stdhttp.
 std := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 	mux.ServeHTTP(c, c.Request) // c 就是 http.ResponseWriter
 })
-engine, err := fib.Bind(config, fibhttp.NewHandler(std))
+engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(std)})
 ```
 
 任何 `http.Handler` 都可以这样接入，包括 chi、gorilla/mux 和 gin 的 `*gin.Engine`，在 HTTP/1.x、
@@ -172,7 +173,7 @@ r.Route("/users", func(r *fibhttp.Router) {
 	r.Get("/{id}/files/*", file) // c.Param("*") 是路径的剩余部分
 })
 r.Mount("/api/{version}", apiRouter)
-engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(r)})
 ```
 
 匹配优先级依次是：静态文本、带正则的参数、普通参数、通配。GET 路由同时响应 HEAD。路径存在但方法
@@ -204,7 +205,7 @@ app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 ```
 
 只提供 WebSocket 时，可以直接 bind WebSocket handler：
-`fib.Bind(config, websocket.NewHandlerWithConfig(cfg, handlers))`。
+`fib.New(config, fib.Binding{Addr: ":8080", Handler: websocket.NewHandlerWithConfig(cfg, handlers)})`。
 
 同一条消息发给多个连接时，先准备一次：
 
@@ -226,7 +227,7 @@ for _, c := range conns {
 ```go
 server := arpc.NewServer()
 server.Handler.Handle("/echo", func(ctx *arpc.Context) { ctx.Write(ctx.Body()) })
-engine, err := fib.Bind(config, server) // 或 fibtls.NewServer(tlsConfig, server)
+engine, err := fib.New(config, fib.Binding{Addr: ":9000", Handler: server}) // 或 fibtls.NewServer(tlsConfig, server)
 
 client, err := arpc.Dial(clientEngine, "tcp", addr, 3*time.Second, nil)
 var rsp string
@@ -242,7 +243,7 @@ handler 默认在 engine 的 handler 池（与 HTTP/2、HTTP/3 相同的 streams
 ```go
 server := grpc.NewServer()                    // grpc.TaskPool(pool) 可改用自己的协程池
 pb.RegisterGreeterServer(server, &greeter{})  // protoc-gen-go-grpc 生成的代码，import 改指向 fib/grpc
-engine, err := fib.Bind(config, server)       // h2c；TLS 用 fibtls.NewServer(grpc.ConfigureTLS(c), server)
+engine, err := fib.New(config, fib.Binding{Addr: ":50051", Handler: server}) // h2c；TLS 用 fibtls.NewServer(grpc.ConfigureTLS(c), server)
 
 conn, err := grpc.NewClient("127.0.0.1:50051", grpc.WithEngine(clientEngine))
 reply, err := pb.NewGreeterClient(conn).SayHello(ctx, &pb.HelloRequest{Name: "fib"})
@@ -260,7 +261,7 @@ reply, err := pb.NewGreeterClient(conn).SayHello(ctx, &pb.HelloRequest{Name: "fi
 r := fibhttp.NewRouter()
 r.Handle("/helloworld.Greeter/*", server)
 r.Get("/", index)
-engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(r)})
 ```
 
 调用发送的每条消息都会立即发出，并受 stream 流控限速，因此服务端流的消息逐条到达客户端。客户端
@@ -271,11 +272,10 @@ engine, err := fib.Bind(config, fibhttp.NewHandler(r))
 
 ```go
 server := socks.NewServer(socks.Config{Authenticate: check}) // Authenticate 为 nil 时无需登录
-config.Bindings = []fib.Binding{
-	{Addr: ":1080", Handler: server},
-	{Network: "udp", Addr: ":1080", Handler: server}, // UDP ASSOCIATE
-}
-engine, err := fib.Bind(config, nil) // 或在共用端口上用 mux.Route{Match: mux.SOCKS(), Handler: server}
+engine, err := fib.New(config,
+	fib.Binding{Addr: ":1080", Handler: server},
+	fib.Binding{Network: "udp", Addr: ":1080", Handler: server}, // UDP ASSOCIATE
+) // 或在共用端口上用 mux.Route{Match: mux.SOCKS(), Handler: server}
 
 proxy, err := socks.ParseURL("socks5h://user:pass@127.0.0.1:1080")
 clientConfig := fibhttp.DefaultClientConfig()
@@ -294,42 +294,38 @@ HTTP/3（RFC 9114 第 4.4 节），得到一个 `Tunnel`，与 `Upgrade` 为某�
 
 ```go
 proxy := fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{Authenticate: check})
-engine, err := fib.Bind(config, mux.New(
+engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: mux.New(
 	mux.Route{Match: mux.SOCKS(), Handler: socks.NewServer(socks.Config{Authenticate: check})},
 	mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(proxy)}, // curl -x http://host:port
-))
+)})
 ```
 
 ### 裸 TCP
 
 ```go
-config := fib.DefaultConfig()
-config.Addr = "127.0.0.1:9000"
-engine, err := fib.Bind(config, fib.HandlerFuncs{
+engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:9000", Handler: fib.HandlerFuncs{
 	Data: func(c *fib.Connection, data []byte) { // data 只在本次回调内有效
 		if c.Send(data) != nil {
 			c.Close()
 		}
 	},
-})
+}})
 ```
 
 ### 一个引擎处理多种协议
 
-每个 `Binding` 是一个或一组地址，有自己的网络类型和自己的 handler；没有指定 handler 的 binding
-使用传给 `Bind` 的那个。
+每个 `Binding` 是一个或一组地址，有自己的网络类型和自己的 handler，传给 `fib.New` 的每个 binding
+都必须指定 handler；不传 binding 的 `fib.New` 创建只用于拨号的客户端引擎。
 
 ```go
-config := fib.DefaultConfig()
-config.Bindings = []fib.Binding{
-	{Addr: ":80"}, // 明文 HTTP，使用传给 Bind 的 handler
-	{Addrs: []string{":443", ":8443"}, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
-	{Network: "udp", Addr: ":443", Handler: http3.NewHandler(tlsConfig, web)},
-	{Addr: ":8081", Handler: websocket.NewHandler(wsHandler)},
-	{Addr: ":9000", Handler: grpcServer},
-	{Network: "unix", Addr: "/run/app.sock", Handler: admin},
-}
-engine, err := fib.Bind(config, fibhttp.NewHandler(web))
+engine, err := fib.New(fib.DefaultConfig(),
+	fib.Binding{Addr: ":80", Handler: fibhttp.NewHandler(web)}, // 明文 HTTP
+	fib.Binding{Addrs: []string{":443", ":8443"}, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
+	fib.Binding{Network: "udp", Addr: ":443", Handler: http3.NewHandler(tlsConfig, web)},
+	fib.Binding{Addr: ":8081", Handler: websocket.NewHandler(wsHandler)},
+	fib.Binding{Addr: ":9000", Handler: grpcServer},
+	fib.Binding{Network: "unix", Addr: "/run/app.sock", Handler: admin},
+)
 addrs, err := engine.BindingAddrs(2) // binding 2 实际监听的地址，包括 ":0" 由内核选的端口
 ```
 
@@ -337,16 +333,28 @@ addrs, err := engine.BindingAddrs(2) // binding 2 实际监听的地址，包括
 buffer、水位线、`IOPollers` 和 `ReusePort` 对每个 binding 都生效。绑定是整体的：任一地址失败，
 已打开的地址都会释放。
 
+引擎运行期间也可以增减 binding。`AddBinding` 新增一个 binding 并返回它的序号；`RemoveBinding`
+关闭它的监听器，已接受的连接保持打开（UDP binding 的 peer 随 socket 一起关闭）；`ShutdownBinding`
+像 `Shutdown` 处理整个引擎那样优雅地排空这一个 binding：通知它的连接结束（只有这些连接的
+`Connection.ShuttingDown` 为 true），context 结束时关闭剩下的连接：
+
+```go
+i, err := engine.AddBinding(fib.Binding{Addr: ":8082", Handler: fibhttp.NewHandler(canary)})
+// ...
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+err = engine.ShutdownBinding(ctx, i) // 其他 binding 照常服务
+```
+
 多种协议也可以共用一个端口。`mux` 查看客户端最先发送的字节，选出能识别它们的路由，再用
 `Connection.SetHandler` 把连接交出去，此后引擎直接调用选中的 handler：
 
 ```go
-config.Addr = ":8000"
-engine, err := fib.Bind(config, mux.NewWithConfig(mux.Config{Fallback: rawEcho},
+engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: mux.NewWithConfig(mux.Config{Fallback: rawEcho},
 	mux.Route{Match: mux.TLS(), Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
 	mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(web)}, // HTTP/1.x 与 h2c
 	mux.Route{Match: mux.Prefix("PING"), Handler: pinger},
-))
+)})
 ```
 
 只有客户端先发言的协议才能识别；服务端先打招呼的协议（如 SMTP、MySQL）需要单独的 binding。
@@ -356,7 +364,7 @@ engine, err := fib.Bind(config, mux.NewWithConfig(mux.Config{Fallback: rawEcho},
 第一个 HTTP/2 HEADERS（并给 grpc-go 这类等待服务端 SETTINGS 的客户端先发送 SETTINGS）：
 
 ```go
-engine, err := fib.Bind(config, multiproto.New(multiproto.Config{
+engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: multiproto.New(multiproto.Config{
 	TLS:       fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), web),
 	HTTP1:     web, // fibhttp.NewHandler(...)
 	HTTP2:     web,
@@ -365,7 +373,7 @@ engine, err := fib.Bind(config, multiproto.New(multiproto.Config{
 	SOCKS:     socks.NewServer(socks.Config{}),
 	HTTPProxy: fibhttp.NewHandler(fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{})), // CONNECT, absolute URLs
 	ARPC:      arpcServer,
-}))
+})})
 ```
 
 ### 示例
