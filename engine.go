@@ -1189,15 +1189,15 @@ type Config struct {
 	// accepts on a TCP socket of its own, which it has only where all of
 	// these hold: the engine has IOPollers and no EngineLoop, so the pollers
 	// listen; the address is TCP on Linux, where each poller binds a socket
-	// of its own beside the others with SO_REUSEPORT. AcceptKernelHash, the
-	// default, has the poller that accepted it serve it: the kernel's hash of
-	// the connection's addresses, which chose the socket, chooses the poller,
-	// and nothing is handed on. AcceptFDModulo hands it to the poller its
-	// descriptor picks, as a connection accepted anywhere else always is,
-	// which spreads connections by count but costs a wake-up and a
-	// registration on another loop, and lands every connection on half the
-	// pollers where a process opens one descriptor of its own for each it
-	// accepts, as a proxy dialing upstream does.
+	// of its own beside the others with SO_REUSEPORT. AcceptFDModulo, the
+	// default, hands it to the poller its descriptor picks, as a connection
+	// accepted anywhere else always is, which spreads connections by count
+	// but costs a wake-up and a registration on another loop, and lands
+	// every connection on half the pollers where a process opens one
+	// descriptor of its own for each it accepts, as a proxy dialing upstream
+	// does. AcceptKernelHash has the poller that accepted it serve it: the
+	// kernel's hash of the connection's addresses, which chose the socket,
+	// chooses the poller, and nothing is handed on.
 	//
 	// The engine logs which placement each listener takes when it starts
 	// serving, with LogStatus, and warns, whether or not LogStatus is set,
@@ -1218,13 +1218,10 @@ type Config struct {
 	// however many cores there were to serve them: HttpArena's limited-conn
 	// profile, ten requests a connection over 4096 at a time on 64 CPUs,
 	// served 0.94M requests a second that way and 1.65M with the pollers
-	// accepting. Each poller serves the connections it accepts, so the
-	// kernel's hash is also what balances them: a connection stays with the
-	// poller its hash picked, however busy that poller is. Handing each to
-	// the poller its descriptor picks instead served limited-conn 0.2% to
-	// 0.5% slower on 8 CPUs, and pairs descriptors badly where a process
-	// opens one descriptor of its own for every connection it accepts, as a
-	// proxy dialing upstream does. Without ReusePort the engine first claims
+	// accepting. A poller then hands each connection it accepts to the
+	// poller its descriptor picks, or serves it itself under
+	// AcceptKernelHash, where the kernel's hash is what balances them; the
+	// two served limited-conn within noise of each other on 8 CPUs. Without ReusePort the engine first claims
 	// the address with a socket bound without SO_REUSEPORT, so that an
 	// address another socket holds is refused with EADDRINUSE as it always
 	// was, and only a socket that sets SO_REUSEPORT itself can join the

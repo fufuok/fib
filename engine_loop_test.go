@@ -232,12 +232,14 @@ func TestNoEngineLoopPlacesAcceptedByDescriptor(t *testing.T) {
 	}
 }
 
-// A poller that accepts on a TCP socket of its own serves the connection
-// itself rather than handing it to the poller its descriptor picks.
+// Under AcceptKernelHash a poller that accepts on a TCP socket of its own
+// serves the connection itself rather than handing it to the poller its
+// descriptor picks.
 func TestPollersKeepOwnAccepts(t *testing.T) {
 	const pollers, conns = 3, 30
 	config := pollerConfig("pollers-keep-own", pollers)
 	config.Addr = "127.0.0.1:0"
+	config.AcceptPlacement = AcceptKernelHash
 	accepted := make(chan *Connection, conns)
 	server, err := Bind(config, HandlerFuncs{
 		Open: func(c *Connection) { accepted <- c },
@@ -272,8 +274,8 @@ func TestPollersKeepOwnAccepts(t *testing.T) {
 	}
 }
 
-// Under AcceptFDModulo a poller hands every connection it accepts on a
-// socket of its own to the poller its descriptor picks.
+// Under AcceptFDModulo, the default, a poller hands every connection it
+// accepts on a socket of its own to the poller its descriptor picks.
 func TestAcceptFDModuloOnOwnSockets(t *testing.T) {
 	const pollers, conns = 3, 30
 	config := pollerConfig("accept-fd-modulo", pollers)
@@ -309,7 +311,7 @@ func TestAcceptFDModuloOnOwnSockets(t *testing.T) {
 func TestAcceptPlacementInvalid(t *testing.T) {
 	config := pollerConfig("accept-invalid", 2)
 	config.Addr = "127.0.0.1:0"
-	config.AcceptPlacement = AcceptFDModulo + 1
+	config.AcceptPlacement = AcceptKernelHash + 1
 	if server, err := Bind(config, nil); err == nil {
 		server.Close()
 		t.Fatal("an unknown AcceptPlacement was accepted")
@@ -347,10 +349,10 @@ func TestAcceptPlacementLogged(t *testing.T) {
 		want       []string
 		warn       bool
 	}{
-		{"default", false, AcceptKernelHash, true, []string{"=pollers,kernel-hash", "=pollers-shared-socket,fd-modulo"}, false},
-		{"fd-modulo", false, AcceptFDModulo, true, []string{"=pollers,fd-modulo"}, false},
-		{"engine-loop", true, AcceptKernelHash, true, []string{"=engine-loop,fd-modulo"}, false},
-		{"engine-loop-warns", true, AcceptFDModulo, false, nil, true},
+		{"default", false, AcceptFDModulo, true, []string{"=pollers,fd-modulo", "=pollers-shared-socket,fd-modulo"}, false},
+		{"kernel-hash", false, AcceptKernelHash, true, []string{"=pollers,kernel-hash"}, false},
+		{"engine-loop", true, AcceptFDModulo, true, []string{"=engine-loop,fd-modulo"}, false},
+		{"engine-loop-warns", true, AcceptKernelHash, false, nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out lockedBuffer

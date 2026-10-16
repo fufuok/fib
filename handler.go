@@ -384,7 +384,7 @@ func (c *Connection) Engine() *Engine { return c.engine.root() }
 // Config.LogStatus asks for it.
 func (e *Engine) logRun() {
 	accept, applies := e.acceptPlacements()
-	if e.acceptPlacement != AcceptKernelHash && !applies {
+	if e.acceptPlacement != AcceptFDModulo && !applies {
 		// Said whatever LogStatus says: the setting asked for does nothing.
 		slog.Warn("fib: Config.AcceptPlacement applies to no listener: it needs IOPollers without EngineLoop and a TCP address on Linux, where each poller listens on a socket of its own with SO_REUSEPORT",
 			"engine", e.name, "acceptPlacement", e.acceptPlacement.String())

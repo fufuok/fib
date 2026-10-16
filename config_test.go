@@ -177,13 +177,17 @@ func TestSetPoolSizingKeepsFieldsLeftUnset(t *testing.T) {
 	}
 }
 
-// DefaultConfig serves on pollers, with no loop of the engine's own, and
-// binds its listeners with SO_REUSEPORT.
+// DefaultConfig serves on pollers, with no loop of the engine's own, binds
+// its listeners with SO_REUSEPORT, and places accepted connections by
+// descriptor, as the zero Config does.
 func TestDefaultIOPollers(t *testing.T) {
 	config := DefaultConfig()
-	if !config.IOPollers || config.EngineLoop || !config.ReusePort {
-		t.Errorf("IOPollers %v, EngineLoop %v, ReusePort %v, want true, false, true",
-			config.IOPollers, config.EngineLoop, config.ReusePort)
+	if !config.IOPollers || config.EngineLoop || !config.ReusePort || config.AcceptPlacement != AcceptFDModulo {
+		t.Errorf("IOPollers %v, EngineLoop %v, ReusePort %v, AcceptPlacement %v, want true, false, true, fd-modulo",
+			config.IOPollers, config.EngineLoop, config.ReusePort, config.AcceptPlacement)
+	}
+	if (Config{}).AcceptPlacement != AcceptFDModulo {
+		t.Error("the zero Config does not place accepted connections by descriptor")
 	}
 }
 

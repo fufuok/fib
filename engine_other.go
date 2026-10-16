@@ -572,7 +572,7 @@ type Config struct {
 	EngineLoop bool
 	// AcceptPlacement picks the poller an epoll engine's poller hands a
 	// connection it accepted to. This backend has no pollers, ignores it,
-	// and warns when it is set.
+	// and warns when it is set to other than AcceptFDModulo.
 	AcceptPlacement AcceptPlacement
 	// ReusePort binds an epoll or kqueue engine's listeners with SO_REUSEPORT.
 	// This backend listens through the net package, and ignores it.

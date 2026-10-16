@@ -188,21 +188,21 @@ func (c *Config) validateTaskPool() error {
 type AcceptPlacement int
 
 const (
+	// AcceptFDModulo, the default, hands the connection to the poller its
+	// descriptor picks modulo the number of pollers.
+	AcceptFDModulo AcceptPlacement = iota
 	// AcceptKernelHash has the poller that accepted a connection serve it,
 	// so the kernel's hash of the connection's addresses, which picked the
 	// socket, picks the poller.
-	AcceptKernelHash AcceptPlacement = iota
-	// AcceptFDModulo hands the connection to the poller its descriptor picks
-	// modulo the number of pollers.
-	AcceptFDModulo
+	AcceptKernelHash
 )
 
 func (p AcceptPlacement) String() string {
 	switch p {
-	case AcceptKernelHash:
-		return "kernel-hash"
 	case AcceptFDModulo:
 		return "fd-modulo"
+	case AcceptKernelHash:
+		return "kernel-hash"
 	}
 	return fmt.Sprintf("AcceptPlacement(%d)", int(p))
 }

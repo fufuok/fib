@@ -666,17 +666,17 @@ func (e *Engine) acceptConnections(listenFD int) {
 			// one back until the peer's delayed ACK.
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		}
-		// A poller that accepted on a socket of its own keeps the
-		// connection under AcceptKernelHash: the kernel already spread
-		// connections over the pollers' sockets by a hash of their
-		// addresses, and handing it on would cost a wake-up and a
-		// registration on another loop. One accepted on a socket every
-		// poller waits on, or by the engine's own loop, goes to the poller
-		// its descriptor picks, since the kernel wakes the pollers sharing a
-		// socket unevenly, and so does every one under AcceptFDModulo.
+		// A connection goes to the poller its descriptor picks, unless a
+		// poller accepted it on a socket of its own under AcceptKernelHash:
+		// the kernel already spread connections over the pollers' sockets by
+		// a hash of their addresses, and the poller keeps it, sparing a
+		// wake-up and a registration on another loop. One accepted on a
+		// socket every poller waits on, or by the engine's own loop, always
+		// goes by descriptor, since the kernel wakes the pollers sharing a
+		// socket unevenly.
 		p := e
 		root := e.root()
-		if len(root.pollers) > 0 && (e.parent == nil || l.shared || root.acceptPlacement == AcceptFDModulo) {
+		if len(root.pollers) > 0 && (e.parent == nil || l.shared || root.acceptPlacement != AcceptKernelHash) {
 			p = root.pollers[fd%len(root.pollers)]
 		}
 		if p == e {

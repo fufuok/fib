@@ -50,9 +50,10 @@ func checkPoller(t *testing.T, e *Engine, c *Connection, fd int) {
 }
 
 // keptByAcceptor reports whether c was accepted by a poller on a TCP socket
-// of its own, which keeps the connection rather than handing it on.
+// of its own under AcceptKernelHash, which keeps the connection rather than
+// handing it on.
 func keptByAcceptor(e *Engine, c *Connection) bool {
-	if c.dialed {
+	if c.dialed || e.acceptPlacement != AcceptKernelHash {
 		return false
 	}
 	if c.flags.has(flagUnix) {
@@ -66,8 +67,7 @@ func keptByAcceptor(e *Engine, c *Connection) bool {
 	return false
 }
 
-// Accepted connections go to the poller their descriptor picks, or stay with
-// the poller that accepted them on a socket of its own, which hands
+// Accepted connections go to the poller their descriptor picks, which hands
 // their rounds to the engine's workers, and the stream pool is sized as it
 // is without pollers.
 func TestPollersServeAcceptedConnections(t *testing.T) {
