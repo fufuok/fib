@@ -63,6 +63,28 @@ Behavior users need to be aware of.
 
 - QUIC's `MaxIdleTimeout` (default 30s) must stay below the engine's
   `Config.UDPIdleTimeout` (default 60s), or the engine closes a quiet peer first.
+
+### Server timeouts
+
+`http3.Config` bounds every wait a client could stretch out, and
+`DefaultConfig` sets each of them:
+
+| Bounds | Setting | `DefaultConfig` | On expiry |
+| --- | --- | --- | --- |
+| The QUIC handshake | `HandshakeTimeout` | QUIC's 10s | the connection closes |
+| A connection that hears no packet | `MaxIdleTimeout` (QUIC's) | 30s | the connection closes |
+| A connection with no request open | `IdleTimeout` | 2 minutes | GOAWAY, then the connection closes |
+| A request's header | `ReadHeaderTimeout` | 10s | the stream is reset with `H3_REQUEST_CANCELLED` |
+| A request's body | `ReadTimeout`, `ReadBodyTimeout` | 5 minutes (body) | a body streaming to its handler fails with `os.ErrDeadlineExceeded`; one still collected, its stream is reset |
+| A held body | `MaxBodyHold` | 1 minute | the body fails with `http.ErrBodyHeldTooLong` |
+| A response | `WriteTimeout` | none | the stream is reset with `H3_INTERNAL_ERROR` |
+
+`IdleTimeout` and `ReadHeaderTimeout` fall back to `ReadTimeout`, as on HTTP/1
+and HTTP/2, and a negative value means no limit. `MaxIdleTimeout` alone does
+not bound an idle connection: a client that sends PINGs, QUIC keep-alives,
+keeps it open without a request, which `IdleTimeout` is for. The header and
+body timers are armed only for a request a delivery left incomplete, so a
+request that arrives whole in one packet, as most do, costs none.
 - The engine queues at most 1024 unprocessed datagrams per UDP connection; more
   are dropped and QUIC treats them as lost.
 - The engine hands every UDP datagram over in a buffer of its own from
@@ -316,8 +338,8 @@ In order of priority.
 
 ### 4. Configurability (low)
 
-- Expose keep-alive, receive windows, the unidirectional stream limit and the
-  server's handshake timeout in `http3.Config` and `http3.ClientConfig`.
+- Expose keep-alive, receive windows and the unidirectional stream limit in
+  `http3.Config` and `http3.ClientConfig`.
 - Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sending.
 - Send request trailers.
 - Client: pick HTTP/3 automatically from `Alt-Svc`, and fall back to TCP when

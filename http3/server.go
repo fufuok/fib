@@ -97,6 +97,25 @@ type Config struct {
 	// MaxConcurrentStreams is how many requests a client may have open on
 	// one connection.
 	MaxConcurrentStreams uint64
+	// HandshakeTimeout bounds a connection's QUIC handshake, from its first
+	// packet; a connection that has not finished it by then is closed. Zero
+	// means the QUIC default, 10 seconds.
+	HandshakeTimeout time.Duration
+	// IdleTimeout bounds how long a connection may carry no request: once it
+	// has had none open for this long, it is retired as on shutdown, with
+	// GOAWAY, and closed once that has gone, as http.Config.IdleTimeout does
+	// on HTTP/2. It differs from MaxIdleTimeout, QUIC's, which only closes a
+	// connection that hears no packet at all, and which a client that pings
+	// keeps open with no request. Zero means ReadTimeout; both zero means no
+	// limit. DefaultConfig sets http.DefaultIdleTimeout.
+	IdleTimeout time.Duration
+	// ReadHeaderTimeout bounds how long a request's header may take to
+	// arrive, from the first of its stream's bytes that did not complete it:
+	// a stream whose header has not all arrived by then is reset with
+	// H3_REQUEST_CANCELLED, which leaves the connection serving. Zero means
+	// ReadTimeout; both zero means no limit. DefaultConfig sets
+	// http.DefaultReadHeaderTimeout.
+	ReadHeaderTimeout time.Duration
 	// MaxIdleTimeout closes a connection that has been silent this long.
 	// Keep it below the engine's UDPIdleTimeout, or the engine closes a
 	// quiet peer first.
@@ -162,7 +181,9 @@ func DefaultConfig() Config {
 		MaxIdleTimeout:       30 * time.Second,
 		// A connection goes once it has been quiet for MaxIdleTimeout, so
 		// the body is the one read a client can stall for good.
-		ReadBodyTimeout: fibhttp.DefaultReadBodyTimeout,
+		ReadBodyTimeout:   fibhttp.DefaultReadBodyTimeout,
+		ReadHeaderTimeout: fibhttp.DefaultReadHeaderTimeout,
+		IdleTimeout:       fibhttp.DefaultIdleTimeout,
 	}
 }
 
@@ -242,6 +263,7 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		NewTLS:             h.newTLS(config.BlockingTLSHandshake),
 		TLSConfig:          ConfigureTLS(config.TLSConfig),
 		MaxIdleTimeout:     config.MaxIdleTimeout,
+		HandshakeTimeout:   config.HandshakeTimeout,
 		MaxIncomingStreams: config.MaxConcurrentStreams,
 		// The client's control and QPACK streams, with room to spare for
 		// extensions it may try.
@@ -690,6 +712,14 @@ type serverConn struct {
 	// retiring says the engine's shutdown has had retire run, which it does
 	// once however often it is told; see ServerHandler.OnShutdown.
 	retiring atomic.Bool
+	// idleTimer retires the connection once it has carried no request for
+	// Config.IdleTimeout: idleSince is when the last one ended, or the
+	// connection started, and lastRequest when the latest request stream
+	// opened, which puts off a timer that comes while its header is still
+	// arriving. Guarded by mu; see armIdleLocked.
+	idleTimer   *time.Timer
+	idleSince   time.Time
+	lastRequest time.Time
 }
 
 func (sc *serverConn) OnHandshake(qc *quic.Conn) {
@@ -720,7 +750,76 @@ func (sc *serverConn) start(qc *quic.Conn) {
 	}
 	sc.mu.Lock()
 	sc.control = control
+	// A connection that opens and then asks for nothing is idle, and bounded
+	// like any other idle connection.
+	sc.armIdleLocked()
 	sc.mu.Unlock()
+}
+
+// idleTimeout is Config.IdleTimeout, or ReadTimeout when it is not set.
+func idleTimeout(config *Config) time.Duration {
+	if config.IdleTimeout != 0 {
+		return config.IdleTimeout
+	}
+	return config.ReadTimeout
+}
+
+// headerTimeout is Config.ReadHeaderTimeout, or ReadTimeout when it is not
+// set.
+func headerTimeout(config *Config) time.Duration {
+	if config.ReadHeaderTimeout != 0 {
+		return config.ReadHeaderTimeout
+	}
+	return config.ReadTimeout
+}
+
+// armIdleLocked starts timing the connection's idleness, now that it carries
+// no request. Callers hold sc.mu.
+func (sc *serverConn) armIdleLocked() {
+	d := idleTimeout(&sc.h.config)
+	if d <= 0 || sc.goingAway || sc.streams == nil {
+		return
+	}
+	sc.idleSince = time.Now()
+	if sc.idleTimer == nil {
+		sc.idleTimer = time.AfterFunc(d, sc.idleExpired)
+	} else {
+		sc.idleTimer.Reset(d)
+	}
+}
+
+// busyLocked stops timing idleness, now that a request is open. Callers hold
+// sc.mu.
+func (sc *serverConn) busyLocked() {
+	if sc.idleTimer != nil {
+		sc.idleTimer.Stop()
+	}
+}
+
+// idleExpired retires a connection that has carried no request for
+// IdleTimeout, with GOAWAY, and closes it once that has gone. A request
+// stream that opened since its idleness began, whose header is still
+// arriving, puts it off by as long again from then; a timer that fired as a
+// request opened, or for an idleness that began again since, finds the
+// connection busy, or idle for less, and leaves it alone.
+func (sc *serverConn) idleExpired() {
+	d := idleTimeout(&sc.h.config)
+	sc.mu.Lock()
+	if sc.goingAway || sc.streams == nil || len(sc.streams) > 0 {
+		sc.mu.Unlock()
+		return
+	}
+	if sc.lastRequest.After(sc.idleSince) {
+		sc.idleSince = sc.lastRequest
+	}
+	if wait := d - time.Since(sc.idleSince); wait > 0 {
+		sc.idleTimer.Reset(wait)
+		sc.mu.Unlock()
+		return
+	}
+	sc.mu.Unlock()
+	sc.goAway()
+	sc.qc.CloseWhenDone(uint64(ErrCodeNoError), "")
 }
 
 func (sc *serverConn) fail(err error) { closeWith(sc.qc, err) }
@@ -770,6 +869,9 @@ func (sc *serverConn) newRequestStream(s *quic.Stream) *requestStream {
 		return nil
 	}
 	sc.nextID = max(sc.nextID, id+4)
+	if sc.idleTimer != nil {
+		sc.lastRequest = time.Now()
+	}
 	sc.mu.Unlock()
 	var rs *requestStream
 	if !sc.h.config.DisableReuse && !sc.h.config.StreamRequestBody {
@@ -821,6 +923,7 @@ func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
 	sc.mu.Lock()
 	streams := sc.streams
 	sc.streams = nil
+	sc.busyLocked()
 	sc.mu.Unlock()
 	for _, rs := range streams {
 		// Closed before the handler hears of it; see peerReset.
@@ -845,6 +948,7 @@ func (sc *serverConn) track(rs *requestStream) {
 	sc.mu.Lock()
 	if sc.streams != nil {
 		sc.streams[rs.s.ID()] = rs
+		sc.busyLocked()
 	}
 	sc.mu.Unlock()
 }
@@ -857,6 +961,9 @@ func (sc *serverConn) untrack(rs *requestStream) {
 	tracked := sc.streams[id] == rs
 	delete(sc.streams, id)
 	done := sc.goingAway && len(sc.streams) == 0
+	if tracked && len(sc.streams) == 0 {
+		sc.armIdleLocked()
+	}
 	sc.mu.Unlock()
 	if tracked {
 		rs.unref()
@@ -953,9 +1060,9 @@ type requestStream struct {
 	// writeTimer resets the stream once Config.WriteTimeout has passed, or
 	// is nil; see armWriteTimeout.
 	writeTimer *time.Timer
-	// collectTimer resets the stream once its body, collected before its
-	// handler runs, has outlasted Config.ReadTimeout or ReadBodyTimeout, or
-	// is nil; see armCollectTimer. It holds a reference to the stream until
+	// collectTimer resets the stream once its header has outlasted
+	// Config.ReadHeaderTimeout, or its body, collected before its handler
+	// runs, ReadTimeout or ReadBodyTimeout, or is nil; see armPendingTimer. It holds a reference to the stream until
 	// it is stopped or has run. A body that streams is timed by its
 	// streamedBody's readTimer instead.
 	collectTimer *time.Timer
@@ -1126,6 +1233,9 @@ func (rs *requestStream) feed(data []byte, fin bool) {
 			b.addSkip(b.fedBody)
 		}
 	}
+	if !fin && !rs.done {
+		rs.armPendingTimer()
+	}
 	if !fin || rs.done {
 		return
 	}
@@ -1266,6 +1376,18 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.req.Trailer = trailer
 		return nil
 	}
+	// The header has arrived, so a timer a delivery before armed for it is
+	// done; the body's, if it has one to come, is armed after this delivery
+	// (see armPendingTimer), measured from here.
+	rs.mu.Lock()
+	headerStopped := rs.stopCollectTimerLocked()
+	rs.mu.Unlock()
+	if headerStopped {
+		rs.unref()
+	}
+	if b := rs.streamed; b != nil && (sc.h.config.ReadTimeout > 0 || sc.h.config.ReadBodyTimeout > 0) {
+		b.headerAt = time.Now()
+	}
 	var header stdhttp.Header
 	values := rs.values[:]
 	if rs.pooled {
@@ -1323,7 +1445,6 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.startStream(nil)
 		return nil
 	}
-	rs.armCollectTimer()
 	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
 		// The body is read whole before the handler runs, so there is no
 		// reason to keep the client waiting for permission to send it.
@@ -1749,26 +1870,46 @@ func (rs *requestStream) readTimedOut() {
 	}
 }
 
-// armCollectTimer bounds the body that is collected before the handler runs
-// by the read timeouts, from now, when they are set.
-func (rs *requestStream) armCollectTimer() {
-	now := time.Now()
-	at := bodyDeadline(&rs.sc.h.config, now)
-	if at.IsZero() {
+// armPendingTimer bounds what is left of a request a delivery did not
+// complete, unless a timer does already: its header by ReadHeaderTimeout,
+// from now, and a body collected before its handler runs by the read
+// timeouts, from its header. A request that arrives whole in one delivery,
+// as most do, arms none. A body that streams to its handler is bounded by
+// the feed's deadline instead (see startStream), and a tunnel by nothing
+// here.
+func (rs *requestStream) armPendingTimer() {
+	config := &rs.sc.h.config
+	var d time.Duration
+	switch b := rs.streamed; {
+	case rs.req == nil:
+		d = headerTimeout(config)
+	case rs.tunnel != nil || b != nil && b.feed != nil:
+		return
+	default:
+		start := time.Now()
+		if b != nil && !b.headerAt.IsZero() {
+			start = b.headerAt
+		}
+		at := bodyDeadline(config, start)
+		if at.IsZero() {
+			return
+		}
+		d = max(time.Until(at), time.Nanosecond)
+	}
+	if d <= 0 {
 		return
 	}
-	if b := rs.streamed; b != nil {
-		b.headerAt = now
-	}
 	rs.mu.Lock()
-	rs.refs.Add(1)
-	rs.collectTimer = time.AfterFunc(time.Until(at), rs.collectTimedOut)
+	if rs.collectTimer == nil && !rs.closed && !rs.remoteDone {
+		rs.refs.Add(1)
+		rs.collectTimer = time.AfterFunc(d, rs.collectTimedOut)
+	}
 	rs.mu.Unlock()
 }
 
-// collectTimedOut resets a stream whose body did not arrive by its read
-// timeouts while it was collected: its handler has not run, so there is
-// nobody else to tell. A timer stopped once it had fired finds collectTimer
+// collectTimedOut resets a stream whose header did not arrive by
+// ReadHeaderTimeout, or whose body did not by its read timeouts while it was
+// collected: its handler has not run, so there is nobody else to tell. A timer stopped once it had fired finds collectTimer
 // gone, and leaves the stream alone. The reset is the stream's own, safe
 // from here; the connection hears the client's answering reset and lets
 // the stream go as for any other.

@@ -50,6 +50,25 @@
 
 - QUIC 的 `MaxIdleTimeout`（默认 30 秒）必须小于 Engine 的 `Config.UDPIdleTimeout`
   （默认 60 秒），否则 Engine 会先把静默的对端关掉。
+
+### 服务端超时
+
+`http3.Config` 约束客户端能拖长的每一种等待，`DefaultConfig` 为每一项都设了值：
+
+| 约束 | 配置 | `DefaultConfig` | 到期后 |
+| --- | --- | --- | --- |
+| QUIC 握手 | `HandshakeTimeout` | QUIC 默认 10 秒 | 关闭连接 |
+| 收不到任何包的连接 | `MaxIdleTimeout`（QUIC 的） | 30 秒 | 关闭连接 |
+| 没有任何请求的连接 | `IdleTimeout` | 2 分钟 | 发 GOAWAY 后关闭连接 |
+| 请求 header | `ReadHeaderTimeout` | 10 秒 | 以 `H3_REQUEST_CANCELLED` reset 该流 |
+| 请求 body | `ReadTimeout`、`ReadBodyTimeout` | 5 分钟（body） | 流式交给 handler 的 body 以 `os.ErrDeadlineExceeded` 失败；还在收集的 body，其流被 reset |
+| 被暂停的 body | `MaxBodyHold` | 1 分钟 | body 以 `http.ErrBodyHeldTooLong` 失败 |
+| 响应 | `WriteTimeout` | 不限 | 以 `H3_INTERNAL_ERROR` reset 该流 |
+
+`IdleTimeout` 和 `ReadHeaderTimeout` 未设时用 `ReadTimeout`，与 HTTP/1、HTTP/2 一致；负数表示不限。
+只靠 `MaxIdleTimeout` 约束不了空闲连接：发 PING（QUIC keep-alive）的客户端不发请求也能一直保持
+连接，`IdleTimeout` 就是为此而设。header 和 body 的计时器只在某次投递没能收全请求时才会创建，
+所以一个包就收全的请求（大多数如此）没有这部分开销。
 - Engine 为每个 UDP 连接最多排队 1024 个待处理的数据报，超出的会被丢弃，由 QUIC 按丢包
   处理。
 - Engine 把每个 UDP 数据报放进一个取自 `bufferpool` 的独立缓冲区交给 QUIC 层，QUIC 层在
@@ -233,7 +252,7 @@
 ### 4. 可配置性（低）
 
 - 在 `http3.Config` 和 `http3.ClientConfig` 中暴露 keep-alive、接收窗口、单向 stream
-  上限、握手超时（服务端）等参数。
+  上限等参数。
 - 发送时遵守对端的 `SETTINGS_MAX_FIELD_SECTION_SIZE`。
 - 支持发送请求 trailer。
 - 客户端：根据 `Alt-Svc` 自动选择 HTTP/3，并在 UDP 不通时回退到 TCP。
