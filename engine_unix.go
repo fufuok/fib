@@ -1196,7 +1196,7 @@ func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFi
 	if s.copyBuf == nil {
 		for {
 			offset := s.offset
-			n, err = syscall.Sendfile(c.FD(), s.fd, &offset, attempted)
+			n, err = sendfile(c.FD(), s.fd, &offset, attempted)
 			n = max(n, 0)
 			if err == syscall.EINTR && n == 0 {
 				continue
@@ -1212,6 +1212,18 @@ func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFi
 					attempted = n
 				}
 				err = nil
+			} else if err == nil && n > 0 && n < attempted {
+				// Linux reports a short count without an error, and not only
+				// when the socket filled: the call also ends when its read of
+				// the file comes up short, as it can with the page cache under
+				// pressure. The socket then still has room, and no write edge
+				// follows, since the kernel raises one only for a socket that
+				// ran out of room: a flush waiting for it waited forever, with
+				// the rest of the file queued and the socket empty. The count
+				// is taken as all that was attempted, so the flush calls again
+				// at once; a socket that is full answers EAGAIN, which is what
+				// the edge then follows.
+				attempted = n
 			}
 			break
 		}
@@ -1240,6 +1252,10 @@ func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFi
 	// again next time, so none of it is ever counted as pending.
 	return max(n, 0), read, true, err
 }
+
+// sendfile is syscall.Sendfile, which a test replaces to have it come up
+// short.
+var sendfile = syscall.Sendfile
 
 // rawSocket is what the kernel names a socket by: a file descriptor here.
 type rawSocket = int
