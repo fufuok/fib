@@ -18,10 +18,12 @@ import (
 
 // http.ResponseController reaches a request stream's deadlines: lifting
 // either succeeds, and a handler that lifts its write deadline streams for as
-// long as it likes under WriteTimeout.
+// long as it likes under WriteTimeout. The timeout runs from the request's
+// arrival, so it leaves a loaded machine a second to start the handler, which
+// then streams for longer than that.
 func TestSetWriteDeadlineLiftsWriteTimeout(t *testing.T) {
 	errs := make(chan error, 1)
-	base := startServer(t, Config{WriteTimeout: 200 * time.Millisecond}, func(c *fibhttp.Context) {
+	base := startServer(t, Config{WriteTimeout: time.Second}, func(c *fibhttp.Context) {
 		rc := stdhttp.NewResponseController(c)
 		if err := errors.Join(rc.SetWriteDeadline(time.Time{}), rc.SetReadDeadline(time.Time{}),
 			rc.SetReadDeadline(time.Now().Add(time.Minute))); err != nil {
@@ -30,7 +32,7 @@ func TestSetWriteDeadlineLiftsWriteTimeout(t *testing.T) {
 		}
 		for i := 0; i < 4; i++ {
 			if i > 0 {
-				time.Sleep(150 * time.Millisecond)
+				time.Sleep(400 * time.Millisecond)
 			}
 			_, _ = c.WriteString("tick\n")
 			if err := rc.Flush(); err != nil {

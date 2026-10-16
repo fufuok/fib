@@ -167,7 +167,13 @@ func TestServerStopOnOwnEngine(t *testing.T) {
 	s.Handler.HandleDisconnected(func(*Client) { left <- struct{}{} })
 	connected := make(chan struct{}, 1)
 	s.Handler.HandleConnected(func(*Client) { connected <- struct{}{} })
-	c := dial(t, startServer(t, s), nil)
+	// A raw connection rather than a Client, which would redial as soon as
+	// Stop closed it, onto the engine Stop leaves listening.
+	c, err := net.Dial("tcp", startServer(t, s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
 	recvArpc(t, connected, "the connected callback")
 	if s.Engine() != nil {
 		t.Fatal("Engine of a Server Serve did not run")
@@ -182,7 +188,6 @@ func TestServerStopOnOwnEngine(t *testing.T) {
 	if s.CurrLoad() != 0 {
 		t.Fatalf("CurrLoad after Stop = %d", s.CurrLoad())
 	}
-	c.Stop()
 }
 
 // TestServeErrors pins down Serve with a config it cannot bind, which returns

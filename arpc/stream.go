@@ -222,7 +222,8 @@ func (s *Stream) recv(done <-chan struct{}, v any) error {
 
 // Send sends v to the peer, encoded as Client.Call encodes a request. values,
 // if given, are the Message's, for the coders. Once the sending half is
-// closed it returns ErrStreamClosedSend.
+// closed it returns ErrStreamClosedSend, and once the Client stops
+// ErrClientStopped, as Recv does.
 func (s *Stream) Send(v any, values ...map[any]any) error {
 	return s.checkStateAndSend(v, false, values)
 }
@@ -256,16 +257,27 @@ func (s *Stream) SendAndCloseWith(ctx context.Context, v any, values ...map[any]
 func (s *Stream) checkStateAndSend(v any, eof bool, values []map[any]any) error {
 	if eof {
 		if !s.sendClosed.CompareAndSwap(false, true) {
-			return ErrStreamClosedSend
+			return s.closedSendErr()
 		}
 		err := s.send(v, true, values)
 		s.halfClose()
 		return err
 	}
 	if s.sendClosed.Load() {
-		return ErrStreamClosedSend
+		return s.closedSendErr()
 	}
 	return s.send(v, false, values)
+}
+
+// closedSendErr is why a Stream whose sending half is closed sends nothing:
+// ErrClientStopped once its Client has stopped, which closes every Stream as
+// its connection goes, and so may close one made after Stop returned; and
+// ErrStreamClosedSend for one closed otherwise.
+func (s *Stream) closedSendErr() error {
+	if clientState(s.cli.state.Load()) == stateStopped {
+		return ErrClientStopped
+	}
+	return ErrStreamClosedSend
 }
 
 func (s *Stream) send(v any, eof bool, values []map[any]any) error {
