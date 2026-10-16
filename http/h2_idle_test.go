@@ -1,0 +1,159 @@
+//go:build linux || darwin || windows
+
+package http
+
+import (
+	stdtls "crypto/tls"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"os"
+	"testing"
+	"time"
+
+	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
+)
+
+// idleH2Handler answers at once, or after a pause for /slow.
+func idleH2Handler() Handler {
+	return HandlerFunc(func(c *Context) {
+		if c.Request.URL.Path == "/slow" {
+			time.Sleep(400 * time.Millisecond)
+		}
+		_ = c.Respond(200, "text/plain", []byte("ok"))
+	})
+}
+
+// dialIdleH2 opens an HTTP/2 connection to a server with config, in
+// cleartext or over TLS.
+func dialIdleH2(t *testing.T, config Config, secure bool) *h2TestConn {
+	t.Helper()
+	handler := NewHandlerWithConfig(config, idleH2Handler())
+	if !secure {
+		return dialH2(t, serve(t, handler))
+	}
+	serverConfig, clientConfig, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), handler))
+	clientConfig.NextProtos = []string{"h2"}
+	conn, err := stdtls.Dial("tcp", addr, clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	tc := newH2TestConn(t, conn)
+	tc.write(append([]byte(h2Preface), h2AppendSettings(nil)...))
+	return tc
+}
+
+// expectIdleGoAway reads until the server's GOAWAY, checks it is NO_ERROR
+// naming last as the last stream, and that the connection then closes.
+func expectIdleGoAway(t *testing.T, tc *h2TestConn, last uint32) {
+	t.Helper()
+	f := tc.readUntil(h2FrameGoAway)
+	if id, code := binary.BigEndian.Uint32(f.payload)&0x7fffffff, H2ErrorCode(binary.BigEndian.Uint32(f.payload[4:])); id != last || code != H2NoError {
+		t.Fatalf("GOAWAY last stream %d code %v, want %d NO_ERROR", id, code, last)
+	}
+	buf := make([]byte, 1024)
+	for {
+		if _, err := tc.c.Read(buf); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatal("the connection stayed open after its GOAWAY")
+			}
+			return
+		}
+	}
+}
+
+// An HTTP/2 connection that carries no stream for IdleTimeout is retired
+// with GOAWAY and closed, in cleartext and over TLS, whether it never asked
+// for anything or went quiet after its requests; one with a stream open is
+// left alone however long the stream takes.
+func TestH2IdleTimeout(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	config := DefaultConfig()
+	config.IdleTimeout = idle
+	for _, secure := range []bool{false, true} {
+		name := map[bool]string{false: "h2c", true: "tls"}[secure]
+		t.Run(name+"/fresh", func(t *testing.T) {
+			tc := dialIdleH2(t, config, secure)
+			start := time.Now()
+			expectIdleGoAway(t, tc, 0)
+			if waited := time.Since(start); waited < idle/2 {
+				t.Fatalf("retired after %v", waited)
+			}
+		})
+		t.Run(name+"/after requests", func(t *testing.T) {
+			tc := dialIdleH2(t, config, secure)
+			tc.headers(1, true, get("/")...)
+			tc.response(1)
+			tc.headers(3, true, get("/")...)
+			tc.response(3)
+			done := time.Now()
+			expectIdleGoAway(t, tc, 3)
+			if waited := time.Since(done); waited < idle/2 {
+				t.Fatalf("retired %v after the last response", waited)
+			}
+		})
+		t.Run(name+"/busy", func(t *testing.T) {
+			tc := dialIdleH2(t, config, secure)
+			tc.headers(1, true, get("/slow")...)
+			// Longer than IdleTimeout, and the stream is still open: the
+			// response comes, not a GOAWAY ahead of it.
+			if _, body := tc.response(1); string(body) != "ok" {
+				t.Fatalf("body %q", body)
+			}
+			expectIdleGoAway(t, tc, 1)
+		})
+	}
+}
+
+// IdleTimeout falls back to ReadTimeout, as on HTTP/1, and a negative one
+// leaves an idle connection open.
+func TestH2IdleTimeoutSettings(t *testing.T) {
+	t.Run("fallback", func(t *testing.T) {
+		config := Config{MaxHeaderBytes: 1 << 20, MaxBodyBytes: 1 << 20, ReadTimeout: 200 * time.Millisecond}
+		expectIdleGoAway(t, dialIdleH2(t, config, false), 0)
+	})
+	t.Run("none", func(t *testing.T) {
+		config := DefaultConfig()
+		config.IdleTimeout = -1
+		tc := dialIdleH2(t, config, false)
+		_ = tc.c.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+		buf := make([]byte, 1024)
+		for {
+			_, err := tc.c.Read(buf)
+			if err == nil {
+				continue
+			}
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				return
+			}
+			if err == io.EOF {
+				t.Fatal("an idle connection was closed without an IdleTimeout")
+			}
+			t.Fatal(err)
+		}
+	})
+}
+
+// A timer that fires as a stream opens, or for an idleness that began again
+// since, leaves the connection alone.
+func TestH2IdleExpiredStale(t *testing.T) {
+	config := DefaultConfig()
+	config.IdleTimeout = time.Hour
+	sc := newH2ServerConn(NewHandlerWithConfig(config, nil), nil, "")
+	sc.idleSince = time.Now()
+	sc.idleExpired()
+	sc.streams[1] = &h2ServerStream{}
+	sc.idleSince = time.Time{}
+	sc.idleExpired()
+	if sc.goAway || sc.closed {
+		t.Fatal("a stale idle timer retired the connection")
+	}
+}

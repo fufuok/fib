@@ -9,6 +9,7 @@ import (
 	"hash/crc32"
 	stdhttp "net/http"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -158,24 +159,38 @@ func TestBodyWriterHoldsNoGoroutine(t *testing.T) {
 			if _, err := warmFuture.Wait(); err != nil {
 				t.Fatal(err)
 			}
-			const uploads = 64
-			time.Sleep(100 * time.Millisecond)
-			before := runtime.NumGoroutine()
-			bodies := make([]*BodyWriter, uploads)
-			futures := make([]*Future, uploads)
-			for i := range bodies {
-				var req *stdhttp.Request
-				req, bodies[i] = pushRequest(t, url, -1, false)
-				futures[i] = client.Go(req)
-				_, _ = bodies[i].Write(bytes.Repeat([]byte("p"), 8<<10))
+			// open starts n uploads that write a piece each and then stop.
+			type upload struct {
+				body   *BodyWriter
+				future *Future
 			}
+			open := func(n int) []upload {
+				ups := make([]upload, n)
+				for i := range ups {
+					var req *stdhttp.Request
+					req, ups[i].body = pushRequest(t, url, -1, false)
+					ups[i].future = client.Go(req)
+					_, _ = ups[i].body.Write(bytes.Repeat([]byte("p"), 8<<10))
+				}
+				return ups
+			}
+			// A first batch grows the client's and the server's pools to what
+			// a burst of uploads takes; the second, measured, finds them
+			// grown, so what it adds is what open uploads hold themselves.
+			const uploads = 40
+			first := open(uploads)
+			time.Sleep(300 * time.Millisecond)
+			before := runtime.NumGoroutine()
+			second := open(uploads)
 			time.Sleep(300 * time.Millisecond)
 			during := runtime.NumGoroutine()
-			for _, body := range bodies {
-				_ = body.Close()
+			var stacks bytes.Buffer
+			_ = pprof.Lookup("goroutine").WriteTo(&stacks, 2)
+			for _, up := range append(first, second...) {
+				_ = up.body.Close()
 			}
-			for _, future := range futures {
-				resp, err := future.Wait()
+			for _, up := range append(first, second...) {
+				resp, err := up.future.Wait()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -183,11 +198,17 @@ func TestBodyWriterHoldsNoGoroutine(t *testing.T) {
 					t.Fatalf("server saw %q", got)
 				}
 			}
-			// The connections an HTTP/1 client dials for the uploads add a
-			// little; a goroutine per upload would add at least as many as
-			// there are uploads.
-			if grew := during - before; grew >= uploads/2 {
-				t.Fatalf("%d open uploads added %d goroutines (%d -> %d)", uploads, grew, before, during)
+			// No goroutine waits in an upload, as one that reads a body does
+			// (sendBody, or a Read on the body), and the count does not grow by
+			// one an upload. The count is of the whole process, where other
+			// tests' goroutines come and go, hence the margin.
+			for _, waiting := range []string{".sendBody(", "reqbody.(*Pusher).Read("} {
+				if n := strings.Count(stacks.String(), waiting); n > 0 {
+					t.Fatalf("%d goroutines wait in %s", n, waiting)
+				}
+			}
+			if grew := during - before; grew >= uploads {
+				t.Fatalf("%d more open uploads added %d goroutines (%d -> %d)", uploads, grew, before, during)
 			}
 		})
 	}

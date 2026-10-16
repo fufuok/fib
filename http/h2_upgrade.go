@@ -77,6 +77,7 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 	st.sendWindow = sc.peerWindow
 	sc.streams[1] = st
 	sc.lastStreamID = 1
+	sc.busyLocked()
 	sc.mu.Unlock()
 	sc.armWriteTimeout(st)
 	// The server preface has gone out, so the response to this request may

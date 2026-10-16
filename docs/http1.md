@@ -203,7 +203,11 @@ three settings for HTTP/3.
 
 A connection that becomes HTTP/2, by the preface or through an `h2c` upgrade,
 is released from these: HTTP/2 is served by its own connection state, and
-nothing would refresh a deadline the HTTP/1 parser had set.
+nothing would refresh a deadline the HTTP/1 parser had set. HTTP/2 applies
+them its own way instead: `IdleTimeout` (falling back to `ReadTimeout`)
+retires a connection that has carried no stream for that long with GOAWAY
+`NO_ERROR` and closes it, and the read timeouts bound each request's body (see
+below).
 
 ### Streaming request bodies
 

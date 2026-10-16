@@ -145,8 +145,10 @@ These are constants today and cannot be configured:
   connection once its streams have finished, but `Engine.Stop`/`Close` on
   their own still close HTTP/2 connections outright, and clients see a broken
   connection rather than a graceful close.
-- **Idle and keep-alive**: the server has no idle timeout for HTTP/2
-  connections and sends no PING keep-alives. The client only has
+- **Idle and keep-alive**: the server retires a connection that has carried
+  no stream for `Config.IdleTimeout` (`ReadTimeout` when it is not set; 2
+  minutes in `DefaultConfig`) with GOAWAY `NO_ERROR`, but sends no PING
+  keep-alives. The client only has
   `IdleConnTimeout` (closing when idle) and does no PING health checks, so a
   connection that dies silently is not noticed promptly.
 - **SETTINGS acknowledgement timeout**: nothing checks that the peer
@@ -221,8 +223,9 @@ still lacks:
 - **CONTINUATION floods**: a single header block is bounded by
   `MaxHeaderBytes`, but the number of CONTINUATION frames, and of zero-length
   frames, should be bounded too.
-- **Slow connections**: with no header-read timeout or idle timeout (see
-  above), many half-open connections can tie up resources.
+- **Slow connections**: `IdleTimeout` ends connections that open no stream,
+  and the read timeouts bound each request's body, but a header block that
+  trickles in through CONTINUATION frames is bounded only by `IdleTimeout`.
 
 ### 2. Conformance testing
 
@@ -259,7 +262,7 @@ concurrency.
   the bandwidth-delay product.
 - Schedule streams with pending data round-robin or by weight, for fairness.
 - Honour the peer's `SETTINGS_MAX_HEADER_LIST_SIZE` when sending.
-- Server: configurable idle timeout and PING keep-alive; half-close and drain
+- Server: PING keep-alive; half-close and drain
   input after GOAWAY to avoid RST.
 - Client: optional PING health checks, least-loaded connection selection, and
   a SETTINGS acknowledgement timeout.

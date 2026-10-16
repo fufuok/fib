@@ -120,6 +120,11 @@ type h2ServerConn struct {
 	// lastStreamID is the highest client stream accepted, which GOAWAY
 	// reports as the last one this side will process.
 	lastStreamID uint32
+	// idleTimer ends the connection with GOAWAY once it has carried no
+	// stream for Config.IdleTimeout, and idleSince is when the last one
+	// ended; see armIdleLocked. Nil without an IdleTimeout.
+	idleTimer *time.Timer
+	idleSince time.Time
 	// readTimers holds the timers that fail a stream's body once the
 	// deadline its handler set with SetReadDeadline has passed, made with
 	// the first of them; see setReadDeadline. The stream has no room for one
@@ -286,7 +291,51 @@ func (sc *h2ServerConn) start() {
 	out = h2AppendWindowUpdate(out, 0, h2ConnWindow-h2DefaultWindow)
 	sc.mu.Lock()
 	sc.sendLocked(out)
+	// A connection that opens and then asks for nothing is idle, and bounded
+	// like any other idle connection, as on HTTP/1.
+	sc.armIdleLocked()
 	sc.mu.Unlock()
+}
+
+// armIdleLocked starts timing the connection's idleness, now that it carries
+// no stream: Config.IdleTimeout (ReadTimeout when it is not set, as on
+// HTTP/1 and in net/http) after this, unless a stream opens first, the
+// connection is retired as on shutdown — GOAWAY with NO_ERROR, then closed
+// once what it sent is out. Callers hold sc.mu.
+func (sc *h2ServerConn) armIdleLocked() {
+	d := sc.handler.idleTimeout()
+	if d <= 0 || sc.closed || sc.goAway {
+		return
+	}
+	sc.idleSince = time.Now()
+	if sc.idleTimer == nil {
+		sc.idleTimer = time.AfterFunc(d, sc.idleExpired)
+	} else {
+		sc.idleTimer.Reset(d)
+	}
+}
+
+// busyLocked stops timing idleness, now that a stream has opened. Callers
+// hold sc.mu.
+func (sc *h2ServerConn) busyLocked() {
+	if sc.idleTimer != nil {
+		sc.idleTimer.Stop()
+	}
+}
+
+// idleExpired retires a connection that has carried no stream for
+// IdleTimeout. A timer that fired as a stream opened, or for an idleness
+// that ended and began again since, finds the connection busy or idle for
+// less, and leaves it alone.
+func (sc *h2ServerConn) idleExpired() {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.closed || sc.goAway || len(sc.streams) > 0 || time.Since(sc.idleSince) < sc.handler.idleTimeout() {
+		return
+	}
+	sc.goAway = true
+	sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID, H2NoError, ""))
+	sc.closeFinishedLocked()
 }
 
 // sendLocked sends out unless the connection has ended.
@@ -448,6 +497,7 @@ func (sc *h2ServerConn) retire() {
 func (sc *h2ServerConn) shutdown() {
 	sc.mu.Lock()
 	sc.closed = true
+	sc.busyLocked()
 	sc.failBodiesLocked(net.ErrClosed)
 	clear(sc.streams)
 	sc.mu.Unlock()
@@ -828,6 +878,7 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	st = sc.newStream(id)
 	sc.streams[id] = st
 	sc.lastStreamID = id
+	sc.busyLocked()
 	sc.mu.Unlock()
 
 	if tooLarge {
@@ -1676,6 +1727,9 @@ func (sc *h2ServerConn) forgetLocked(st *h2ServerStream) {
 		return
 	}
 	delete(sc.streams, st.id)
+	if len(sc.streams) == 0 {
+		sc.armIdleLocked()
+	}
 	if st.pushed {
 		sc.pushedStreams--
 	}

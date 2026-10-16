@@ -157,7 +157,9 @@ type Config struct {
 	MaxBodyHold time.Duration
 	// IdleTimeout bounds how long a kept-alive connection may sit between
 	// requests. Zero means ReadTimeout; both zero means no limit.
-	// DefaultConfig sets DefaultIdleTimeout.
+	// DefaultConfig sets DefaultIdleTimeout. On HTTP/2 it bounds a
+	// connection that carries no stream, which is then retired with GOAWAY
+	// (NO_ERROR) and closed.
 	IdleTimeout time.Duration
 	// WriteTimeout bounds how long a response may take to be written,
 	// measured from when its handler is called, as net/http.Server's does. A

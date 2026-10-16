@@ -124,6 +124,7 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 	promised := &h2ServerStream{sc: sc, id: id, req: req, pushed: true, remoteDone: true, sendWindow: sc.peerWindow}
 	sc.streams[id] = promised
 	sc.pushedStreams++
+	sc.busyLocked()
 	sc.sendLocked(h2AppendPushPromise(nil, st.id, id, block, sc.peerMaxFrame))
 	sc.mu.Unlock()
 	sc.armWriteTimeout(promised)

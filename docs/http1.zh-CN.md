@@ -154,7 +154,9 @@ body 单独计时，从它的 HEADERS 算起：流式交给 handler 的 body 以
 为 HTTP/3 提供同样的三个设置。
 
 通过 preface 或 `h2c` 升级变成 HTTP/2 的连接会被解除这些超时：HTTP/2 有自己的连接
-状态，HTTP/1 解析器设下的 deadline 之后没人会去刷新它。
+状态，HTTP/1 解析器设下的 deadline 之后没人会去刷新它。HTTP/2 用自己的方式应用它们：
+`IdleTimeout`（未设时用 `ReadTimeout`）让一段时间内没有任何流的连接发出 GOAWAY
+`NO_ERROR` 后关闭；读超时对每个请求的 body 分别计时（见下文）。
 
 ### 流式请求 body
 

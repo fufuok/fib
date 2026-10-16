@@ -5,6 +5,7 @@ package http
 import (
 	"bytes"
 	"fmt"
+	"github.com/lesismal/fib/hpack"
 	"io"
 	stdhttp "net/http"
 	"os"
@@ -159,12 +160,23 @@ func TestServerWithoutTimeoutsHoldsAConnectionOpen(t *testing.T) {
 
 // TestServerTimeoutsDoNotFollowAConnectionIntoHTTP2 checks that a connection
 // that becomes HTTP/2 is not closed by the HTTP/1 parser's idle timeout, which
-// nothing would refresh once HTTP/2 is serving it.
+// nothing would refresh once HTTP/2 is serving it. HTTP/2 applies IdleTimeout
+// its own way, to a connection without streams (see TestH2IdleTimeout), so
+// this one keeps a stream open, its body still to come: only a deadline left
+// over from HTTP/1 could close it.
 func TestServerTimeoutsDoNotFollowAConnectionIntoHTTP2(t *testing.T) {
 	addr := serveStreamingServer(t, timeoutConfig(0, 0, 300*time.Millisecond), echoPath)
 	conn := dialRaw(t, addr)
 	conn.send(h2Preface)
 	if _, err := conn.Write(h2AppendSettings(nil)); err != nil {
+		t.Fatal(err)
+	}
+	enc := hpack.NewEncoder()
+	block := enc.Begin(nil)
+	for _, f := range [][2]string{{":method", "POST"}, {":scheme", "http"}, {":authority", "test"}, {":path", "/open"}} {
+		block = enc.AppendField(block, f[0], f[1], false)
+	}
+	if _, err := conn.Write(h2AppendHeaderBlock(nil, 1, block, false, 16384)); err != nil {
 		t.Fatal(err)
 	}
 	// Well past the HTTP/1 idle timeout the connection is still HTTP/2's.
