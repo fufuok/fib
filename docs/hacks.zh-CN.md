@@ -60,6 +60,20 @@ func(c *fibhttp.Context) {
 }
 ```
 
+`c.Async(fn)` 把这一对包好：它先 `Retain`，返回一个闭包，闭包执行 `fn` 后自动 `Release`
+（defer 执行，`fn` panic 也会释放），交给你自己的协程池或 goroutine 去跑：
+
+```go
+func(c *fibhttp.Context) {
+    userPool.Go(c.Async(func() {
+        _ = c.Respond(200, "application/json", slowQuery())
+    }))
+}
+```
+
+闭包只执行一次，再调用什么都不做；请求已经没法 Retain 时（响应已写完、连接已断且请求已结束），
+`fn` 照样执行，但不会多还一个引用。闭包必须被执行，否则就和忘了 `Release` 一样。
+
 **为什么这是优势**
 
 - 和标准库不同：`net/http` 里 handler 一返回响应就结束，要异步只能 handler 自己阻塞着等，

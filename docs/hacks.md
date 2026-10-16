@@ -69,6 +69,22 @@ func(c *fibhttp.Context) {
 }
 ```
 
+`c.Async(fn)` wraps the pair: it takes the `Retain` and returns a func that runs `fn` and then
+`Release`s (deferred, so a panicking `fn` still releases), for your own pool or goroutine to run:
+
+```go
+func(c *fibhttp.Context) {
+    userPool.Go(c.Async(func() {
+        _ = c.Respond(200, "application/json", slowQuery())
+    }))
+}
+```
+
+The func runs `fn` once and does nothing when called again. If the request can no longer be
+retained (its response is written, or its connection has gone and the request ended), `fn` still
+runs but nothing is released. The func must be called, or the request is held as by a `Retain`
+never released.
+
 **Why this is an advantage**
 
 - Unlike the standard library: in `net/http` the response ends when the handler returns, so

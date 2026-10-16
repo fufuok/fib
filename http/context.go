@@ -287,7 +287,10 @@ func (c *Context) reopen() {
 // recycled under it, whenever the cancellation lands.
 //
 // A handler may hold at most 65535 Retains on one request at a time.
-func (c *Context) Retain() {
+func (c *Context) Retain() { c.hold() }
+
+// hold is Retain, reporting whether it took a hold.
+func (c *Context) hold() bool {
 	for {
 		w := c.word.Load()
 		if ctxState(w) == ctxOpen || ctxState(w) == ctxCancelled && w&ctxAlive != 0 {
@@ -295,11 +298,39 @@ func (c *Context) Retain() {
 				panic("http: too many Retains on one request")
 			}
 			if c.word.CompareAndSwap(w, w+1) {
-				return
+				return true
 			}
 			continue
 		}
-		return
+		return false
+	}
+}
+
+// Async retains the request and returns a func that runs fn and then
+// releases it, for the handler to hand to a goroutine or a pool of its own:
+//
+//	pool.Go(c.Async(func() {
+//		_ = c.Respond(200, "text/plain", slowQuery())
+//	}))
+//
+// The returned func runs fn once; calling it again does nothing, since the
+// request may be another one's by then. The release is deferred, so a fn
+// that panics still gives the hold back. If the request could not be
+// retained, because its response is already written or its connection has
+// gone and the request ended, fn still runs but nothing is released, so the
+// func never gives back a hold it did not take. A func that is never called
+// holds the request as a Retain never released does.
+func (c *Context) Async(fn func()) func() {
+	held := c.hold()
+	var ran atomic.Bool
+	return func() {
+		if !ran.CompareAndSwap(false, true) {
+			return
+		}
+		if held {
+			defer c.Release()
+		}
+		fn()
 	}
 }
 

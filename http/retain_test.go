@@ -899,3 +899,41 @@ func TestRetainOverHTTP2(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// TestAsync checks that Async holds the response until the returned func has
+// run, releases it once however often that func is called, and gives the hold
+// back when fn panics.
+func TestAsync(t *testing.T) {
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
+		switch c.Request.URL.Path {
+		case "/panic":
+			run := c.Async(func() { panic("boom") })
+			go func() {
+				defer func() { _ = recover() }()
+				run()
+			}()
+		case "/written":
+			// Async on a written response takes no hold, so its func must not
+			// release the handler's own one.
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("written"))
+			c.Async(func() {})()
+			if c.Err() != nil {
+				t.Errorf("Err = %v after a no-op Async", c.Err())
+			}
+		default:
+			run := c.Async(func() {
+				time.Sleep(30 * time.Millisecond)
+				_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("async "+c.Request.URL.Path))
+			})
+			go func() { run(); run() }()
+		}
+	})
+	conn := dialRaw(t, addr)
+	conn.send("GET /one HTTP/1.1\r\nHost: test\r\n\r\nGET /two HTTP/1.1\r\nHost: test\r\n\r\n" +
+		"GET /panic HTTP/1.1\r\nHost: test\r\n\r\nGET /written HTTP/1.1\r\nHost: test\r\n\r\n")
+	for _, want := range []string{"async /one", "async /two", "", "written"} {
+		if _, body := conn.response(stdhttp.MethodGet); body != want {
+			t.Fatalf("body = %q, want %q", body, want)
+		}
+	}
+}
