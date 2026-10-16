@@ -3,9 +3,12 @@
 package fib
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -266,5 +269,130 @@ func TestPollersKeepOwnAccepts(t *testing.T) {
 	// descriptors.
 	if moved == 0 {
 		t.Fatalf("all %d connections sit on the poller their descriptor picks", conns)
+	}
+}
+
+// Under AcceptFDModulo a poller hands every connection it accepts on a
+// socket of its own to the poller its descriptor picks.
+func TestAcceptFDModuloOnOwnSockets(t *testing.T) {
+	const pollers, conns = 3, 30
+	config := pollerConfig("accept-fd-modulo", pollers)
+	config.Addr = "127.0.0.1:0"
+	config.AcceptPlacement = AcceptFDModulo
+	accepted := make(chan *Connection, conns)
+	server, err := Bind(config, HandlerFuncs{
+		Open: func(c *Connection) { accepted <- c },
+		Data: prefixEcho("").(HandlerFuncs).Data,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runEngine(t, server)
+	if !server.listeners[0].spread {
+		t.Fatal("the pollers do not listen on sockets of their own")
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < conns; i++ {
+		if got := exchange(t, addr, "ping"); got != "ping" {
+			t.Fatalf("answered %q", got)
+		}
+		c := <-accepted
+		if fd := c.FD(); fd >= 0 && c.engine != server.pollers[fd%pollers] {
+			t.Fatalf("descriptor %d is served by %p, want poller %p", fd, c.engine, server.pollers[fd%pollers])
+		}
+	}
+}
+
+func TestAcceptPlacementInvalid(t *testing.T) {
+	config := pollerConfig("accept-invalid", 2)
+	config.Addr = "127.0.0.1:0"
+	config.AcceptPlacement = AcceptFDModulo + 1
+	if server, err := Bind(config, nil); err == nil {
+		server.Close()
+		t.Fatal("an unknown AcceptPlacement was accepted")
+	}
+}
+
+// lockedBuffer is a bytes.Buffer slog may write to from the engine's
+// goroutine while the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// The engine logs which placement each listener takes when it starts, and
+// warns, LogStatus or not, when AcceptPlacement is set where it applies to
+// no listener.
+func TestAcceptPlacementLogged(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		engineLoop bool
+		placement  AcceptPlacement
+		logStatus  bool
+		want       []string
+		warn       bool
+	}{
+		{"default", false, AcceptKernelHash, true, []string{"=pollers,kernel-hash", "=pollers-shared-socket,fd-modulo"}, false},
+		{"fd-modulo", false, AcceptFDModulo, true, []string{"=pollers,fd-modulo"}, false},
+		{"engine-loop", true, AcceptKernelHash, true, []string{"=engine-loop,fd-modulo"}, false},
+		{"engine-loop-warns", true, AcceptFDModulo, false, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out lockedBuffer
+			defer slog.SetDefault(slog.Default())
+			slog.SetDefault(slog.New(slog.NewTextHandler(&out, nil)))
+			config := pollerConfig("accept-log-"+tc.name, 2)
+			config.EngineLoop = tc.engineLoop
+			config.AcceptPlacement = tc.placement
+			config.LogStatus = tc.logStatus
+			config.Bindings = []Binding{
+				{Addr: "127.0.0.1:0"},
+				{Network: "unix", Addr: unixSocketPath(t)},
+			}
+			server, err := Bind(config, prefixEcho(""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			runEngine(t, server)
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				got := out.String()
+				done := !tc.logStatus || strings.Contains(got, "engine started")
+				if tc.warn {
+					done = strings.Contains(got, "applies to no listener")
+				}
+				if done {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("no startup line in %q", got)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			got := out.String()
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("log %q lacks %q", got, w)
+				}
+			}
+			if warned := strings.Contains(got, "level=WARN"); warned != tc.warn {
+				t.Errorf("warned=%v, want %v: %q", warned, tc.warn, got)
+			}
+		})
 	}
 }

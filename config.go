@@ -183,6 +183,38 @@ func (c *Config) validateTaskPool() error {
 	return nil
 }
 
+// AcceptPlacement says which poller serves a connection a poller accepts on
+// a listening socket of its own; see Config.AcceptPlacement.
+type AcceptPlacement int
+
+const (
+	// AcceptKernelHash has the poller that accepted a connection serve it,
+	// so the kernel's hash of the connection's addresses, which picked the
+	// socket, picks the poller.
+	AcceptKernelHash AcceptPlacement = iota
+	// AcceptFDModulo hands the connection to the poller its descriptor picks
+	// modulo the number of pollers.
+	AcceptFDModulo
+)
+
+func (p AcceptPlacement) String() string {
+	switch p {
+	case AcceptKernelHash:
+		return "kernel-hash"
+	case AcceptFDModulo:
+		return "fd-modulo"
+	}
+	return fmt.Sprintf("AcceptPlacement(%d)", int(p))
+}
+
+// validAcceptPlacement rejects a Config.AcceptPlacement no constant names.
+func validAcceptPlacement(p AcceptPlacement) error {
+	if p != AcceptKernelHash && p != AcceptFDModulo {
+		return fmt.Errorf("invalid accept placement %d", int(p))
+	}
+	return nil
+}
+
 // engineLoop reports whether config gives an engine an event loop of its
 // own: always without pollers, which leave it the only loop, and with them
 // only when Config.EngineLoop asks for one.

@@ -383,6 +383,12 @@ func (c *Connection) Engine() *Engine { return c.engine.root() }
 // addresses it listens on and the task pool its connections run on, when
 // Config.LogStatus asks for it.
 func (e *Engine) logRun() {
+	accept, applies := e.acceptPlacements()
+	if e.acceptPlacement != AcceptKernelHash && !applies {
+		// Said whatever LogStatus says: the setting asked for does nothing.
+		slog.Warn("fib: Config.AcceptPlacement applies to no listener: it needs IOPollers without EngineLoop and a TCP address on Linux, where each poller listens on a socket of its own with SO_REUSEPORT",
+			"engine", e.name, "acceptPlacement", e.acceptPlacement.String())
+	}
 	if !e.logStatus {
 		return
 	}
@@ -401,5 +407,5 @@ func (e *Engine) logRun() {
 		pool = named.Name()
 	}
 	slog.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool,
-		"pollers", len(e.pollers))
+		"pollers", len(e.pollers), "accept", accept)
 }

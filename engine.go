@@ -109,7 +109,9 @@ type Engine struct {
 	pollers []*Engine
 	// noLoop says the engine has no event loop of its own, and its pollers
 	// listen, dial and serve everything; see Config.EngineLoop.
-	noLoop             bool
+	noLoop bool
+	// acceptPlacement is Config.AcceptPlacement.
+	acceptPlacement    AcceptPlacement
 	name               string
 	logStatus          bool
 	maxEvents          int
@@ -240,6 +242,9 @@ func newEngine(config Config, handler Handler, listen bool) (*Engine, error) {
 	if err := config.validateTaskPool(); err != nil {
 		return nil, err
 	}
+	if err := validAcceptPlacement(config.AcceptPlacement); err != nil {
+		return nil, err
+	}
 	if config.MaxEvents <= 0 {
 		config.MaxEvents = 256
 	}
@@ -265,6 +270,7 @@ func newEngine(config Config, handler Handler, listen bool) (*Engine, error) {
 
 	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents,
 		noLoop:             !engineLoop(config),
+		acceptPlacement:    config.AcceptPlacement,
 		useWritev:          config.UseWritev,
 		socketSyscalls:     config.SocketSyscalls,
 		coalesceWrites:     config.CoalesceWrites,
@@ -999,7 +1005,9 @@ type Config struct {
 	// DefaultName.
 	Name string
 	// LogStatus has the engine log a line when it starts serving, with its
-	// name, the addresses it listens on, its task pool and its pollers. It is
+	// name, the addresses it listens on, its task pool, its pollers and, as
+	// "accept", which loop accepts each TCP and Unix listener's connections
+	// and which poller then serves them (see AcceptPlacement). It is
 	// off by default. The task pools' own lines are switched separately, with
 	// taskpool.SetLogStatus.
 	LogStatus bool
@@ -1177,6 +1185,24 @@ type Config struct {
 	// Without IOPollers the engine always has its loop, which listens and
 	// serves alike.
 	EngineLoop bool
+	// AcceptPlacement picks the poller that serves a connection a poller
+	// accepts on a TCP socket of its own, which it has only where all of
+	// these hold: the engine has IOPollers and no EngineLoop, so the pollers
+	// listen; the address is TCP on Linux, where each poller binds a socket
+	// of its own beside the others with SO_REUSEPORT. AcceptKernelHash, the
+	// default, has the poller that accepted it serve it: the kernel's hash of
+	// the connection's addresses, which chose the socket, chooses the poller,
+	// and nothing is handed on. AcceptFDModulo hands it to the poller its
+	// descriptor picks, as a connection accepted anywhere else always is,
+	// which spreads connections by count but costs a wake-up and a
+	// registration on another loop, and lands every connection on half the
+	// pollers where a process opens one descriptor of its own for each it
+	// accepts, as a proxy dialing upstream does.
+	//
+	// The engine logs which placement each listener takes when it starts
+	// serving, with LogStatus, and warns, whether or not LogStatus is set,
+	// when this is set but no listener takes it.
+	AcceptPlacement AcceptPlacement
 	// ReusePort binds the engine's listeners with SO_REUSEPORT, so that
 	// other sockets that set it too, in this process or another of the same
 	// user, may listen on the same address and share its connections, or

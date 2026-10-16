@@ -1418,3 +1418,12 @@ func (e *Engine) drainWake() {
 	e.wakePending.Store(false)
 	e.drainCommands()
 }
+
+// acceptPlacements says the engine's one loop accepts and serves every
+// connection, which Config.AcceptPlacement has no say in.
+func (e *Engine) acceptPlacements() (string, bool) {
+	if len(e.listeners) == 0 {
+		return "", false
+	}
+	return "engine-loop", false
+}

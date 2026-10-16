@@ -26,7 +26,9 @@ const pollersSupported = false
 
 type Engine struct {
 	// pollers is always empty here; see pollersSupported.
-	pollers         []*Engine
+	pollers []*Engine
+	// acceptPlacement is Config.AcceptPlacement, kept only to warn of it.
+	acceptPlacement AcceptPlacement
 	name            string
 	logStatus       bool
 	listeners       []boundListener
@@ -81,6 +83,9 @@ func newEngine(config Config, handler Handler, listen bool) (*Engine, error) {
 	if err := config.validateTaskPool(); err != nil {
 		return nil, err
 	}
+	if err := validAcceptPlacement(config.AcceptPlacement); err != nil {
+		return nil, err
+	}
 	if config.MaxEvents <= 0 {
 		config.MaxEvents = 256
 	}
@@ -99,7 +104,7 @@ func newEngine(config Config, handler Handler, listen bool) (*Engine, error) {
 		return nil, err
 	}
 	pool, releasePool := acquireTaskPool(config)
-	e := &Engine{name: engineName(config), logStatus: config.LogStatus, listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
+	e := &Engine{name: engineName(config), logStatus: config.LogStatus, acceptPlacement: config.AcceptPlacement, listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
 		connections: make(map[*Connection]struct{}), stopped: make(chan struct{}),
 		udpListeners: udpListeners, udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout)}
 	e.readBufferSize = config.ReadBufferSize
@@ -565,6 +570,10 @@ type Config struct {
 	// EngineLoop gives an epoll or kqueue engine with pollers a loop of its
 	// own for its listeners. This backend has no loops, and ignores it.
 	EngineLoop bool
+	// AcceptPlacement picks the poller an epoll engine's poller hands a
+	// connection it accepted to. This backend has no pollers, ignores it,
+	// and warns when it is set.
+	AcceptPlacement AcceptPlacement
 	// ReusePort binds an epoll or kqueue engine's listeners with SO_REUSEPORT.
 	// This backend listens through the net package, and ignores it.
 	ReusePort bool
@@ -1279,4 +1288,13 @@ func (e *Engine) LocalUDPAddr() (*net.UDPAddr, error) {
 		return nil, errors.New("fib: engine has no listener")
 	}
 	return addrs[0], nil
+}
+
+// acceptPlacements says each connection has a goroutine of its own here,
+// which Config.AcceptPlacement has no say in.
+func (e *Engine) acceptPlacements() (string, bool) {
+	if len(e.listeners) == 0 {
+		return "", false
+	}
+	return "goroutine-per-connection", false
 }

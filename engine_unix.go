@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -666,15 +667,17 @@ func (e *Engine) acceptConnections(listenFD int) {
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		}
 		// A poller that accepted on a socket of its own keeps the
-		// connection: the kernel already spread connections over the
-		// pollers' sockets by a hash of their addresses, and handing it on
-		// would cost a wake-up and a registration on another loop. One
-		// accepted on a socket every poller waits on, or by the engine's own
-		// loop, goes to the poller its descriptor picks, since the kernel
-		// wakes the pollers sharing a socket unevenly.
+		// connection under AcceptKernelHash: the kernel already spread
+		// connections over the pollers' sockets by a hash of their
+		// addresses, and handing it on would cost a wake-up and a
+		// registration on another loop. One accepted on a socket every
+		// poller waits on, or by the engine's own loop, goes to the poller
+		// its descriptor picks, since the kernel wakes the pollers sharing a
+		// socket unevenly, and so does every one under AcceptFDModulo.
 		p := e
-		if pollers := e.root().pollers; len(pollers) > 0 && (e.parent == nil || l.shared) {
-			p = pollers[fd%len(pollers)]
+		root := e.root()
+		if len(root.pollers) > 0 && (e.parent == nil || l.shared || root.acceptPlacement == AcceptFDModulo) {
+			p = root.pollers[fd%len(root.pollers)]
 		}
 		if p == e {
 			e.admit(newAccepted(e, l.handler, l.unix, peer), fd)
@@ -859,6 +862,36 @@ func (e *Engine) release() error {
 		closeErr = err
 	}
 	return closeErr
+}
+
+// acceptPlacements describes, for each TCP and Unix listener in order, the
+// loop that accepts its connections and the poller that then serves them;
+// see Config.AcceptPlacement. It reports whether any listener's placement
+// is the one Config.AcceptPlacement chose, which only a poller accepting on
+// a socket of its own takes.
+func (e *Engine) acceptPlacements() (string, bool) {
+	parts := make([]string, 0, len(e.listeners))
+	applies := false
+	for i, l := range e.listeners {
+		var how string
+		switch {
+		case len(e.pollers) == 0:
+			how = "engine-loop"
+		case l.spread:
+			how = "pollers," + e.acceptPlacement.String()
+			applies = true
+		case l.shared:
+			how = "pollers-shared-socket," + AcceptFDModulo.String()
+		default:
+			how = "engine-loop," + AcceptFDModulo.String()
+		}
+		addr := l.network
+		if sa, err := e.listenSockname(i, l.fd); err == nil {
+			addr = l.network + "://" + netaddr.ToAddr(sa).String()
+		}
+		parts = append(parts, addr+"="+how)
+	}
+	return strings.Join(parts, " "), applies
 }
 
 // pollersListen reports whether config has each poller listen on a socket
