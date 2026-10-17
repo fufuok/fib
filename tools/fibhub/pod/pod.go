@@ -29,6 +29,8 @@ import (
 
 // Config is a pod's settings, as its config file holds them.
 type Config struct {
+	// Mode is "pod" in a config file.
+	Mode string `json:"mode,omitempty"`
 	Name string `json:"name"`
 	// WebAddr is the address of the web page; empty disables it.
 	WebAddr string `json:"webAddr"`
@@ -71,6 +73,7 @@ func Run(ctx context.Context, cfg Config, configPath string, out io.Writer, read
 	if cfg.Nodes == nil {
 		cfg.Nodes = []proto.Node{}
 	}
+	cfg.Mode = "pod"
 	for i := range cfg.Servers {
 		if cfg.Servers[i].Name == "" {
 			cfg.Servers[i].Name = cfg.Servers[i].Addr

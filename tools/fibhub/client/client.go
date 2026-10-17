@@ -43,6 +43,8 @@ type Forward struct {
 
 // Config is a client's settings, as its config file holds them.
 type Config struct {
+	// Mode is "client" in a config file.
+	Mode string `json:"mode,omitempty"`
 	Name string `json:"name"`
 	// WebAddr is the address of the web page; empty disables it.
 	WebAddr string `json:"webAddr"`
@@ -86,6 +88,7 @@ func Run(ctx context.Context, cfg Config, configPath string, out io.Writer, read
 	if cfg.Name == "" {
 		return errors.New("client: a name is required")
 	}
+	cfg.Mode = "client"
 	for i := range cfg.Servers {
 		if cfg.Servers[i].Name == "" {
 			cfg.Servers[i].Name = cfg.Servers[i].Addr

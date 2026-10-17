@@ -30,36 +30,38 @@ import (
 
 // Config configures a server.
 type Config struct {
+	// Mode is "server" in a config file.
+	Mode string `json:"mode,omitempty"`
 	// Name is the server's name, which peers are told.
-	Name string
+	Name string `json:"name"`
 	// Addr is the arpc address pods and clients connect to.
-	Addr string
+	Addr string `json:"addr"`
 	// WebAddr is the address of the web page.
-	WebAddr string
+	WebAddr string `json:"webAddr"`
 	// WebAuth, "user:password", protects the web page; empty leaves it open.
-	WebAuth string
+	WebAuth string `json:"webAuth"`
 	// WSAddr is the address of the encrypted WebSocket that reaches the web
 	// page; empty disables it.
-	WSAddr string
+	WSAddr string `json:"wsAddr"`
 	// Password authenticates pods and clients.
-	Password string
+	Password string `json:"password"`
 	// WSPassword encrypts the WebSocket; it defaults to Password.
-	WSPassword string
+	WSPassword string `json:"wsPassword"`
 	// ArpcWSAddr is an address pods and clients reach the arpc service on
 	// over WebSocket, at ArpcWSPath, for networks that let only HTTP
 	// through; empty disables it.
-	ArpcWSAddr string
+	ArpcWSAddr string `json:"arpcWsAddr"`
 	// ArpcWSPath is the path of the arpc WebSocket; it defaults to
 	// /fibhub.
-	ArpcWSPath string
+	ArpcWSPath string `json:"arpcWsPath"`
 	// BodyPassword, when set, has every arpc message's body encrypted with
 	// AES under a key derived from it; pods and clients must be configured
 	// with the same one.
-	BodyPassword string
+	BodyPassword string `json:"bodyPassword"`
 	// RegisterTimeout is how long a connection may take to register.
-	RegisterTimeout time.Duration
+	RegisterTimeout time.Duration `json:"-"`
 	// CallTimeout bounds the calls the server makes on pods.
-	CallTimeout time.Duration
+	CallTimeout time.Duration `json:"-"`
 }
 
 func (cfg *Config) setDefaults() {
