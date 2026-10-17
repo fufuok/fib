@@ -305,13 +305,17 @@ func (e *Engine) stopListening() {
 
 // beginShutdown starts Shutdown: the listeners stop taking connections, as
 // Stop has them do, while the loops go on serving the connections there are.
+// They stop before ShuttingDown reports true, so that a client connecting
+// once it does is refused.
 func (e *Engine) beginShutdown() {
-	e.draining.Store(true)
 	e.stopListening()
 	for _, p := range e.pollers {
-		p.draining.Store(true)
 		p.stopListening()
 	}
+	for _, p := range e.pollers {
+		p.draining.Store(true)
+	}
+	e.draining.Store(true)
 }
 
 // shutdownConnections runs one round of Shutdown on the loop: each open

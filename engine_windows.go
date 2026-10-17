@@ -570,9 +570,15 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 // listener is what stops it, and the loop may be posting an AcceptEx on it.
 func (e *Engine) stopListening() {}
 
-// beginShutdown starts Shutdown. The listeners are closed by the loop, in
-// the first round of Shutdown, for the reason stopListening is the loop's.
-func (e *Engine) beginShutdown() { e.draining.Store(true) }
+// beginShutdown starts Shutdown. The listeners are closed by the loop, for
+// the reason stopListening is the loop's, and Shutdown waits for it before
+// ShuttingDown reports true, so that a client connecting once it does is
+// refused, as on the other platforms. Leaving the close to Shutdown's first
+// round let such a client be accepted.
+func (e *Engine) beginShutdown() {
+	_ = e.onLoop(func() { _ = e.closeListeners() })
+	e.draining.Store(true)
+}
 
 // shutdownConnections runs one round of Shutdown on the loop: the listeners
 // stop taking connections, if they have yet to, each open connection is told

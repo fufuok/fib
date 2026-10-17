@@ -435,14 +435,17 @@ func (e *Engine) finishConnection(c *Connection, err error) {
 // taking connections, while the connections there are go on being served.
 // The UDP sockets stay open, since the peers' datagrams arrive on them.
 func (e *Engine) beginShutdown() {
-	if !e.draining.CompareAndSwap(false, true) {
+	if e.draining.Load() {
 		return
 	}
+	// The listeners close before ShuttingDown reports true, so that a client
+	// connecting once it does is refused; closing one twice does no harm.
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	for _, listener := range e.listeners {
 		_ = listener.Close()
 	}
+	e.mu.Unlock()
+	e.draining.Store(true)
 }
 
 // shutdownRound tells each open connection the engine is shutting down, here
