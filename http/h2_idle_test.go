@@ -16,11 +16,18 @@ import (
 	"github.com/lesismal/fib/tlstest"
 )
 
-// idleH2Handler answers at once, or after a pause for /slow.
+// h2TestIdle is the IdleTimeout these tests give the server. A loaded CI
+// runner can leave the server's worker unscheduled for a good part of a
+// shorter one, and the connection is then retired with a request it has not
+// read yet in its socket, as a connection waiting on a read deadline would be.
+const h2TestIdle = 500 * time.Millisecond
+
+// idleH2Handler answers at once, or after a pause longer than h2TestIdle for
+// /slow.
 func idleH2Handler() Handler {
 	return HandlerFunc(func(c *Context) {
 		if c.Request.URL.Path == "/slow" {
-			time.Sleep(400 * time.Millisecond)
+			time.Sleep(2 * h2TestIdle)
 		}
 		_ = c.Respond(200, "text/plain", []byte("ok"))
 	})
@@ -74,7 +81,7 @@ func expectIdleGoAway(t *testing.T, tc *h2TestConn, last uint32) {
 // for anything or went quiet after its requests; one with a stream open is
 // left alone however long the stream takes.
 func TestH2IdleTimeout(t *testing.T) {
-	const idle = 200 * time.Millisecond
+	const idle = h2TestIdle
 	config := DefaultConfig()
 	config.IdleTimeout = idle
 	for _, secure := range []bool{false, true} {
@@ -116,14 +123,14 @@ func TestH2IdleTimeout(t *testing.T) {
 // leaves an idle connection open.
 func TestH2IdleTimeoutSettings(t *testing.T) {
 	t.Run("fallback", func(t *testing.T) {
-		config := Config{MaxHeaderBytes: 1 << 20, MaxBodyBytes: 1 << 20, ReadTimeout: 200 * time.Millisecond}
+		config := Config{MaxHeaderBytes: 1 << 20, MaxBodyBytes: 1 << 20, ReadTimeout: h2TestIdle}
 		expectIdleGoAway(t, dialIdleH2(t, config, false), 0)
 	})
 	t.Run("none", func(t *testing.T) {
 		config := DefaultConfig()
 		config.IdleTimeout = -1
 		tc := dialIdleH2(t, config, false)
-		_ = tc.c.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+		_ = tc.c.SetReadDeadline(time.Now().Add(2 * h2TestIdle))
 		buf := make([]byte, 1024)
 		for {
 			_, err := tc.c.Read(buf)
