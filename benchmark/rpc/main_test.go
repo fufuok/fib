@@ -15,7 +15,7 @@ import (
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/arpc"
-	"github.com/lesismal/fib/examples/example"
+	"github.com/lesismal/fib/benchmark/rpc/internal/example"
 	"github.com/lesismal/fib/grpc"
 )
 

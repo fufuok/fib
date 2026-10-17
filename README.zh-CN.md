@@ -378,23 +378,28 @@ engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: multiproto.Ne
 
 ### 示例
 
+可运行的示例放在独立仓库 [fib-examples](https://github.com/lesismal/fib-examples) 中，它是一个像普通应用一样依赖 fib 的模块。克隆后在仓库根目录运行：
+
 ```sh
-go run ./examples/multiprotocol/server # 一个引擎同时提供 HTTP、HTTPS、HTTP/3、WebSocket 和裸 TCP，另有一个按首字节分流的端口
-go run ./examples/multiproto/server   # 同一端口上的 HTTPS、HTTP/1.1、h2c、WebSocket、gRPC、SOCKS、HTTP CONNECT、arpc 与 TCP 回显
-go run ./examples/tcp/nontls/server
-go run ./examples/http/nontls/server
-go run ./examples/http/router
-go run ./examples/websocket/nontls/server
-go run ./examples/arpc/server
-go run ./examples/grpc/server
-go run ./examples/socks/server        # 同一端口上的 SOCKS5/4/4a 与 HTTP CONNECT 代理；examples/socks/client 经它抓取 URL
-go run ./examples/http3/tls/server
-go run ./examples/gateway/upstream    # 反向代理 / 网关：HTTP/1.1、HTTP/2、HTTP/3、WebSocket，全部异步回调
-go run ./examples/gateway/server      # 依次启动 upstream、gateway、client（见 server 的文件头注释）
-go run ./examples/gateway/client
+git clone https://github.com/lesismal/fib-examples && cd fib-examples
+go run ./multiprotocol/server # 一个引擎同时提供 HTTP、HTTPS、HTTP/3、WebSocket 和裸 TCP，另有一个按首字节分流的端口
+go run ./multiproto/server   # 同一端口上的 HTTPS、HTTP/1.1、h2c、WebSocket、gRPC、SOCKS、HTTP CONNECT、arpc 与 TCP 回显
+go run ./tcp/nontls/server
+go run ./http/nontls/server
+go run ./http/router
+go run ./websocket/nontls/server
+go run ./arpc/server
+go run ./grpc/server
+go run ./socks/server        # 同一端口上的 SOCKS5/4/4a 与 HTTP CONNECT 代理；socks/client 经它抓取 URL
+go run ./http3/tls/server
+go run ./gateway/upstream    # 反向代理 / 网关：HTTP/1.1、HTTP/2、HTTP/3、WebSocket，全部异步回调
+go run ./gateway/server      # 依次启动 upstream、gateway、client（见 server 的文件头注释）
+go run ./gateway/client
 ```
 
 除 `multiprotocol` 外，每个 server 目录旁边都有对应的 `client`；`multiproto` 的 server 文件头注释还列出了各协议对应的 curl 或客户端命令。
+
+[fibhub](https://github.com/lesismal/fibhub) 是一个基于 fib 的 TCP 引擎、arpc 与 WebSocket 构建的完整应用：经由中心节点，把 TCP 连接隧道转发到 NAT 与防火墙后面的设备。
 
 ## 架构
 

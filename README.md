@@ -397,26 +397,31 @@ engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: multiproto.Ne
 
 ### Examples
 
+The runnable examples live in their own repository, [fib-examples](https://github.com/lesismal/fib-examples), one module that depends on fib like any application would. Clone it and run them from its root:
+
 ```sh
-go run ./examples/multiprotocol/server # HTTP, HTTPS, HTTP/3, WebSocket and raw TCP from one engine, and a port that sniffs
-go run ./examples/multiproto/server   # HTTPS, HTTP/1.1, h2c, WebSocket, gRPC, SOCKS, HTTP CONNECT, arpc and a TCP echo on one port
-go run ./examples/tcp/nontls/server
-go run ./examples/http/nontls/server
-go run ./examples/http/router
-go run ./examples/http/upload/server   # big bodies: SaveBody, resumable SaveBodyResumable, OnBody echo; see its mkfile and client
-go run ./examples/http2/upload/server  # the same upload endpoints over HTTP/2 (TLS)
-go run ./examples/http3/upload/server  # ... and over HTTP/3 (QUIC)
-go run ./examples/websocket/nontls/server
-go run ./examples/http3/tls/server
-go run ./examples/arpc/server
-go run ./examples/grpc/server
-go run ./examples/socks/server        # SOCKS5/4/4a and an HTTP CONNECT proxy on one port; examples/socks/client fetches through it
-go run ./examples/gateway/upstream     # a reverse proxy / gateway for HTTP/1.1, HTTP/2, HTTP/3 and WebSocket:
-go run ./examples/gateway/server       # upstream, gateway and client, all callback-based (see its server's doc comment)
-go run ./examples/gateway/client
+git clone https://github.com/lesismal/fib-examples && cd fib-examples
+go run ./multiprotocol/server # HTTP, HTTPS, HTTP/3, WebSocket and raw TCP from one engine, and a port that sniffs
+go run ./multiproto/server   # HTTPS, HTTP/1.1, h2c, WebSocket, gRPC, SOCKS, HTTP CONNECT, arpc and a TCP echo on one port
+go run ./tcp/nontls/server
+go run ./http/nontls/server
+go run ./http/router
+go run ./http/upload/server   # big bodies: SaveBody, resumable SaveBodyResumable, OnBody echo; see its mkfile and client
+go run ./http2/upload/server  # the same upload endpoints over HTTP/2 (TLS)
+go run ./http3/upload/server  # ... and over HTTP/3 (QUIC)
+go run ./websocket/nontls/server
+go run ./http3/tls/server
+go run ./arpc/server
+go run ./grpc/server
+go run ./socks/server        # SOCKS5/4/4a and an HTTP CONNECT proxy on one port; socks/client fetches through it
+go run ./gateway/upstream     # a reverse proxy / gateway for HTTP/1.1, HTTP/2, HTTP/3 and WebSocket:
+go run ./gateway/server       # upstream, gateway and client, all callback-based (see its server's doc comment)
+go run ./gateway/client
 ```
 
 Each server directory but `multiprotocol` has a matching `client` next to it; `multiproto`'s server also lists a curl or client command for each of its protocols.
+
+[fibhub](https://github.com/lesismal/fibhub), a hub that tunnels TCP connections to devices behind NATs and firewalls, is a complete application built on fib's TCP engine, arpc and WebSocket.
 
 ## Architecture
 

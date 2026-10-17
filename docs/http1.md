@@ -232,7 +232,7 @@ waiting for it: the handler sends the upstream request with a
 `OnBody` callback writes each piece to the writer, which the client sends as
 the upstream connection has room; past the writer's limit the callback holds
 the body, and `BodyWriter.OnDrain` resumes it (see the `BodyWriter` example,
-and `examples/gateway`).
+and [`fib-examples/gateway`](https://github.com/lesismal/fib-examples/tree/main/gateway)).
 
 `Config.StreamRequestBodyThreshold` keeps the smaller bodies buffered whole
 while streaming is on: only a body whose `Content-Length` is larger than it,

@@ -203,7 +203,7 @@ handler := fibhttp.NewHandlerWithConfig(httpConfig, fibhttp.HandlerFunc(
 ```
 
 A complete runnable example (with SHA-256 verification, a client, and a 1GiB test-file
-generator) is in [`examples/http/upload`](../examples/http/upload).
+generator) is in [`fib-examples/http/upload`](https://github.com/lesismal/fib-examples/tree/main/http/upload).
 
 **The advantages, one by one**
 
@@ -893,5 +893,5 @@ out := bufferpool.Join(nil, a, b)           // takes enough at once and joins th
 
 - [Guide (Chinese)](guide.zh-CN.md): full description of each API
 - [HTTP/1.x](http1.md) · [HTTP/2](http2.md) · [HTTP/3](http3.md): limits and conformance
-- [`examples/http/upload`](../examples/http/upload): a complete `OnBody` large-upload example
+- [`fib-examples/http/upload`](https://github.com/lesismal/fib-examples/tree/main/http/upload): a complete `OnBody` large-upload example
 - [`taskpool`](../taskpool): the standalone pool and its benchmarks

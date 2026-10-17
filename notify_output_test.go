@@ -84,7 +84,7 @@ func TestNotifyOutputWhenDrained(t *testing.T) {
 	c, peer := backlog(t, addr, opened, 16<<20)
 	const limit = 1 << 20
 	notice := make(chan error, 1)
-	if !outputwait.Notify(c, limit, func(err error) { notice <- err }) {
+	if !c.NotifyOutput(limit, func(err error) { notice <- err }) {
 		t.Fatalf("nothing armed with %d bytes queued", outputwait.Pending(c))
 	}
 	select {

@@ -570,10 +570,10 @@ handler := epollhttp.NewHandler(epollhttp.HandlerFunc(
 server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: handler})
 ```
 
-完整示例：
+完整示例（在 [fib-examples](https://github.com/lesismal/fib-examples) 仓库根目录运行）：
 
 ```sh
-go run ./examples/http/nontls/server   # 另开终端：go run ./examples/http/nontls/client
+go run ./http/nontls/server   # 另开终端：go run ./http/nontls/client
 ```
 
 ### HTTP/1.x：流式响应、trailer 与 sendfile
@@ -706,7 +706,7 @@ c.SaveBody(path, func(saved fibhttp.Saved, err error) { c.RespondSaved(saved, er
 c.SaveBodyResumable(path, nil)
 ```
 
-需要 `StreamRequestBody` 才能边收边存；没开时 body 已经整个到达，同样能存。示例见 `examples/http/upload`。
+需要 `StreamRequestBody` 才能边收边存；没开时 body 已经整个到达，同样能存。示例见 [`fib-examples/http/upload`](https://github.com/lesismal/fib-examples/tree/main/http/upload)。
 
 ### 静态文件（FileCache）
 
@@ -1273,10 +1273,10 @@ handler := websocket.HandlerFuncs{
   上串行执行。server 和 client（`Dialer`）两端都支持。
 - `Connection.Ping` 主动发送 Ping，payload 最多 125 字节。
 
-运行 WebSocket echo 示例（`-compress` 开启压缩）：
+运行 WebSocket echo 示例（`-compress` 开启压缩；在 [fib-examples](https://github.com/lesismal/fib-examples) 仓库根目录运行）：
 
 ```sh
-go run ./examples/websocket/nontls/server   # 另开终端：go run ./examples/websocket/nontls/client
+go run ./websocket/nontls/server   # 另开终端：go run ./websocket/nontls/client
 ```
 
 ### 按帧接收（避免大消息占用大内存）
@@ -1490,11 +1490,14 @@ fib 内部用它的地方：连接的读 buffer 与发送队列缓冲、`SendFil
 
 ## Examples
 
+示例在独立仓库 [fib-examples](https://github.com/lesismal/fib-examples) 中，下面的命令都在它的根目录运行
+（`git clone https://github.com/lesismal/fib-examples && cd fib-examples`）。
+
 每种协议一个目录，每个目录下分 TLS 与非 TLS 两个子目录（UDP 只有非 TLS：本库
 不内置 DTLS；HTTP/3 只有 TLS：QUIC 总是加密的），各有一个 echo server 和一个 echo client：
 
 ```text
-examples/
+fib-examples/
 ├── tcp/        nontls/{server,client}  127.0.0.1:9000    tls/{server,client}  127.0.0.1:9443
 ├── udp/        nontls/{server,client}  127.0.0.1:9001
 ├── http/       nontls/{server,client}  127.0.0.1:8080    tls/{server,client}  127.0.0.1:8443 (HTTPS)
@@ -1506,8 +1509,8 @@ examples/
 先启动 server，再在另一个终端运行对应的 client，例如：
 
 ```sh
-go run ./examples/tcp/tls/server
-go run ./examples/tcp/tls/client -n 10
+go run ./tcp/tls/server
+go run ./tcp/tls/client -n 10
 ```
 
 - client 默认发送 5 条消息（`-n` 修改），逐条打印回显后退出；server 按 Ctrl-C 退出。
@@ -1523,34 +1526,34 @@ go run ./examples/tcp/tls/client -n 10
   HTTP/1.1），TCP 上的响应带 `Alt-Svc`，浏览器据此切换到 HTTP/3。
 - WebSocket server 的 `-compress` 开启 permessage-deflate，CI 用它跑 Autobahn 测试。
 - HTTP server 的 `-dir` 用 `net/http` 的 `FileServer` 在 `/files/` 下提供该目录的文件
-  （支持 Range、条件请求，文件走 sendfile），例如 `go run ./examples/http/nontls/server -dir .`
+  （支持 Range、条件请求，文件走 sendfile），例如 `go run ./http/nontls/server -dir .`
   后 `curl -O http://127.0.0.1:8080/files/go.mod`。
-- `examples/http/upload` 演示 HTTP/1 大 body：server 开启 `StreamRequestBody`，请求头到达就回调 Handler，
+- [`fib-examples/http/upload`](https://github.com/lesismal/fib-examples/tree/main/http/upload) 演示 HTTP/1 大 body：server 开启 `StreamRequestBody`，请求头到达就回调 Handler，
   不等完整 body，再分段处理，内存不随 body 大小增长。三个接口：`POST /upload`（`SaveBody`，单次上传）、
   `PUT /resume`（`SaveBodyResumable`，分块断点续传）、`POST /echo`（`OnBody` 边收边原样写回的大 body echo）。
   `mkfile` 生成可复现的测试文件，`client -mode upload|resume|echo` 流式发送并校验 SHA-256（`-max-chunks`
   让 resume 提前停下，再跑一次就从服务端已有的位置接着传）。
-  `go run ./examples/http/upload/mkfile -size 1GiB -o /tmp/big.bin`，`go run ./examples/http/upload/server -dir /tmp/uploads`，
-  `go run ./examples/http/upload/client -mode resume -file /tmp/big.bin -name part.bin -max-chunks 3` 后再不带 `-max-chunks` 运行一次。
-  同一套接口（handler 在 `examples/http/upload/service`，客户端逻辑在 `uploadclient`）也用 HTTP/2 和 HTTP/3 跑：
-  `examples/http2/upload`（TLS，`HTTP2Only`，用 `net/http` 客户端流式发送）和 `examples/http3/upload`（QUIC，
+  `go run ./http/upload/mkfile -size 1GiB -o /tmp/big.bin`，`go run ./http/upload/server -dir /tmp/uploads`，
+  `go run ./http/upload/client -mode resume -file /tmp/big.bin -name part.bin -max-chunks 3` 后再不带 `-max-chunks` 运行一次。
+  同一套接口（handler 在 [`fib-examples/http/upload/service`](https://github.com/lesismal/fib-examples/tree/main/http/upload/service)，客户端逻辑在 `uploadclient`）也用 HTTP/2 和 HTTP/3 跑：
+  [`fib-examples/http2/upload`](https://github.com/lesismal/fib-examples/tree/main/http2/upload)（TLS，`HTTP2Only`，用 `net/http` 客户端流式发送）和 [`fib-examples/http3/upload`](https://github.com/lesismal/fib-examples/tree/main/http3/upload)（QUIC，
   用 fib 的 HTTP/3 客户端——它把每个请求的 body 整个读进内存，所以大文件用 `-mode resume` 分块发送）。
   body 的接收不论走哪个协议都是 `OnBody`，背压分别来自 TCP、HTTP/2 流控窗口和 QUIC 流控。
-- `examples/gateway` 是一个反向代理 / 网关：下游同时接 HTTP/1.1、HTTP/2、HTTP/3 和 WebSocket
+- [`fib-examples/gateway`](https://github.com/lesismal/fib-examples/tree/main/gateway) 是一个反向代理 / 网关：下游同时接 HTTP/1.1、HTTP/2、HTTP/3 和 WebSocket
   （HTTPS 与 HTTP/3 共用一个端口号，另有明文端口），按路径前缀转发到 `http://`（HTTP/1.1）、
   `https://`（ALPN 选 HTTP/2）或 `h3://`（HTTP/3）的上游。三个程序依次运行：
-  `go run ./examples/gateway/upstream`、`go run ./examples/gateway/server`、`go run ./examples/gateway/client`，
+  `go run ./gateway/upstream`、`go run ./gateway/server`、`go run ./gateway/client`，
   client 会用三种协议各请求一遍三种上游（echo、大文件下载、带 trailer 的慢速流）并走 ws:// 与 wss:// 回显。
   全程没有阻塞的读写：请求 body 用 `Context.OnBody` 收，上游请求用 `Client.Do` 发，上游响应用
   `ClientResponse.OnBody` 边收边写回下游（大下载内存恒定，两边中较慢的一方给另一方施加背压），WebSocket 用
-  `Dialer.Dial` 的回调接上游、两端各自的 `OnMessage` 互相转发。核心在 `examples/gateway/server/proxy`，
+  `Dialer.Dial` 的回调接上游、两端各自的 `OnMessage` 互相转发。核心在 [`fib-examples/gateway/server/proxy`](https://github.com/lesismal/fib-examples/tree/main/gateway/server/proxy)，
   `server/main_test.go` 把 3×3 协议矩阵、大上传、取消传播、超时/502/404、上游中途失败、WebSocket 关闭码转发都测了一遍。
   取舍与限制：上游请求的 body 是整体发送的（`Client.Do` 不支持流式请求体），所以网关先把请求体收齐，
   上限 `-max-request-body`；`Context.Upgrade` 只能在 handler 返回前调用，所以 WebSocket 先升级下游再异步拨号上游，
   上游不可达时用关闭码 1014 通知客户端，而不是 HTTP 502；HTTP/2 与 HTTP/3 下游的 `Write` 在窗口用尽时会等待客户端，
   这个等待发生在上游连接的 worker 上，上限是 64KB。
-- `examples/http/router` 演示 Router：带参数与正则的路由、带自己中间件的 `Route`、`Mount`
-  的子 Router，以及 404/405，`go run ./examples/http/router` 后用文件头注释里的 curl 命令访问。
+- [`fib-examples/http/router`](https://github.com/lesismal/fib-examples/tree/main/http/router) 演示 Router：带参数与正则的路由、带自己中间件的 `Route`、`Mount`
+  的子 Router，以及 404/405，`go run ./http/router` 后用文件头注释里的 curl 命令访问。
 
 ## GOMAXPROCS
 

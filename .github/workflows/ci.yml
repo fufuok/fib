@@ -336,8 +336,9 @@ jobs:
 
   # A standalone h2spec report. http2-conformance above already runs h2spec
   # inside go test and fails on any case it reports, but only keeps its last
-  # summary line; this job runs the same tool directly against
-  # examples/http2only's server, over h2c and h2, and keeps h2spec's own
+  # summary line; this job runs the same tool directly against the
+  # http2only server of lesismal/fib-examples, built against this checkout,
+  # over h2c and h2, and keeps h2spec's own
   # case-by-case log and JUnit report as an artifact together with a
   # pass/fail summary and conclusion in the job itself.
   h2spec-report:
@@ -354,8 +355,17 @@ jobs:
         run: go install github.com/summerwind/h2spec/cmd/h2spec@v2.2.1
       - name: Versions
         run: '"$(go env GOPATH)/bin/h2spec" --version'
+      # The examples are a module of their own in another repository; it is
+      # built against the fib in this checkout rather than the one it pins.
+      - uses: actions/checkout@v5
+        with:
+          repository: lesismal/fib-examples
+          path: fib-examples
       - name: Build the HTTP/2-only example server
-        run: go build -o "$RUNNER_TEMP/h2only-server" ./examples/http2only/server
+        working-directory: fib-examples
+        run: |
+          go mod edit -replace github.com/lesismal/fib=..
+          go build -o "$RUNNER_TEMP/h2only-server" ./http2only/server
       - name: Run h2spec against h2c and h2, and report the result
         shell: bash
         run: |
@@ -652,17 +662,26 @@ jobs:
       matrix:
         include:
           - scheme: ws
-            server: ./examples/websocket/nontls/server
+            server: ./websocket/nontls/server
           - scheme: wss
-            server: ./examples/websocket/tls/server
+            server: ./websocket/tls/server
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version: stable
           cache-dependency-path: go.mod
+      # The echo servers are lesismal/fib-examples', built against the fib
+      # in this checkout rather than the one that module pins.
+      - uses: actions/checkout@v5
+        with:
+          repository: lesismal/fib-examples
+          path: fib-examples
       - name: Build echo server
-        run: go build -o "$RUNNER_TEMP/websocket_server" ${{ matrix.server }}
+        working-directory: fib-examples
+        run: |
+          go mod edit -replace github.com/lesismal/fib=..
+          go build -o "$RUNNER_TEMP/websocket_server" ${{ matrix.server }}
       - name: Start echo server
         run: |
           "$RUNNER_TEMP/websocket_server" -addr 127.0.0.1:9001 -compress > "$RUNNER_TEMP/server.log" 2>&1 &

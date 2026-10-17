@@ -735,6 +735,10 @@ func (c *Connection) HoldReads(hold bool) {
 	c.mu.Unlock()
 }
 
+// NotifyOutput reports false on the portable backend, whose Send writes
+// before it returns, so nothing is ever left queued to wait for.
+func (c *Connection) NotifyOutput(int64, func(error)) bool { return false }
+
 // SetWriteBackpressure does nothing on the portable backend, whose reads
 // never pause for the connection's own backlog.
 func (c *Connection) SetWriteBackpressure(bool) {}

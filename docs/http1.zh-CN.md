@@ -174,7 +174,7 @@ body 单独计时，从它的 HEADERS 算起：流式交给 handler 的 body 以
 而不让任何东西等待的：handler 用 `fibhttp.BodyWriter` 作为上游请求的 body 发出请求，
 `Retain` 请求后返回；`OnBody` 回调把每段写进 writer，client 在上游连接有空间时发送；
 超过 writer 的上限时回调暂停 body，由 `BodyWriter.OnDrain` 恢复（见 `BodyWriter` 的
-示例和 `examples/gateway`）。
+示例和 [`fib-examples/gateway`](https://github.com/lesismal/fib-examples/tree/main/gateway)）。
 
 `Config.StreamRequestBodyThreshold` 在开启流式时让较小的 body 仍然整体缓存：只有
 `Content-Length` 超过它的 body，以及已经发来超过这么多字节的 chunked body 才流式交付。

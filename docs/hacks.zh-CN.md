@@ -181,7 +181,7 @@ handler := fibhttp.NewHandlerWithConfig(httpConfig, fibhttp.HandlerFunc(
 ```
 
 完整可运行的例子（含 SHA-256 校验、客户端、1GiB 测试文件生成）：
-[`examples/http/upload`](../examples/http/upload)。
+[`fib-examples/http/upload`](https://github.com/lesismal/fib-examples/tree/main/http/upload)。
 
 **这个设计的几个优势，逐条看**
 
@@ -764,5 +764,5 @@ out := bufferpool.Join(nil, a, b)           // 一次取够，拼几段
 
 - [指南（中文）](guide.zh-CN.md)：各个 API 的完整说明
 - [HTTP/1.x](http1.zh-CN.md) · [HTTP/2](http2.zh-CN.md) · [HTTP/3](http3.zh-CN.md)：限制与一致性
-- [`examples/http/upload`](../examples/http/upload)：`OnBody` 大文件上传的完整示例
+- [`fib-examples/http/upload`](https://github.com/lesismal/fib-examples/tree/main/http/upload)：`OnBody` 大文件上传的完整示例
 - [`taskpool`](../taskpool)：独立可用的协程池与基准测试

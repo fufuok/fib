@@ -1311,6 +1311,18 @@ func (c *Connection) fireNoticesLocked(err error) {
 	}
 }
 
+// NotifyOutput is for a writer that may not wait for this connection's
+// queued output to drain, such as one that acknowledges what it has sent here
+// to a peer elsewhere: when more than limit bytes of what Send accepted are
+// still queued for the socket it arranges for fn to run, on another
+// goroutine, once no more than half of limit are, or with syscall.EPIPE once
+// the connection is closing, and reports true; when no more than limit are,
+// it reports false and fn never runs. On a UDP connection it always reports
+// false.
+func (c *Connection) NotifyOutput(limit int64, fn func(error)) bool {
+	return c.notifyOutput(limit, fn)
+}
+
 // notifyOutput is waitOutput for a caller that may not wait: when more than
 // limit bytes of what Send accepted are queued for the socket it arranges for
 // fn to run, through sidepool.Post, once no more than half of limit are, or
