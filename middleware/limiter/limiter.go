@@ -104,9 +104,16 @@ func New(config ...Config) middleware.Middleware {
 				return
 			}
 			if cfg.SkipFailedRequests || cfg.SkipSuccessfulRequests {
-				c.OnFinish(func(status int, _ stdhttp.Header, _ int64) {
-					if failed := status >= stdhttp.StatusBadRequest; failed && cfg.SkipFailedRequests ||
-						!failed && cfg.SkipSuccessfulRequests {
+				// The request is given back before its response goes, not
+				// once it has: a client that sends its next request as soon
+				// as this answer arrives would otherwise be counted for both.
+				// A response that fails to go runs the hooks again for the
+				// one the handler answers with instead, so it gives back once.
+				given := false
+				c.OnHeader(func(status int, _ stdhttp.Header) {
+					if failed := status >= stdhttp.StatusBadRequest; !given && (failed && cfg.SkipFailedRequests ||
+						!failed && cfg.SkipSuccessfulRequests) {
+						given = true
 						store.give(key, window)
 					}
 				})

@@ -87,9 +87,8 @@ func TestLimiterSkipFailed(t *testing.T) {
 				t.Fatalf("failed request %d was limited: %d", i, resp.StatusCode)
 			}
 		}
-		// The refund happens once each response is out; give the last one a
-		// moment.
-		time.Sleep(20 * time.Millisecond)
+		// Each failed request is given back before its response goes, so the
+		// next request, sent once the response arrives, finds it given back.
 		for i, want := range []int{stdhttp.StatusOK, stdhttp.StatusOK, stdhttp.StatusTooManyRequests} {
 			if resp, _ := c.Do(t, "GET", url, key, ""); resp.StatusCode != want {
 				t.Errorf("request %d: %d, want %d", i, resp.StatusCode, want)
