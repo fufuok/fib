@@ -1018,6 +1018,21 @@ func ConnectionState(c *fib.Connection) (stdtls.ConnectionState, bool) {
 	return t.connectionState(), true
 }
 
+// Handshaking reports whether c carries TLS whose handshake has not completed
+// yet. A wrapped handler's OnOpen runs before the handshake, and a handler
+// that times what the connection waits for after it, such as an HTTP server
+// timing its idleness, can leave the handshake to HandshakeTimeout and start
+// timing in OnHandshake; see HandshakeHandler.
+func Handshaking(c *fib.Connection) bool {
+	t, ok := c.Layer().(*layer)
+	if !ok {
+		return false
+	}
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	return !t.ready && !t.failed
+}
+
 // feedNative carries a handshake that runs without a worker on with the bytes
 // a round read. The handshake never waits: whatever does not make a whole
 // record is kept until the next round, and when it completes the bytes behind

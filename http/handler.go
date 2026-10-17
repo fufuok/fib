@@ -692,8 +692,27 @@ func (h *ServerHandler) releaseTimeouts(c *fib.Connection, parser *Parser) {
 
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
 	parser := h.attachParser(c)
+	if fibtls.Handshaking(c) {
+		// The handshake is bounded by the TLS handler's HandshakeTimeout,
+		// and the connection is idle from when it can carry a request; see
+		// OnHandshake. Timing it from here gave a slow handshake less of
+		// IdleTimeout, or none, as net/http's never does.
+		return
+	}
 	// A connection that opens and then says nothing is idle, and bounded like
 	// any other idle connection.
+	parser.mu.Lock()
+	h.armRead(c, parser)
+	parser.mu.Unlock()
+}
+
+// OnHandshake starts timing a TLS connection's idleness once its handshake
+// has completed, as OnOpen does for one without TLS.
+func (h *ServerHandler) OnHandshake(c *fib.Connection, _ stdtls.ConnectionState) {
+	parser, ok := c.Attachment().(*Parser)
+	if !ok {
+		return
+	}
 	parser.mu.Lock()
 	h.armRead(c, parser)
 	parser.mu.Unlock()

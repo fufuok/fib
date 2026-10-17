@@ -3,16 +3,22 @@
 package http
 
 import (
+	"bufio"
 	"bytes"
+	stdtls "crypto/tls"
+	"errors"
 	"fmt"
 	"github.com/lesismal/fib/hpack"
 	"io"
+	"net"
 	stdhttp "net/http"
 	"os"
 	"testing"
 	"time"
 
 	fib "github.com/lesismal/fib"
+	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
 )
 
 func timeoutConfig(header, read, idle time.Duration) Config {
@@ -141,6 +147,45 @@ func TestServerIdleTimeoutBoundsAConnectionThatSaysNothing(t *testing.T) {
 	conn := dialRaw(t, addr)
 	if !conn.closed() {
 		t.Fatal("a connection that never sent anything stayed open")
+	}
+}
+
+// TestServerIdleTimeoutStartsAfterTheTLSHandshake has a TLS client take
+// longer than IdleTimeout to begin its handshake: the handshake is the TLS
+// handler's to bound, so the request that follows is served, and the
+// connection is then idle, and closed, as any other.
+func TestServerIdleTimeoutStartsAfterTheTLSHandshake(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	serverConfig, clientConfig, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandlerWithConfig(timeoutConfig(0, 0, idle), HandlerFunc(echoPath))
+	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), handler))
+	raw, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+	time.Sleep(2 * idle)
+	conn := stdtls.Client(raw, clientConfig)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := conn.Handshake(); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+	if _, err := io.WriteString(conn, "GET /late HTTP/1.1\r\nHost: test\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("the request after a slow handshake: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "/late" {
+		t.Fatalf("body = %q", body)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("after its request the connection was not closed for idleness: %v", err)
 	}
 }
 
