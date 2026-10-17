@@ -149,7 +149,9 @@ func upload(c *fibhttp.Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8",
 			[]byte(fmt.Sprintf("%s received %d bytes sha256=%s\n", c.Request.Proto, n, hex.EncodeToString(digest.Sum(nil)))))
 	}
-	if c.BodyComplete() {
+	if c.RequestBody() == nil {
+		// Read whole before the handler ran. A body that streams is taken by
+		// OnBody, even once it has all arrived: Body holds none of it.
 		n, _ = digest.Write(c.Body())
 		answer()
 		return

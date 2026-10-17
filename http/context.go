@@ -492,7 +492,9 @@ var endedContext = func() context.Context {
 // its last byte has been taken off the connection; see
 // Config.StreamRequestBody. A handler that finds it complete can
 // read Request.Body to the end without meeting ErrWouldBlock, and one that
-// does not can take the body through OnBody as it arrives.
+// does not can take the body through OnBody as it arrives. A body that
+// streams is never in Body, complete or not: whether Body holds the body is
+// whether RequestBody is nil.
 func (c *Context) BodyComplete() bool {
 	if stream := c.RequestBody(); stream != nil {
 		return stream.Complete()

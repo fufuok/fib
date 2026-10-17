@@ -49,10 +49,12 @@ func (g *Gateway) serveHTTP(c *fibhttp.Context, route *Route) {
 	copyHeader(header, r.Header, "Content-Length", "Expect")
 	addForwarded(header, r)
 
-	if c.BodyComplete() {
+	if c.RequestBody() == nil {
 		// Nothing more to wait for: no body, or one small enough to have come
 		// with the request. Body is the server's own buffer, which the client
-		// reads before Do returns.
+		// reads before Do returns. A body that streams is taken by OnBody
+		// below even when it has all arrived by now, which BodyComplete
+		// would report: Body holds none of it.
 		var body io.Reader
 		if b := c.Body(); len(b) > 0 {
 			body = bytes.NewReader(b)
