@@ -83,6 +83,35 @@ func (r *StreamRequest) streamBody(c *Context, config BodyFeedConfig) *BodyFeed 
 	return &BodyFeed{s: s, declared: config.Declared}
 }
 
+// ErrBodyOverrun is what a body that goes past its declared length fails
+// with, and ErrBodyShort what one that ends short of it fails with. Both are
+// ErrMalformed.
+var ErrBodyOverrun = fmt.Errorf("%w: body longer than its declared length", ErrMalformed)
+
+// Overruns reports whether n more bytes would take a body still arriving past
+// its declared length, which Write would fail it for. A protocol that resets
+// the request for it resets it first, and then writes the bytes, which fails
+// the body if the reset has not and credits them: that way nothing the
+// handler sends on hearing of the failure leaves ahead of the reset. Only the
+// writer calls it, so what it reports holds for the Write that follows.
+func (f *BodyFeed) Overruns(n int) bool {
+	s := f.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return f.declared >= 0 && !s.abandoned && s.err == nil && !s.ended && s.total+int64(n) > f.declared
+}
+
+var ErrBodyShort = fmt.Errorf("%w: body shorter than its declared length", ErrMalformed)
+
+// EndsShort reports whether a body still arriving that ended now would be
+// short of its declared length, which End would fail it for; see Overruns.
+func (f *BodyFeed) EndsShort() bool {
+	s := f.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return f.declared >= 0 && s.total != f.declared && s.err == nil
+}
+
 // Write hands the handler the next piece of the body, which Write copies, so
 // the caller keeps data. It never calls the handler's callback itself: it is
 // called on the goroutine reading the connection, which serves every stream
@@ -106,7 +135,7 @@ func (f *BodyFeed) Write(data []byte) error {
 	var err error
 	switch {
 	case f.declared >= 0 && s.total > f.declared:
-		err = fmt.Errorf("%w: body longer than its declared length", ErrMalformed)
+		err = ErrBodyOverrun
 	case s.limit > 0 && s.total > s.limit:
 		err = ErrBodyTooLarge
 	}
@@ -129,9 +158,8 @@ func (f *BodyFeed) End(trailer stdhttp.Header) error {
 	short := f.declared >= 0 && s.total != f.declared && s.err == nil
 	s.mu.Unlock()
 	if short {
-		err := fmt.Errorf("%w: body shorter than its declared length", ErrMalformed)
-		s.fail(err, true)
-		return err
+		s.fail(ErrBodyShort, true)
+		return ErrBodyShort
 	}
 	s.finish(trailer)
 	return nil

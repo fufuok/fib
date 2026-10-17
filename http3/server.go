@@ -1261,9 +1261,12 @@ func (rs *requestStream) feed(data []byte, fin bool) {
 	}
 	if b != nil && b.feed != nil {
 		rs.done = true
-		if err := b.feed.End(b.trailer); err != nil {
-			rs.abort(ErrCodeMessageError)
+		if b.feed.EndsShort() {
+			// Aborted before the handler hears of it; see onData.
+			rs.abortWith(ErrCodeMessageError, fibhttp.ErrBodyShort)
+			return
 		}
+		_ = b.feed.End(b.trailer)
 		return
 	}
 	rs.finish()
@@ -1285,12 +1288,17 @@ func (rs *requestStream) onData(chunk []byte) error {
 	if b := rs.streamed; b != nil {
 		if b.feed != nil {
 			b.fedBody += len(chunk)
-			if err := b.feed.Write(chunk); errors.Is(err, fibhttp.ErrMalformed) {
-				// Longer than its content-length. A body past
-				// MaxStreamedBodyBytes instead fails with the handler told,
-				// which may still answer it; what more arrives is dropped.
-				rs.abort(ErrCodeMessageError)
+			if b.feed.Overruns(len(chunk)) {
+				// Longer than its content-length. The stream is aborted
+				// before the handler hears of it, so that nothing it sends
+				// on hearing it, such as the response OnBody's end lets go,
+				// leaves ahead of the reset; the chunk is then credited as
+				// the body credits it. A body past MaxStreamedBodyBytes
+				// instead fails with the handler told, which may still answer
+				// it; what more arrives is dropped.
+				rs.abortWith(ErrCodeMessageError, fibhttp.ErrBodyOverrun)
 			}
+			_ = b.feed.Write(chunk)
 			return nil
 		}
 		config := &rs.sc.h.config
@@ -1555,9 +1563,13 @@ func (rs *requestStream) finish() {
 
 // abort gives up on a malformed or incomplete request.
 func (rs *requestStream) abort(code ErrorCode) {
+	rs.abortWith(code, fmt.Errorf("http3: request stream aborted: %v", code))
+}
+
+// abortWith is abort with the error the request's body and handler hear.
+func (rs *requestStream) abortWith(code ErrorCode, err error) {
 	rs.done = true
 	rs.dropBody()
-	err := fmt.Errorf("http3: request stream aborted: %v", code)
 	// Closed before the handler hears of it; see peerReset.
 	rs.mu.Lock()
 	rs.closed = true

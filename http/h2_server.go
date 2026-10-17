@@ -1188,10 +1188,19 @@ func (sc *h2ServerConn) handleStreamedData(st *h2ServerStream, f *h2Frame) error
 	st.recvWindow -= length
 	st.recvUnacked += length - int64(len(f.payload))
 	sc.mu.Unlock()
+	if st.feed.Overruns(len(f.payload)) {
+		// Longer than its content-length (RFC 9113 section 8.1.1). The stream
+		// is reset in the same breath as the handler is told, so nothing it
+		// sends on hearing it, such as the response OnBody's end lets go,
+		// leaves ahead of the reset. What arrived is credited as the body
+		// would credit it.
+		sc.resetStreamWith(st.id, H2ProtocolError, ErrBodyOverrun)
+		_ = st.feed.Write(f.payload)
+		return nil
+	}
 	if err := st.feed.Write(f.payload); errors.Is(err, ErrMalformed) {
-		// Longer than its content-length (RFC 9113 section 8.1.1). A body
-		// past MaxStreamedBodyBytes instead fails with the handler told,
-		// which may still answer it; what more arrives is thrown away.
+		// A body past MaxStreamedBodyBytes instead fails with the handler
+		// told, which may still answer it; what more arrives is thrown away.
 		return &H2StreamError{StreamID: f.streamID, Code: H2ProtocolError}
 	}
 	if f.has(h2FlagEndStream) {
@@ -1202,6 +1211,12 @@ func (sc *h2ServerConn) handleStreamedData(st *h2ServerStream, f *h2Frame) error
 
 // endStreamed ends a body that streams, with its trailer, if any.
 func (sc *h2ServerConn) endStreamed(st *h2ServerStream, trailer stdhttp.Header) error {
+	if st.feed.EndsShort() {
+		// Shorter than its content-length: reset with the handler told, as
+		// for a body that overruns it (see handleStreamedData).
+		sc.resetStreamWith(st.id, H2ProtocolError, ErrBodyShort)
+		return nil
+	}
 	sc.mu.Lock()
 	st.remoteDone = true
 	sc.stopReadTimerLocked(st)
@@ -1478,9 +1493,15 @@ func (sc *h2ServerConn) reject(st *h2ServerStream, status int) {
 
 // resetStream ends a stream with RST_STREAM.
 func (sc *h2ServerConn) resetStream(id uint32, code H2ErrorCode) {
+	sc.resetStreamWith(id, code, &H2StreamError{StreamID: id, Code: code})
+}
+
+// resetStreamWith is resetStream with the error the stream's body and
+// handler hear.
+func (sc *h2ServerConn) resetStreamWith(id uint32, code H2ErrorCode, err error) {
 	sc.mu.Lock()
 	if st := sc.streams[id]; st != nil {
-		sc.failBodyLocked(st, &H2StreamError{StreamID: id, Code: code})
+		sc.failBodyLocked(st, err)
 		sc.forgetLocked(st)
 	}
 	sc.sendLocked(h2AppendRSTStream(nil, id, code))
