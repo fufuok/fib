@@ -334,7 +334,10 @@ func TestCcResponseStreamEdges(t *testing.T) {
 	if err := results.expect(t, "short"); err != nil {
 		t.Fatal(err)
 	}
-	if st := w.await(id, "the reset", func(st *h3WireStream) bool { return st.reset }); st.status != stdhttp.StatusOK {
+	// The header went out before the reset, but a reset lets the receiver
+	// drop what it has not delivered yet (RFC 9000 section 3.2), so whether
+	// the status was seen first is up to how the two arrived.
+	if st := w.await(id, "the reset", func(st *h3WireStream) bool { return st.reset }); st.status != stdhttp.StatusOK && st.status != 0 {
 		t.Fatalf("short: status %d", st.status)
 	}
 

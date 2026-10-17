@@ -192,6 +192,10 @@ type h2TestConn struct {
 	// still arriving in CONTINUATION frames.
 	streams map[uint32]*h2TestStream
 	cont    *h2TestFrame
+	// opened is when the connection was made, and goAway describes the last
+	// GOAWAY read, so that a connection that ends under a test says how.
+	opened time.Time
+	goAway string
 }
 
 // h2TestStream is what a stream has received: its final response header,
@@ -232,7 +236,7 @@ func dialH2(t *testing.T, addr string, settings ...[2]uint32) *h2TestConn {
 func newH2TestConn(t *testing.T, c net.Conn) *h2TestConn {
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 	return &h2TestConn{t: t, c: c, enc: hpack.NewEncoder(), dec: hpack.NewDecoder(hpack.DefaultTableSize),
-		streams: map[uint32]*h2TestStream{}}
+		streams: map[uint32]*h2TestStream{}, opened: time.Now()}
 }
 
 func (tc *h2TestConn) write(b []byte) {
@@ -330,12 +334,21 @@ func (tc *h2TestConn) readRaw() h2Frame {
 		if n > 0 {
 			f.payload = append([]byte(nil), f.payload...)
 			tc.in = tc.in[n:]
+			if f.typ == h2FrameGoAway && len(f.payload) >= 8 {
+				tc.goAway = fmt.Sprintf("GOAWAY last stream %d code %v after %v",
+					binary.BigEndian.Uint32(f.payload)&0x7fffffff, H2ErrorCode(binary.BigEndian.Uint32(f.payload[4:])),
+					time.Since(tc.opened))
+			}
 			return f
 		}
 		buf := make([]byte, 32<<10)
 		m, err := tc.c.Read(buf)
 		if err != nil {
-			tc.t.Fatalf("read: %v", err)
+			goAway := tc.goAway
+			if goAway == "" {
+				goAway = "no GOAWAY"
+			}
+			tc.t.Fatalf("read: %v, %v after the dial (%s)", err, time.Since(tc.opened), goAway)
 		}
 		tc.in = append(tc.in, buf[:m]...)
 	}

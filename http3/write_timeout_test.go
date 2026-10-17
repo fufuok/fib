@@ -133,9 +133,12 @@ func TestWriteTimeoutRefusesLateWrites(t *testing.T) {
 // Responses that finish within WriteTimeout are left alone, whether sent
 // whole or streamed, on recycled streams, long after the first of them: the
 // timers of streams that finished stop, and never reach the requests their
-// streams go on to serve.
+// streams go on to serve. The timeout is generous, since it runs from the
+// request's arrival, and a loaded CI runner can leave the handler waiting
+// for a worker for a good part of a shorter one.
 func TestWriteTimeoutLeavesFinishedStreamsAlone(t *testing.T) {
-	base := startServer(t, Config{WriteTimeout: 300 * time.Millisecond}, func(c *fibhttp.Context) {
+	const timeout = time.Second
+	base := startServer(t, Config{WriteTimeout: timeout}, func(c *fibhttp.Context) {
 		if c.Request.URL.Path == "/stream" {
 			for range 8 {
 				if _, err := c.Write(make([]byte, 16<<10)); err != nil {
@@ -149,7 +152,7 @@ func TestWriteTimeoutLeavesFinishedStreamsAlone(t *testing.T) {
 	w := dialH3Wire(t, nil, base)
 	for i := range 3 {
 		if i > 0 {
-			time.Sleep(350 * time.Millisecond)
+			time.Sleep(timeout + 200*time.Millisecond)
 		}
 		if status, body := w.response(w.send(t, h3Request{path: "/whole"}, false)); status != 200 || string(body) != "whole" {
 			t.Fatalf("round %d: %d %q", i, status, body)
