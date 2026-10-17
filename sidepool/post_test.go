@@ -74,7 +74,7 @@ func TestPost(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the callback never ran")
 	}
-	if !ran.Load() || Notify() != Notify() {
+	if first, again := Notify(), Notify(); !ran.Load() || first != again {
 		t.Fatal("Post did not run on one notify pool")
 	}
 }

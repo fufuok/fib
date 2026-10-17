@@ -220,8 +220,10 @@ func TestIdleTimeout(t *testing.T) {
 	})
 	t.Run("after requests", func(t *testing.T) {
 		w := dialIdleWire(t, url, quic.Config{})
-		if !w.awaitEnd(w.request("/")) || !w.awaitEnd(w.request("/")) {
-			t.Fatal("a request was reset")
+		for i := 0; i < 2; i++ {
+			if !w.awaitEnd(w.request("/")) {
+				t.Fatalf("request %d was reset", i)
+			}
 		}
 		w.expectRetired(8)
 	})
