@@ -1452,3 +1452,123 @@ func TestSetWriteBackpressure(t *testing.T) {
 		_ = conn.Close()
 	}
 }
+
+// A read deferred because the backlog reached the watermark is still owed
+// while the queue never empties: a sender that keeps topping it up, as a
+// streamed upload waiting on waitOutput does, may never let it empty, and the
+// peer's data, an early response say, must not wait for that. The round that
+// defers leaves the read among the connection's pending events, so the next
+// write edge's round, or on Windows the next completed send's, reads once the
+// backlog is under the watermark.
+func TestDeferredReadDeliveredWhileQueueStaysNonEmpty(t *testing.T) {
+	const (
+		watermark = 1 << 20
+		chunk     = 32 << 10
+		// The pump keeps between keep/2 and keep+chunk queued, below the low
+		// watermark (watermark/4) and far more than the small socket buffers
+		// free at once, so the queue does not empty while it runs.
+		keep = 128 << 10
+	)
+	config := DefaultConfig()
+	config.WriteBufferHighWatermark = watermark
+	inData := make(chan *Connection, 1)
+	release := make(chan struct{})
+	full := make(chan struct{})
+	got := make(chan struct{})
+	stop := make(chan struct{})
+	pumpDone := make(chan struct{})
+	payload := make([]byte, chunk)
+	pump := func(c *Connection) {
+		defer close(pumpDone)
+		// Past the watermark at once, while the peer reads nothing.
+		for c.unsent() < 2*watermark {
+			if c.Send(payload) != nil {
+				return
+			}
+		}
+		close(full)
+		// While the round runs its sends are corked, which waitOutput does
+		// not count; top up only once it has gone.
+		<-release
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if c.waitOutput(keep) != nil || c.Send(payload) != nil {
+				return
+			}
+		}
+	}
+	_, addr := startEchoServer(t, config, HandlerFuncs{
+		Open: func(c *Connection) { _ = c.SetWriteBuffer(16 << 10) },
+		Data: func(c *Connection, b []byte) {
+			if bytes.Contains(b, []byte("go")) {
+				inData <- c
+				<-release
+			}
+			if bytes.Contains(b, []byte("ping")) {
+				close(got)
+			}
+		},
+	})
+
+	conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("go")); err != nil {
+		t.Fatal(err)
+	}
+	var c *Connection
+	select {
+	case c = <-inData:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server never read the first message")
+	}
+	// The ping's edge reaches the round still running, before anything is
+	// queued, so it is noted for the round rather than held back as a paused
+	// read. The round then finds the backlog past the watermark, and defers
+	// the read to whatever drains it.
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	go pump(c)
+	var releaseOnce sync.Once
+	letGo := func() { releaseOnce.Do(func() { close(release) }) }
+	defer func() {
+		// The pump may be waiting on output only the peer can drain.
+		close(stop)
+		conn.Close()
+		letGo()
+		<-pumpDone
+	}()
+	select {
+	case <-full:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the server's queue never reached the watermark")
+	}
+	letGo()
+
+	// Read until the server has the ping. The socket buffers are small enough
+	// that no flush takes all the pump keeps queued.
+	buf := make([]byte, 16<<10)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case <-got:
+			return
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the peer's data went unread while the server kept output queued")
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := conn.Read(buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
