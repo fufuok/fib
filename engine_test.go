@@ -1304,12 +1304,14 @@ func TestReadDeadlineClosesTheConnection(t *testing.T) {
 }
 
 // TestReadDeadlineMovedBeforeItFires checks the generation guard: a deadline
-// pushed back must not be closed by the timer it outlived.
+// pushed back must not be closed by the timer it outlived. The deadline is
+// several times the gap between pushes, since a loaded CI runner can oversleep
+// a gap, or deliver a push late, by a good part of a shorter one.
 func TestReadDeadlineMovedBeforeItFires(t *testing.T) {
 	var reads atomic.Int64
 	watcher := newCloseWatcher(func(c *Connection, _ []byte) {
 		reads.Add(1)
-		_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	})
 	_, addr := startEchoServer(t, DefaultConfig(), watcher)
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
@@ -1318,7 +1320,7 @@ func TestReadDeadlineMovedBeforeItFires(t *testing.T) {
 	}
 	defer conn.Close()
 	// Keep pushing the deadline back for well past its length.
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 15; i++ {
 		if _, err = conn.Write([]byte("tick")); err != nil {
 			t.Fatal(err)
 		}

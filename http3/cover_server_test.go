@@ -689,7 +689,11 @@ func TestCsRequestStreams(t *testing.T) {
 	// What more arrives on the refused stream is passed over: it once found
 	// a nil request stream there, and the connection's goroutine panicked.
 	late := csOpen(t, w, csRequest("POST", "/late"), false)
-	csWriteOn(t, late, dataFrame([]byte("more")), true)
+	if err := late.Write(dataFrame([]byte("more")), true); err != nil && !errors.Is(err, quic.ErrClosed) {
+		// The refusal's STOP_SENDING may have arrived first, which resets
+		// the stream here, and then there is no more to send.
+		t.Fatal(err)
+	}
 	csAwaitReset(t, w, late)
 	close(holdRelease)
 	csExpectStatus(t, w, hold, stdhttp.StatusOK)
