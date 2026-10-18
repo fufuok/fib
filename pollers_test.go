@@ -138,6 +138,66 @@ func TestPollersServeAcceptedConnections(t *testing.T) {
 	}
 }
 
+// PollBatchSize sizes every loop's wait apart from the task queue, and a batch
+// smaller than what is ready leaves the rest for the next wait rather than
+// losing it: with a batch of one, connections whose data arrives together
+// are still all served.
+func TestPollBatchSizeIsItsOwnSetting(t *testing.T) {
+	const pollers, conns = 2, 16
+	config := pollerConfig("poll-batch", pollers)
+	config.PollBatchSize = 1
+	server, addr := startEchoServer(t, config, HandlerFuncs{
+		Data: func(c *Connection, b []byte) {
+			if err := c.Send(b); err != nil {
+				c.Close()
+			}
+		},
+	})
+	for _, e := range append([]*Engine{server}, server.pollers...) {
+		if e.pollBatchSize != 1 {
+			t.Fatalf("a loop waits for %d events, want 1", e.pollBatchSize)
+		}
+		if e.maxEvents != config.MaxEvents {
+			t.Fatalf("maxEvents %d, want MaxEvents %d left alone", e.maxEvents, config.MaxEvents)
+		}
+	}
+
+	payload := []byte("one event per wait")
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < conns; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			<-start
+			for round := 0; round < 10; round++ {
+				if _, err := conn.Write(payload); err != nil {
+					t.Error(err)
+					return
+				}
+				reply := make([]byte, len(payload))
+				if _, err := io.ReadFull(conn, reply); err != nil {
+					t.Error(err)
+					return
+				}
+				if !bytes.Equal(reply, payload) {
+					t.Errorf("echo mismatch: %q", reply)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+}
+
 // Dialed connections, over TCP and over UDP, go to the pollers as accepted
 // ones do.
 func TestPollersServeDialedConnections(t *testing.T) {

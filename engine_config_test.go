@@ -34,6 +34,9 @@ func TestBindFillsInZeroSizes(t *testing.T) {
 	if e.maxEvents != 256 || e.readBufferSize != 16<<10 || e.writeHighWatermark != 4<<10 {
 		t.Fatalf("maxEvents %d, readBufferSize %d, writeHighWatermark %d", e.maxEvents, e.readBufferSize, e.writeHighWatermark)
 	}
+	if e.pollBatchSize != defaultPollBatchSize {
+		t.Fatalf("pollBatchSize %d, want %d", e.pollBatchSize, defaultPollBatchSize)
+	}
 	if _, ok := e.Handler().(HandlerFuncs); !ok {
 		t.Fatalf("a nil handler became %T", e.Handler())
 	}

@@ -31,8 +31,8 @@ type TaskPool interface {
 }
 
 // PoolSizing is how many workers a task pool may run and how many tasks it may
-// hold waiting for them. MaxEvents also sizes the epoll batch the event loop
-// collects in one round.
+// hold waiting for them. How many events an event loop collects in one round
+// is Config.PollBatchSize, apart from either.
 type PoolSizing struct {
 	WorkerCount int
 	MaxEvents   int

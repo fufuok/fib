@@ -73,6 +73,13 @@
   config.SetTaskPoolMode(taskpool.ModeElastic)  // 容量随之切到该 Mode 的默认值
   config.SetPoolSizing(500, 10000)              // 固定成自己的取值
   ```
+- `MaxEvents` 只决定协程池的队列长度。事件循环每次等待最多取多少个事件
+  （Linux 上 `epoll_wait` 的 maxevents，macOS/BSD 上 `kevent` 的 nevents，
+  Windows 上 `GetQueuedCompletionStatusEx` 的 count）由 `Config.PollBatchSize`
+  单独设置，默认 1024（填 0 即默认值）。超出部分仍然就绪，下一次等待取走。
+  一轮取到的事件全部过一遍之后才一起交给 worker，所以调大能把每轮的固定开销
+  摊到更多事件上，但这一轮最早就绪的连接要多等；调小则相反。只有一次等待就绪
+  事件超过这个数时，调整才有区别。
 - 背压有两道界，暂停读的原因只能是其中之一，`Engine.Stats()` 会分别计数
   （`ReadsPausedByWatermark`、`ReadsPausedByBudget`、`ReadsResumed`、
   `PendingBytes`）：

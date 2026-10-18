@@ -622,10 +622,7 @@ func (e *Engine) Run() error {
 	// A client connecting once the engine stops is refused rather than left
 	// in a backlog nothing accepts from.
 	defer e.closeListeners()
-	batch := e.maxEvents
-	if batch > maxWaitBatch {
-		batch = maxWaitBatch
-	}
+	batch := e.pollBatchSize
 	entries := make([]sys.OverlappedEntry, batch)
 	var ready []*Connection
 	var tasks []taskpool.Task

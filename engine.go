@@ -26,10 +26,11 @@ import (
 
 const (
 	maxWritevItems = 64
-	// maxWaitBatch caps the buffer one wait for events fills. MaxEvents keeps
-	// sizing the task queue; beyond this many events per wait the loop just
-	// waits again, so a larger buffer only costs memory per server.
-	maxWaitBatch = 1024
+	// defaultPollBatchSize is Config.PollBatchSize when it is left at zero.
+	// Beyond this many events per wait the loop just waits again, and each
+	// round's fixed costs are already spread thin, so a larger buffer mostly
+	// delays handing the first events of a round to the workers.
+	defaultPollBatchSize = 1024
 	// defaultWriteHighWatermark is the per-connection outbound budget. Two
 	// costs sit either side of it. Lower, and ordinary traffic crosses it on
 	// every reply: a round that crosses it flushes before it reads on, and a
@@ -124,6 +125,7 @@ type Engine struct {
 	name               string
 	logStatus          bool
 	maxEvents          int
+	pollBatchSize      int // see Config.PollBatchSize
 	useWritev          bool
 	socketSyscalls     bool // see Config.SocketSyscalls
 	coalesceWrites     bool // see Config.CoalesceWrites
@@ -264,6 +266,9 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 	if config.MaxEvents <= 0 {
 		config.MaxEvents = 256
 	}
+	if config.PollBatchSize <= 0 {
+		config.PollBatchSize = defaultPollBatchSize
+	}
 	if config.ReadBufferSize <= 0 {
 		config.ReadBufferSize = 16 * 1024
 	}
@@ -281,6 +286,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 	}
 
 	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents,
+		pollBatchSize:      config.PollBatchSize,
 		noLoop:             !engineLoop(config),
 		acceptPlacement:    config.AcceptPlacement,
 		useWritev:          config.UseWritev,
@@ -338,7 +344,8 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 func (e *Engine) openPollers(config Config) error {
 	n := pollerCount(config)
 	for i := 0; i < n; i++ {
-		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents, useWritev: e.useWritev,
+		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents,
+			pollBatchSize: e.pollBatchSize, useWritev: e.useWritev,
 			socketSyscalls: e.socketSyscalls, coalesceWrites: e.coalesceWrites,
 			writeHighWatermark: e.writeHighWatermark,
 			writeLowWatermark:  e.writeLowWatermark, maxPendingBytes: e.maxPendingBytes,
@@ -1095,10 +1102,23 @@ type Config struct {
 	LogStatus bool
 	// Network is the network of every Binding that leaves its own empty;
 	// see Binding.Network. Empty means "tcp".
-	Network        string
-	Backlog        int
-	WorkerCount    int
-	MaxEvents      int
+	Network     string
+	Backlog     int
+	WorkerCount int
+	// MaxEvents is how many tasks the task pool holds waiting for workers;
+	// see PoolSizing.
+	MaxEvents int
+	// PollBatchSize is the most events one wait of an event loop collects:
+	// epoll_wait's maxevents on Linux, kevent's nevents on macOS and the
+	// BSDs, and GetQueuedCompletionStatusEx's count on Windows. Events past
+	// it stay ready and are collected by the next wait. Zero means 1024.
+	//
+	// A loop hands what a wait collected to the workers once it has gone
+	// through all of it, so a larger batch spreads each round's wait and
+	// submission over more events while the first of them wait longer for a
+	// worker; a smaller one does the reverse. Only a loop that finds more
+	// events ready than the batch holds sees any difference.
+	PollBatchSize  int
 	ReadBufferSize int
 	// WriteBufferHighWatermark pauses socket reads while at least this many
 	// bytes are waiting to be written. This bounds userspace buffering while

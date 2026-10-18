@@ -537,9 +537,12 @@ type Config struct {
 	// see Binding.Network. Empty means "tcp".
 	Network                         string
 	Backlog, WorkerCount, MaxEvents int
-	ReadBufferSize                  int
-	WriteBufferHighWatermark        int
-	UseWritev                       bool
+	// PollBatchSize caps how many events one wait of an epoll, kqueue or
+	// IOCP event loop collects. This backend has no loops, and ignores it.
+	PollBatchSize            int
+	ReadBufferSize           int
+	WriteBufferHighWatermark int
+	UseWritev                bool
 	// CoalesceWrites batches the replies a read round produces. This backend
 	// reads and writes through the net package, which has no read rounds to
 	// batch, and ignores it.

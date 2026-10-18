@@ -74,10 +74,7 @@ func (e *Engine) closeBackend() error {
 
 // runLoop runs the engine's event loop until Stop.
 func (e *Engine) runLoop() error {
-	batch := e.maxEvents
-	if batch > maxWaitBatch {
-		batch = maxWaitBatch
-	}
+	batch := e.pollBatchSize
 	events := make([]syscall.Kevent_t, batch)
 	var ready []*Connection
 	var tasks []taskpool.Task
