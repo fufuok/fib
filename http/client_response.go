@@ -46,6 +46,7 @@ type ClientResponse struct {
 	fn         BodyFunc
 	inCallback bool
 	delivered  bool
+	paused     bool
 	taken      int64
 	// s is the stream of a response whose body was still arriving when the
 	// callback ran, and nil for one that arrived whole.
@@ -129,11 +130,39 @@ func (c *ClientResponse) OnBody(fn BodyFunc) {
 	}
 }
 
+// HoldBody pauses, with hold set, the delivery of the body to OnBody's
+// function, and resumes it without. While it is held, what arrives waits in
+// the client's buffer, as it does for a function that is slow to return:
+// HTTP/1 stops reading the connection once StreamResponseBodyBuffer waits,
+// and HTTP/2 and HTTP/3 give back no window for this stream, so the other
+// streams on the connection go on. The end of the body waits too, but an
+// error, which ends the body without the rest of it, is delivered at once.
+// Resuming delivers what waits on the client's side pool, never on the
+// caller's goroutine, so HoldBody may be called from inside the function
+// and from anywhere else. It is how a caller that passes the body on to a
+// writer that must not wait, such as Context.WriteNoWait, pauses it until
+// Context.OnWritable says there is room.
+//
+// A response that arrived whole is held the same way, before its one call.
+func (c *ClientResponse) HoldBody(hold bool) {
+	if c.s != nil {
+		c.s.hold(hold)
+		return
+	}
+	c.mu.Lock()
+	resume := c.paused && !hold && c.fn != nil && !c.delivered && !c.inCallback
+	c.paused = hold
+	c.mu.Unlock()
+	if resume {
+		sidepool.Go(c.deliverWhole)
+	}
+}
+
 // deliverWhole hands a body that arrived whole to the function waiting for it.
 func (c *ClientResponse) deliverWhole() {
 	c.mu.Lock()
 	fn := c.fn
-	if fn == nil || c.delivered {
+	if fn == nil || c.delivered || c.paused {
 		c.mu.Unlock()
 		return
 	}
@@ -287,8 +316,10 @@ type ResponseStream struct {
 	// finSent that fn has been told so.
 	ended, finSent bool
 	err            error
-	// held says the connection's reads are stopped for want of a reader.
+	// held says the connection's reads are stopped for want of a reader, and
+	// paused that HoldBody holds the body back from fn.
 	held     bool
+	paused   bool
 	consumed int64
 	trailer  stdhttp.Header
 	// preCredited counts what of buf has been credited already, when
@@ -388,7 +419,7 @@ func (s *ResponseStream) Data(b []byte) {
 		}
 		return
 	}
-	if s.fn != nil && s.fired && !s.inCallback && !s.delivering && len(s.buf) == 0 && !s.detached {
+	if s.fn != nil && s.fired && !s.inCallback && !s.delivering && len(s.buf) == 0 && !s.detached && !s.paused {
 		// Nobody is behind: hand it over from where it was read.
 		fn := s.fn
 		s.delivering = true
@@ -484,6 +515,21 @@ func (s *ResponseStream) setFn(fn BodyFunc) {
 	}
 }
 
+// hold is ClientResponse.HoldBody for a body that streams.
+func (s *ResponseStream) hold(hold bool) {
+	s.mu.Lock()
+	resume := s.paused && !hold
+	s.paused = hold
+	s.mu.Unlock()
+	switch {
+	case !resume:
+	case s.detached:
+		s.kick()
+	default:
+		sidepool.Go(s.drain)
+	}
+}
+
 // deliver hands fn what has arrived: on this goroutine, or, for a stream
 // that is detached, on one of its own.
 func (s *ResponseStream) deliver() {
@@ -499,7 +545,7 @@ func (s *ResponseStream) deliver() {
 // returns.
 func (s *ResponseStream) kick() {
 	s.mu.Lock()
-	if s.delivering || s.inCallback || s.fn == nil {
+	if s.delivering || s.inCallback || s.fn == nil || s.paused && s.err == nil {
 		s.mu.Unlock()
 		return
 	}
@@ -531,7 +577,7 @@ func (s *ResponseStream) drainLocked() {
 	for {
 		fn := s.fn
 		switch {
-		case len(s.buf) > 0 && s.err == nil:
+		case len(s.buf) > 0 && s.err == nil && !s.paused:
 			data := s.buf
 			s.buf = nil
 			s.consumed += int64(len(data))
@@ -548,7 +594,7 @@ func (s *ResponseStream) drainLocked() {
 			fn(nil, true, err)
 			s.mu.Lock()
 			continue
-		case s.ended && !s.finSent && s.err == nil:
+		case s.ended && !s.finSent && s.err == nil && !s.paused:
 			s.finSent = true
 			s.mu.Unlock()
 			fn(nil, true, nil)
