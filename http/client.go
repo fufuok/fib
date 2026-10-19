@@ -73,11 +73,17 @@ type ClientConfig struct {
 	// Requests beyond it wait for one of them. Zero or less means no cap.
 	MaxConnsPerHost int
 	// MaxPendingPerHost caps the requests to one host:port waiting for a
-	// connection, whether for one being dialed or for one MaxConnsPerHost
-	// keeps them from dialing. A request beyond it fails at once with
-	// ErrTooManyPending, so that a host that has stopped answering costs
-	// a bounded queue rather than one that grows until the requests'
-	// timeouts. Zero or less means no cap.
+	// connection that MaxConnsPerHost keeps the client from dialing for
+	// them, as nginx's queue does: a request beyond it fails at once with
+	// ErrTooManyPending, so that a host that has stopped answering costs a
+	// bounded queue, of at most MaxConnsPerHost plus this, rather than one
+	// that grows until the requests' timeouts. Requests a connection is
+	// being dialed for, or could still be within MaxConnsPerHost, do not
+	// count, so a burst to a cold host is not turned away while the
+	// connections it is allowed open; for a host that may speak HTTP/2,
+	// which the client dials once for until it knows, that is the dial and
+	// the connections MaxConnsPerHost still leaves room for. It has no
+	// effect without MaxConnsPerHost. Zero or less means no cap.
 	MaxPendingPerHost int
 	// MaxIdleConnsPerHost is how many finished connections to one host:port
 	// are kept for later requests. Zero or less keeps none, so every request
@@ -588,16 +594,42 @@ func (c *Client) enqueue(target hostTarget, r *clientRequest, retry bool) {
 		// A request sent again was not waiting when it was let in, so the
 		// cap does not turn it away now.
 		h.waiting = append([]*clientRequest{r}, h.waiting...)
-	} else if limit := c.config.MaxPendingPerHost; limit > 0 && len(h.waiting) >= limit && pendingLocked(h) >= limit {
-		c.mu.Unlock()
-		r.finish(nil, ErrTooManyPending)
-		return
 	} else {
 		h.waiting = append(h.waiting, r)
 	}
 	work, dials := c.dispatchLocked(h)
+	refused := !retry && c.overPendingLocked(h, r)
 	c.mu.Unlock()
 	c.carryOut(h, work, dials)
+	if refused {
+		r.finish(nil, ErrTooManyPending)
+	}
+}
+
+// overPendingLocked reports whether r, just queued and dispatched, waits
+// beyond MaxPendingPerHost, and takes it out of the queue if so. What
+// counts is the requests no connection is being dialed for, nor could be
+// within MaxConnsPerHost: dispatchLocked has turned the room for
+// connections into dials already, except for a host that may speak HTTP/2,
+// which it dials once for, and whose room is counted here as the dials it
+// would be were the host to answer in HTTP/1.
+func (c *Client) overPendingLocked(h *hostPool, r *clientRequest) bool {
+	limit, conns := c.config.MaxPendingPerHost, c.config.MaxConnsPerHost
+	if limit <= 0 || conns <= 0 {
+		return false
+	}
+	covered := h.dialing + max(conns-h.open, 0)
+	if len(h.waiting)-covered <= limit || pendingLocked(h)-covered <= limit {
+		return false
+	}
+	// r is the last of the queue, unless dispatchLocked handed it a
+	// connection, in which case it waits for nothing.
+	if n := len(h.waiting); n > 0 && h.waiting[n-1] == r {
+		h.waiting[n-1] = nil
+		h.waiting = h.waiting[:n-1]
+		return true
+	}
+	return false
 }
 
 // pendingLocked drops the requests that ended while they waited, which the
