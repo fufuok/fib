@@ -306,6 +306,56 @@ func TestCvCliIdleTimerReused(t *testing.T) {
 	}
 }
 
+// With MaxConnsPerHost reached, MaxPendingPerHost requests wait for the
+// connection and the next fails at once with ErrTooManyPending; one that
+// ended while it waited makes room for another.
+func TestCvCliMaxPendingPerHost(t *testing.T) {
+	asked := make(chan struct{}, 8)
+	release := make(chan struct{})
+	u := rawServer(t, func(conn net.Conn, _ int) {
+		r := bufio.NewReader(conn)
+		for {
+			if _, err := stdhttp.ReadRequest(r); err != nil {
+				return
+			}
+			asked <- struct{}{}
+			<-release
+			if _, err := io.WriteString(conn, cvCliOK); err != nil {
+				return
+			}
+		}
+	})
+	config := DefaultClientConfig()
+	config.MaxConnsPerHost = 1
+	config.MaxPendingPerHost = 2
+	client := newTestClient(t, config)
+	results := make(chan error, 8)
+	send := func(ctx context.Context) {
+		req := mustRequest(t, "GET", u, nil).WithContext(ctx)
+		client.Do(req, func(cr *ClientResponse, err error) { results <- err })
+	}
+	send(context.Background())
+	cvCliWait(t, asked, "the first request to reach the server")
+	ctx, cancel := context.WithCancel(context.Background())
+	send(ctx)
+	send(context.Background())
+	send(context.Background())
+	if err := cvCliWait(t, results, "the request over the cap"); !errors.Is(err, ErrTooManyPending) {
+		t.Fatalf("the request over the cap got %v, want %v", err, ErrTooManyPending)
+	}
+	cancel()
+	if err := cvCliWait(t, results, "the cancelled request"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("the cancelled request got %v", err)
+	}
+	send(context.Background())
+	close(release)
+	for i := 0; i < 3; i++ {
+		if err := cvCliWait(t, results, "the requests let in"); err != nil {
+			t.Fatalf("a request let in got %v", err)
+		}
+	}
+}
+
 // An idle HTTP/2 connection is closed once IdleConnTimeout passes.
 func TestCvCliIdleConnTimeoutHTTP2(t *testing.T) {
 	closed := make(chan struct{})

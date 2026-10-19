@@ -32,6 +32,10 @@ var (
 	// ErrClientClosed is what requests still waiting for a connection get when
 	// the client is closed, and what new requests get afterwards.
 	ErrClientClosed = errors.New("http: client closed")
+	// ErrTooManyPending is what a request gets at once when
+	// ClientConfig.MaxPendingPerHost requests to its host are already
+	// waiting for a connection.
+	ErrTooManyPending = errors.New("http: too many requests waiting for a connection to the host")
 	// ErrUnsupportedScheme is what a request for anything but http:// or
 	// https:// gets.
 	ErrUnsupportedScheme = errors.New("http: unsupported URL scheme")
@@ -68,6 +72,13 @@ type ClientConfig struct {
 	// MaxConnsPerHost caps the connections open or dialing to one host:port.
 	// Requests beyond it wait for one of them. Zero or less means no cap.
 	MaxConnsPerHost int
+	// MaxPendingPerHost caps the requests to one host:port waiting for a
+	// connection, whether for one being dialed or for one MaxConnsPerHost
+	// keeps them from dialing. A request beyond it fails at once with
+	// ErrTooManyPending, so that a host that has stopped answering costs
+	// a bounded queue rather than one that grows until the requests'
+	// timeouts. Zero or less means no cap.
+	MaxPendingPerHost int
 	// MaxIdleConnsPerHost is how many finished connections to one host:port
 	// are kept for later requests. Zero or less keeps none, so every request
 	// dials afresh.
@@ -537,13 +548,34 @@ func (c *Client) enqueue(target hostTarget, r *clientRequest, retry bool) {
 		c.hosts[target] = h
 	}
 	if retry {
+		// A request sent again was not waiting when it was let in, so the
+		// cap does not turn it away now.
 		h.waiting = append([]*clientRequest{r}, h.waiting...)
+	} else if limit := c.config.MaxPendingPerHost; limit > 0 && len(h.waiting) >= limit && pendingLocked(h) >= limit {
+		c.mu.Unlock()
+		r.finish(nil, ErrTooManyPending)
+		return
 	} else {
 		h.waiting = append(h.waiting, r)
 	}
 	work, dials := c.dispatchLocked(h)
 	c.mu.Unlock()
 	c.carryOut(h, work, dials)
+}
+
+// pendingLocked drops the requests that ended while they waited, which the
+// queue otherwise keeps until they reach its head, and reports how many are
+// left.
+func pendingLocked(h *hostPool) int {
+	kept := h.waiting[:0]
+	for _, r := range h.waiting {
+		if !r.done.Load() {
+			kept = append(kept, r)
+		}
+	}
+	clear(h.waiting[len(kept):])
+	h.waiting = kept
+	return len(kept)
 }
 
 // dispatchLocked matches waiting requests with idle connections, and reports
