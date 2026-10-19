@@ -1170,6 +1170,7 @@ type Config struct {
 	// which is what DefaultConfig sets: only the per-connection watermark
 	// applies unless a deployment opts into this one.
 	MaxPendingBytes int64
+	UseWritev       bool
 	// MaxConns caps the connections the engine's bindings have accepted and
 	// not yet closed, all of them together: one accepted past it is closed
 	// at once, before any handler hears of it, and counted in
@@ -1177,8 +1178,7 @@ type Config struct {
 	// number of descriptors and handlers. Connections the engine dials, and
 	// UDP peers, are not counted. Zero or less means no cap, which is what
 	// DefaultConfig sets.
-	MaxConns  int
-	UseWritev bool
+	MaxConns int
 	// CoalesceWrites batches the replies a read round produces. With it, the
 	// sends a handler makes from OnData are held under a cork and written
 	// together, in as few writes as the socket takes, when the round ends: a
