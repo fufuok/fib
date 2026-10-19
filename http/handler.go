@@ -148,6 +148,21 @@ type ResponseStreamer interface {
 	EndResponse(trailer stdhttp.Header, complete bool) error
 }
 
+// ResponseNotifier is a ResponseStreamer that can also be written to
+// without waiting, for Context.WriteNoWait and Context.OnWritable.
+type ResponseNotifier interface {
+	ResponseStreamer
+	// WriteBodyNoWait sends p as WriteBody does without wait, keeping what
+	// the stream cannot send yet, and reports whether more than the
+	// stream's limit is now held back.
+	WriteBodyNoWait(p []byte) (above bool, err error)
+	// NotifyWritable arranges for fn to run, once, on another goroutine,
+	// when what the stream holds back falls to half its limit, or with an
+	// error when the stream ends first, and reports true; it reports false,
+	// and never runs fn, when the stream holds no more than half already.
+	NotifyWritable(fn func(error)) bool
+}
+
 // NewStreamContext returns the Context through which a handler answers req,
 // which arrived on conn and is answered through stream.
 func NewStreamContext(conn *fib.Connection, req *stdhttp.Request, stream Stream) *Context {

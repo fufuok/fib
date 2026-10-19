@@ -2095,6 +2095,7 @@ func (rs *requestStream) Push(*stdhttp.Request, string, *stdhttp.PushOptions) er
 var (
 	_ fibhttp.Stream           = (*requestStream)(nil)
 	_ fibhttp.ResponseStreamer = (*requestStream)(nil)
+	_ fibhttp.ResponseNotifier = (*requestStream)(nil)
 )
 
 // newTLS is how a connection's TLS handshake is made: by this module's state

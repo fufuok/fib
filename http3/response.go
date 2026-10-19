@@ -100,6 +100,27 @@ func (rs *requestStream) WriteBody(p []byte, wait bool) error {
 	return nil
 }
 
+// WriteBodyNoWait sends p as WriteBody does without wait, and reports
+// whether more than maxUnsentOutput of what the stream was given is now
+// unsent.
+func (rs *requestStream) WriteBodyNoWait(p []byte) (bool, error) {
+	if err := rs.WriteBody(p, false); err != nil {
+		return false, err
+	}
+	return rs.s.Unsent() > maxUnsentOutput, nil
+}
+
+// NotifyWritable runs fn once no more than half of maxUnsentOutput is
+// unsent, or with the stream's error once it closes.
+func (rs *requestStream) NotifyWritable(fn func(error)) bool {
+	return rs.s.NotifySendable(maxUnsentOutput/2, func(err error) {
+		if err != nil {
+			err = rs.closedErr()
+		}
+		fn(err)
+	})
+}
+
 // EndResponse ends a response that streams with the stream's FIN, behind the
 // trailers if there are any to send, or resets the stream when the body fell
 // short of its content-length, since ending it would leave the client a body

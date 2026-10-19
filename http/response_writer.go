@@ -254,6 +254,109 @@ func (c *Context) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// WriteNoWait adds p to the response body as Write does, but never waits for
+// the client: it takes all of p, and reports above when more than the
+// response's limit of 64 kilobytes is now queued on the HTTP/1 connection or
+// held back by HTTP/2's or HTTP/3's flow control. A caller that gets above
+// stops writing until a function it gives OnWritable runs, which is how a
+// response is paced by its client without a goroutine waiting on it, as a
+// proxy passing on a body from elsewhere wants. What is written past the
+// limit is queued as it is, so a caller that goes on writing regardless is
+// not held back.
+//
+// What Write holds back, a small first write or a response an OnResponse
+// hook needs whole, is held back here too, and never above. A stream served
+// outside this package that is not a ResponseNotifier is written to as
+// Write writes it.
+func (c *Context) WriteNoWait(p []byte) (above bool, err error) {
+	if c.wrote {
+		return false, ErrResponseWritten
+	}
+	w := c.writer()
+	if w.err != nil {
+		return false, w.err
+	}
+	if c.external != nil && !c.holdsWhole() {
+		if _, ok := c.external.(ResponseNotifier); !ok {
+			_, err := c.Write(p)
+			return false, err
+		}
+	}
+	if w.status == 0 {
+		c.WriteHeader(stdhttp.StatusOK)
+	}
+	if w.finished {
+		return false, ErrResponseWritten
+	}
+	if !statusHasBody(w.status) {
+		return false, stdhttp.ErrBodyNotAllowed
+	}
+	if w.declared >= 0 && w.written+int64(len(p)) > w.declared {
+		return false, stdhttp.ErrContentLength
+	}
+	if c.Request.Method == stdhttp.MethodHead || len(p) == 0 || c.holdsWhole() ||
+		!w.committed && (len(w.buf)+len(p) <= writerBufferSize || w.holdsDeclared()) {
+		// Write only holds these back, never waits on them.
+		_, err := c.Write(p)
+		return false, err
+	}
+	w.written += int64(len(p))
+	if !w.committed {
+		if err := c.commit(false); err != nil {
+			return false, w.fail(err)
+		}
+	}
+	switch {
+	case c.isHTTP1():
+		if c.h1WriteExpired() {
+			return false, w.fail(os.ErrDeadlineExceeded)
+		}
+		if w.chunked {
+			out := appendChunk(bufferpool.Get(len(p) + 20)[:0], p)
+			err = c.Conn.Send(out)
+			bufferpool.Put(out)
+		} else {
+			err = c.Conn.Send(p)
+		}
+		if err != nil {
+			return false, w.fail(err)
+		}
+		return outputwait.Unsent(c.Conn) > h1MaxPendingOutput, nil
+	case c.stream != nil:
+		above, err = c.stream.writeBodyNoWait(p)
+	default:
+		above, err = c.external.(ResponseNotifier).WriteBodyNoWait(p)
+	}
+	if err != nil {
+		return false, w.fail(err)
+	}
+	return above, nil
+}
+
+// OnWritable arranges for fn to run, once, on another goroutine, when the
+// response's queued output, which WriteNoWait reported above its limit, has
+// fallen to half of it, or with an error when the connection or the stream
+// ends first, which a write deadline passing does too; and reports true. It
+// reports false, and never runs fn, when the output is at or below half
+// already, or the response has not begun to stream, or is finished. A
+// response has room for one fn at a time: register the next once the last
+// has run.
+func (c *Context) OnWritable(fn func(error)) bool {
+	if fn == nil || c.wrote || c.w == nil || !c.w.committed || c.w.finished || c.holdsWhole() {
+		return false
+	}
+	switch {
+	case c.isHTTP1():
+		return c.Conn.NotifyOutput(h1MaxPendingOutput, fn)
+	case c.stream != nil:
+		return c.stream.onWritable(fn)
+	}
+	if n, ok := c.external.(ResponseNotifier); ok {
+		return n.NotifyWritable(fn)
+	}
+	return false
+}
+
 // WriteString is Write for a string.
 func (c *Context) WriteString(s string) (int, error) { return c.Write([]byte(s)) }
 

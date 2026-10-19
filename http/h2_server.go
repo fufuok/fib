@@ -1263,6 +1263,7 @@ func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
 	if o := st.out; o != nil {
 		// A handler waiting for room to write finds the stream gone.
 		o.room.Broadcast()
+		st.runWritableLocked(err)
 	}
 	// A response still streaming is still being written, as one not begun
 	// is. The stream is still the connection's, which is what Cancel needs,
@@ -1738,6 +1739,11 @@ func (sc *h2ServerConn) forgetLocked(st *h2ServerStream) {
 		bufferpool.Put(o.buf)
 		o.buf = nil
 		o.room.Broadcast()
+		if st.reset {
+			st.runWritableLocked(st.closedErrLocked())
+		} else {
+			st.runWritableLocked(nil)
+		}
 	}
 	if st.tunnel != nil {
 		bufferpool.Put(st.tunnel.sendBuf)

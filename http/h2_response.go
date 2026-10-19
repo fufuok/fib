@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/sidepool"
 )
 
 // A response written through Context's ResponseWriter methods streams on
@@ -34,6 +35,9 @@ type h2Output struct {
 	ending  bool
 	room    sync.Cond
 	waiting int
+	// writable is the function OnWritable registered, run once what is
+	// pending falls to half of h2MaxPendingOutput.
+	writable func(error)
 }
 
 // h2Responder is a stream as what a response that streams is sent through.
@@ -152,6 +156,49 @@ func (st *h2ServerStream) writeBody(p []byte, wait bool) error {
 	return nil
 }
 
+// writeBodyNoWait is writeBody without waiting, reporting whether more than
+// h2MaxPendingOutput is now pending.
+func (st *h2ServerStream) writeBodyNoWait(p []byte) (bool, error) {
+	if err := st.writeBody(p, false); err != nil {
+		return false, err
+	}
+	sc := st.sc
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return len(st.pending) > h2MaxPendingOutput, nil
+}
+
+// onWritable is Context.OnWritable for a response on st.
+func (st *h2ServerStream) onWritable(fn func(error)) bool {
+	sc := st.sc
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	o := st.out
+	switch {
+	case o == nil:
+		return false
+	case sc.closed || st.reset:
+		err := st.closedErrLocked()
+		sidepool.Post(func() { fn(err) })
+		return true
+	case sc.streams[st.id] != st || len(st.pending) <= h2MaxPendingOutput/2:
+		// Gone with all of it sent, or near enough to all.
+		return false
+	}
+	o.writable = fn
+	return true
+}
+
+// runWritableLocked runs, on another goroutine, the function OnWritable
+// registered on st's response, with err.
+func (st *h2ServerStream) runWritableLocked(err error) {
+	if o := st.out; o != nil && o.writable != nil {
+		fn := o.writable
+		o.writable = nil
+		sidepool.Post(func() { fn(err) })
+	}
+}
+
 // endResponse ends a response that streams once what is pending has gone:
 // with trailer, if HTTP/2 can send any of it, or else END_STREAM. A response
 // that is not complete, its body shorter than its content-length, is reset
@@ -208,8 +255,11 @@ func (sc *h2ServerConn) frameOutputLocked(st *h2ServerStream) []byte {
 // wakeWritersLocked lets the writers waiting on st's response go once enough
 // of what is pending has drained.
 func (st *h2ServerStream) wakeWritersLocked() {
-	if o := st.out; o != nil && o.waiting > 0 && len(st.pending) <= h2MaxPendingOutput/2 {
-		o.room.Broadcast()
+	if o := st.out; o != nil && len(st.pending) <= h2MaxPendingOutput/2 {
+		if o.waiting > 0 {
+			o.room.Broadcast()
+		}
+		st.runWritableLocked(nil)
 	}
 	// A tunnel's waiters each wait for a limit of their own, which they
 	// check again.
