@@ -648,6 +648,11 @@ func TestHTTP1ConformanceServerRejectsBadRequests(t *testing.T) {
 		{"bad content length", "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1, 2\r\n\r\n", 400},
 		{"bad request line", "GET\r\n\r\n", 400},
 		{"space before colon", "GET / HTTP/1.1\r\nHost : x\r\n\r\n", 400},
+		// RFC 9112 section 5.1, on a field other than Host, whose absence
+		// would refuse the request anyway.
+		{"space before another colon", "GET / HTTP/1.1\r\nHost: x\r\nX-A : one\r\n\r\n", 400},
+		{"tab before a colon", "GET / HTTP/1.1\r\nHost: x\r\nX-A\t: one\r\n\r\n", 400},
+		{"space in a field name", "GET / HTTP/1.1\r\nHost: x\r\nBad Key: v\r\n\r\n", 400},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

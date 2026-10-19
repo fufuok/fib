@@ -692,6 +692,19 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		}
 		return frameInfo{}, false, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
+	if block == nil {
+		// net/http's reader, which a head the fast path does not take goes
+		// to, keeps a field name that is not a token as it was sent, as "X-A "
+		// from "X-A : 1"; net/http's server refuses it after reading, and so
+		// does this one, as RFC 9112 section 5.1 asks of whitespace before the
+		// colon, which a server downstream could read as another field. The
+		// fast path takes only tokens.
+		for key := range req.Header {
+			if !validFieldName(key) {
+				return frameInfo{}, false, fmt.Errorf("%w: invalid header field name %q", ErrMalformed, key)
+			}
+		}
+	}
 	_ = req.Body.Close()
 	// The header is in; from here the request is waiting for its body, which
 	// ReadTimeout rather than ReadHeaderTimeout bounds.
@@ -784,6 +797,20 @@ func readRequest(data []byte, keepBody bool) (*stdhttp.Request, *requestReader, 
 	}
 	releaseRequestReader(reader)
 	return req, nil, err
+}
+
+// validFieldName reports whether name is a token, as a header field name
+// must be.
+func validFieldName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if !tokenByte[name[i]] {
+			return false
+		}
+	}
+	return true
 }
 
 func chunkedEnd(data []byte, offset, maxTrailer int, maxBody int64) (int, bool, error) {
