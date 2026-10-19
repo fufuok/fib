@@ -240,9 +240,40 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 	c.do(req, callback, false)
 }
 
+// Start is Do, and returns a Call that abandons the request, for a caller
+// whose only reason to give req a context it can cancel would be to cancel
+// the request: Do watches such a context with a context.AfterFunc, which
+// costs a few allocations a request, and a Call costs none. A context that
+// can be cancelled is still watched as Do watches it.
+func (c *Client) Start(req *stdhttp.Request, callback func(*fibhttp.ClientResponse, error)) Call {
+	return Call{r: c.do(req, callback, false)}
+}
+
+// Call is a request Start sent, for abandoning it while it is in flight.
+type Call struct {
+	r *clientRequest
+}
+
+// Cancel abandons the request, as cancelling its context would: the callback
+// hears err, or context.Canceled when err is nil, if it has not heard the
+// outcome already, and a body that is streaming fails with it. It may be
+// called from any goroutine, any number of times; once the request has been
+// settled it does nothing, as does the zero Call and one for a request Start
+// rejected outright.
+func (c Call) Cancel(err error) {
+	if c.r == nil {
+		return
+	}
+	if err == nil {
+		err = context.Canceled
+	}
+	c.r.abort(err)
+}
+
 // do is Do, with whole set when the response must arrive whole whatever the
-// client's configuration says.
-func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse, error), whole bool) {
+// client's configuration says. It returns the request, or nil for one it
+// rejected outright.
+func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse, error), whole bool) *clientRequest {
 	if callback == nil {
 		callback = func(*fibhttp.ClientResponse, error) {}
 	}
@@ -255,7 +286,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 			_ = req.Body.Close()
 		}
 		callback(nil, ErrUnsupportedScheme)
-		return
+		return nil
 	}
 	var body []byte
 	var upload *reqbody.Source
@@ -269,7 +300,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 		_ = req.Body.Close()
 		if err != nil {
 			callback(nil, err)
-			return
+			return nil
 		}
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
@@ -285,7 +316,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 			upload.Close()
 		}
 		callback(nil, err)
-		return
+		return nil
 	}
 	r.fields, r.trailer = fields, trailer
 	r.mu.Lock()
@@ -297,6 +328,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 	}
 	r.mu.Unlock()
 	c.enqueue(r)
+	return r
 }
 
 // Future is a request in flight, for callers that would rather wait on it

@@ -243,6 +243,8 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 // may instead still be arriving, and is taken with ClientResponse.OnBody
 // inside the callback. Cancelling req's context abandons the request, as does
 // the client's Timeout, which then also ends a body that is streaming.
+// Start sends a request as Do does and returns a Call that abandons it
+// without a context.
 //
 // callback may run on any goroutine: an engine worker for a response, which
 // the callback then holds until it returns, a timer for a timeout or a
@@ -253,9 +255,40 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*ClientResponse, error))
 	c.do(req, callback, false)
 }
 
+// Start is Do, and returns a Call that abandons the request, for a caller
+// whose only reason to give req a context it can cancel would be to cancel
+// the request: Do watches such a context with a context.AfterFunc, which
+// costs a few allocations a request, and a Call costs none. A context that
+// can be cancelled is still watched as Do watches it.
+func (c *Client) Start(req *stdhttp.Request, callback func(*ClientResponse, error)) Call {
+	return Call{r: c.do(req, callback, false)}
+}
+
+// Call is a request Start sent, for abandoning it while it is in flight.
+type Call struct {
+	r *clientRequest
+}
+
+// Cancel abandons the request, as cancelling its context would: the callback
+// hears err, or context.Canceled when err is nil, if it has not heard the
+// outcome already, and a body that is streaming fails with it. It may be
+// called from any goroutine, any number of times; once the request has been
+// settled it does nothing, as does the zero Call and one for a request Start
+// rejected outright.
+func (c Call) Cancel(err error) {
+	if c.r == nil {
+		return
+	}
+	if err == nil {
+		err = context.Canceled
+	}
+	c.r.abort(err)
+}
+
 // do is Do, with whole set when the response must arrive whole whatever the
-// client's configuration says.
-func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error), whole bool) {
+// client's configuration says. It returns the request, or nil for one it
+// rejected outright.
+func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error), whole bool) *clientRequest {
 	if callback == nil {
 		callback = func(*ClientResponse, error) {}
 	}
@@ -263,7 +296,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 	if err != nil {
 		closeRequestBody(req)
 		callback(nil, err)
-		return
+		return nil
 	}
 	// A small body is read once and kept, since whether it travels in
 	// HTTP/1.1 or HTTP/2 framing is only known once a connection has been
@@ -277,7 +310,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 		_ = req.Body.Close()
 		if err != nil {
 			callback(nil, err)
-			return
+			return nil
 		}
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
@@ -297,7 +330,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 			upload.Close()
 		}
 		callback(nil, err)
-		return
+		return nil
 	}
 	r := &clientRequest{req: req, data: data, body: body, upload: upload, declared: declared, chunked: chunked,
 		callback: callback, whole: whole, headerWait: c.config.ResponseHeaderTimeout}
@@ -313,6 +346,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 	}
 	r.mu.Unlock()
 	c.enqueue(target, r, false)
+	return r
 }
 
 // marshalRequest frames req, whose body has already been read into body, for
