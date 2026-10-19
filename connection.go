@@ -2102,13 +2102,13 @@ func (c *Connection) closeReasonLocked() error {
 	return nil
 }
 
-// deadline is one of a connection's two deadlines. Its timer is rebuilt
-// whenever the deadline moves, and gen tells a timer that fires while it is
-// moving from the one that is current, so a connection given more time is not
-// closed by the deadline it has outlived.
+// deadline is one of a connection's two deadlines. Its timer is made the
+// first time the deadline is set and reset each time it moves after that.
+// A timer that fires while the deadline is moving finds at later than now,
+// or zero, so a connection given more time is not closed by the deadline it
+// has outlived.
 type deadline struct {
 	timer *time.Timer
-	gen   uint64
 	at    time.Time
 }
 
@@ -2183,31 +2183,38 @@ func (c *Connection) deadlinesLocked(t time.Time) *connectionDeadlines {
 }
 
 // armDeadlineLocked points d at t. A deadline set to the time it already holds
-// keeps the timer it has, so a handler that re-states the same deadline on
-// every read round does not rebuild a timer per round.
+// keeps its timer as it is, so a handler that re-states the same deadline on
+// every read round does not move a timer per round, and one that moves it
+// resets the timer it has rather than make another.
 func (c *Connection) armDeadlineLocked(d *deadline, t time.Time, write bool) {
-	if d.timer != nil && d.at.Equal(t) || d.timer == nil && t.IsZero() {
+	if d.at.Equal(t) {
 		return
 	}
-	d.gen++
 	d.at = t
-	if d.timer != nil {
-		d.timer.Stop()
-		d.timer = nil
+	switch {
+	case t.IsZero():
+		if d.timer != nil {
+			d.timer.Stop()
+		}
+	case d.timer == nil:
+		d.timer = time.AfterFunc(max(time.Until(t), 0), func() { c.expireDeadline(d, write) })
+	default:
+		d.timer.Reset(max(time.Until(t), 0))
 	}
-	if t.IsZero() {
-		return
-	}
-	gen := d.gen
-	d.timer = time.AfterFunc(max(time.Until(t), 0), func() { c.expireDeadline(d, gen, write) })
 }
 
 // expireDeadline closes a connection whose deadline has passed, unless the
 // deadline moved while the timer was on its way or the connection is already
-// going.
-func (c *Connection) expireDeadline(d *deadline, gen uint64, write bool) {
+// going. A deadline still ahead, which a timer reaches early when the wall
+// clock steps back under a t without a monotonic reading, has its timer set
+// again for the rest.
+func (c *Connection) expireDeadline(d *deadline, write bool) {
 	c.mu.Lock()
-	stale := d.gen != gen || c.closing || c.closed
+	stale := d.at.IsZero() || c.closing || c.closed
+	if wait := time.Until(d.at); !stale && wait > 0 {
+		d.timer.Reset(wait)
+		stale = true
+	}
 	c.foldCorkedLocked()
 	c.mu.Unlock()
 	if stale {
@@ -2226,18 +2233,17 @@ func (c *Connection) expireDeadline(d *deadline, gen uint64, write bool) {
 	c.closeWithError(os.ErrDeadlineExceeded)
 }
 
-// stopDeadlinesLocked drops both timers, so a closed connection is not kept
+// stopDeadlinesLocked stops both timers, so a closed connection is not kept
 // reachable by a deadline it will never reach.
 func (c *Connection) stopDeadlinesLocked() {
 	if c.deadlines == nil {
 		return
 	}
 	for _, d := range [...]*deadline{&c.deadlines.read, &c.deadlines.write} {
+		d.at = time.Time{}
 		if d.timer != nil {
 			d.timer.Stop()
-			d.timer = nil
 		}
-		d.gen++
 	}
 }
 

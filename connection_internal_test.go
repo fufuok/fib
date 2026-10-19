@@ -214,9 +214,41 @@ func TestReadReportsSocketFailures(t *testing.T) {
 // connection closed, does nothing.
 func TestStaleDeadlineDoesNotClose(t *testing.T) {
 	c := newOfflineConnection(newOfflineServer(t))
-	c.expireDeadline(&deadline{gen: 2}, 1, false)
+	c.expireDeadline(&deadline{}, false)
 	if c.closing {
-		t.Fatal("a stale deadline closed the connection")
+		t.Fatal("a removed deadline closed the connection")
+	}
+	// One still ahead, as a timer that fired for a deadline since moved
+	// later finds it, is set again for the rest instead.
+	d := &deadline{at: time.Now().Add(time.Hour)}
+	d.timer = time.AfterFunc(time.Hour, func() {})
+	defer d.timer.Stop()
+	c.expireDeadline(d, false)
+	if c.closing {
+		t.Fatal("a deadline still ahead closed the connection")
+	}
+}
+
+// A deadline that moves, or is removed and set again, keeps the timer it
+// was first given.
+func TestDeadlineReusesItsTimer(t *testing.T) {
+	c := newOfflineConnection(newOfflineServer(t))
+	defer func() {
+		c.mu.Lock()
+		c.stopDeadlinesLocked()
+		c.mu.Unlock()
+	}()
+	if err := c.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	timer := c.deadlines.read.timer
+	for _, at := range []time.Time{time.Now().Add(2 * time.Hour), {}, time.Now().Add(time.Hour)} {
+		if err := c.SetReadDeadline(at); err != nil {
+			t.Fatal(err)
+		}
+		if c.deadlines.read.timer != timer {
+			t.Fatalf("moving the deadline to %v made another timer", at)
+		}
 	}
 }
 
