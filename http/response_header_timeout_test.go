@@ -3,12 +3,18 @@
 package http
 
 import (
+	"bufio"
 	"errors"
+	"io"
+	"net"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	fib "github.com/lesismal/fib"
 )
 
 // TestResponseHeaderTimeout checks, over HTTP/1.1 and h2c, that a response
@@ -71,5 +77,50 @@ func TestResponseHeaderTimeout(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestResponseHeaderTimeoutSkipsRetryWait checks that a request sent again,
+// after the kept connection it went out on turned out closed, is not failed
+// by ResponseHeaderTimeout while it waits for a new connection: the wait for
+// the header starts again once it has been sent on that one.
+func TestResponseHeaderTimeoutSkipsRetryWait(t *testing.T) {
+	const wait = 150 * time.Millisecond
+	url := rawServer(t, func(conn net.Conn, _ int) {
+		reader := bufio.NewReader(conn)
+		for served := 0; ; served++ {
+			if _, err := stdhttp.ReadRequest(reader); err != nil {
+				return
+			}
+			if served == 1 {
+				// Hang up on the second request, unanswered.
+				return
+			}
+			_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+		}
+	})
+	var dials atomic.Int32
+	config := DefaultClientConfig()
+	config.ResponseHeaderTimeout = wait
+	config.Dial = func(engine *fib.Engine, network, addr string, timeout time.Duration,
+		handler fib.Handler, done func(*fib.Connection, error)) error {
+		if dials.Add(1) > 1 {
+			// The retry's connection takes longer than the header may.
+			time.Sleep(3 * wait)
+		}
+		return engine.DialWithHandler(network, addr, timeout, handler, done)
+	}
+	client := newTestClient(t, config)
+	for i := 0; i < 2; i++ {
+		resp, err := client.Go(mustRequest(t, "GET", url, nil)).Wait()
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		if got := readBody(t, resp); got != "ok" {
+			t.Fatalf("request %d: body %q", i, got)
+		}
+	}
+	if n := dials.Load(); n != 2 {
+		t.Fatalf("%d dials, want 2: one reused and dropped, one for the retry", n)
 	}
 }

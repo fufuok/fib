@@ -536,6 +536,9 @@ type assignment struct {
 // enqueue queues r for target and starts whatever that makes possible. A
 // retried request goes to the front, since it has already waited its turn once.
 func (c *Client) enqueue(target hostTarget, r *clientRequest, retry bool) {
+	if retry {
+		r.requeued()
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -992,6 +995,20 @@ func (r *clientRequest) requestSent() {
 	default:
 		r.timer.Reset(r.headerWait)
 	}
+}
+
+// requeued stops the wait for the response's header of a request that goes
+// back to the queue, so that waiting for another connection does not count
+// against ResponseHeaderTimeout; requestSent starts it again. The timer, if
+// set for the header, is left to fire and find nothing due, as in
+// headerArrived.
+func (r *clientRequest) requeued() {
+	if r.headerWait <= 0 {
+		return
+	}
+	r.mu.Lock()
+	r.headerAt = time.Time{}
+	r.mu.Unlock()
 }
 
 // headerArrived ends the wait for the response's header. The timer, if it
