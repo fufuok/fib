@@ -200,3 +200,54 @@ func TestClientHoldBodyError(t *testing.T) {
 		t.Fatal("a held body that failed was never told")
 	}
 }
+
+// TestClientBodyBytes checks that a response that arrived whole, over
+// HTTP/1 and HTTP/2, hands out its body's bytes, which stay as they were
+// once the connection has carried another response, and that one that
+// streams does not.
+func TestClientBodyBytes(t *testing.T) {
+	handler := func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		if r.URL.Path == "/large" {
+			_, _ = w.Write(pattern(1 << 20))
+			return
+		}
+		_, _ = w.Write([]byte("body of " + r.URL.Path))
+	}
+	h1 := httptest.NewServer(stdhttp.HandlerFunc(handler))
+	t.Cleanup(h1.Close)
+	h2, _, tlsConfig := newH2TestServer(t, handler)
+	for _, proto := range []string{"HTTP/1.1", "HTTP/2.0"} {
+		config := streamConfig(64 << 10)
+		url := h1.URL
+		if proto == "HTTP/2.0" {
+			config.TLSConfig, url = tlsConfig, h2.URL
+		}
+		client := newTestClient(t, config)
+		type result struct {
+			data []byte
+			ok   bool
+		}
+		get := func(path string) result {
+			got := make(chan result, 1)
+			client.Do(mustRequest(t, "GET", url+path, nil), func(cr *ClientResponse, err error) {
+				if err != nil {
+					t.Error(err)
+					got <- result{}
+					return
+				}
+				data, ok := cr.BodyBytes()
+				got <- result{data, ok}
+				cr.Close()
+			})
+			return <-got
+		}
+		first := get("/a")
+		get("/b")
+		if !first.ok || string(first.data) != "body of /a" {
+			t.Errorf("%s: whole body %q, %v", proto, first.data, first.ok)
+		}
+		if large := get("/large"); large.ok {
+			t.Errorf("%s: a streamed body handed out %d bytes", proto, len(large.data))
+		}
+	}
+}

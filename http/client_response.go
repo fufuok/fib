@@ -181,6 +181,26 @@ func (c *ClientResponse) deliverWhole() {
 	fn(data, true, nil)
 }
 
+// BodyBytes returns the body of a response that arrived whole, what of it
+// Body has yet to read, and true; it reports false for a body that streams.
+// The bytes are the client's own copy, which it never reuses, so they stay
+// valid for as long as they are referenced and may be handed on without a
+// copy, as Context.WriteResponse's Body, say, even past the callback. They
+// must not be changed. Taking them reads nothing: Body and OnBody still
+// deliver them.
+func (c *ClientResponse) BodyBytes() ([]byte, bool) {
+	if c.s != nil {
+		return nil, false
+	}
+	switch body := c.Response.Body; {
+	case c.whole != nil:
+		return c.whole.data[c.whole.off:], true
+	case body == nil || body == stdhttp.NoBody:
+		return nil, true
+	}
+	return nil, false
+}
+
 // BodyComplete reports whether all of the body has arrived, which is always so
 // unless the response streams. It is the way to tell, inside the callback,
 // whether Body holds the whole of it.
