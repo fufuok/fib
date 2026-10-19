@@ -10,10 +10,12 @@ import (
 // registered on a Context, in the order they were registered.
 type responseHooks struct {
 	list []responseHook
-	// whole records that an OnResponse hook needs the whole body, and ran
-	// that the hooks that change the response have run.
-	whole bool
-	ran   bool
+	// whole records that an OnResponse hook needs the whole body, changes
+	// that an OnHeader or OnResponse hook may change the response, and ran
+	// that the hooks that change it have run.
+	whole   bool
+	changes bool
+	ran     bool
 	// response is the copy of a whole response the hooks are handed.
 	response Response
 }
@@ -39,6 +41,7 @@ type responseHook struct {
 func (c *Context) OnHeader(fn func(status int, header stdhttp.Header)) {
 	if fn != nil && !c.begun() {
 		c.addHook(responseHook{header: fn})
+		c.w.hooks.changes = true
 	}
 }
 
@@ -60,6 +63,7 @@ func (c *Context) OnResponse(fn func(response *Response)) {
 	if fn != nil && !c.begun() {
 		c.addHook(responseHook{response: fn})
 		c.w.hooks.whole = true
+		c.w.hooks.changes = true
 	}
 }
 

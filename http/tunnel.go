@@ -426,7 +426,7 @@ func (c *Context) switchTunnel(protocol string, header stdhttp.Header, handler T
 	if c.external == nil && c.stream == nil && protocol != "" {
 		status = stdhttp.StatusSwitchingProtocols
 	}
-	if hooks := c.hooked(); hooks != nil {
+	if hooks := c.hooked(); hooks != nil && hooks.changes {
 		// The hooks may change the header, which is the caller's.
 		header = header.Clone()
 		if header == nil {

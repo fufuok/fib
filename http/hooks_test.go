@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -148,6 +149,54 @@ func TestResponseHooks(t *testing.T) {
 	}
 	if len(shared) != 1 {
 		t.Errorf("hooks changed the header the handler passed to WriteResponse: %v", shared)
+	}
+}
+
+// TestFinishHookSharesHeader checks that a response only OnFinish hooks is
+// sent, and handed to the hook, with the header the handler passed to
+// WriteResponse rather than a copy of it, which a hook that may change the
+// header still gets, over HTTP/1 and HTTP/2.
+func TestFinishHookSharesHeader(t *testing.T) {
+	shared := stdhttp.Header{"Content-Type": {"text/plain"}}
+	same := func(h stdhttp.Header) bool {
+		return reflect.ValueOf(h).UnsafePointer() == reflect.ValueOf(shared).UnsafePointer()
+	}
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		key := c.Request.URL.Path + " " + c.Request.Proto
+		if c.Request.URL.Path == "/header" {
+			c.OnHeader(func(int, stdhttp.Header) {})
+		}
+		c.OnFinish(func(_ int, h stdhttp.Header, _ int64) {
+			mu.Lock()
+			seen[key] = same(h)
+			mu.Unlock()
+		})
+		_ = c.WriteResponse(Response{Header: shared, Body: []byte("body")})
+	})))
+	for _, client := range hookClients(t) {
+		for path, want := range map[string]bool{"/finish": true, "/header": false} {
+			resp, err := client.Get("http://" + addr + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if string(data) != "body" || resp.Header.Get("Content-Type") != "text/plain" {
+				t.Errorf("%s %s: got %q with %v", client.proto, path, data, resp.Header)
+			}
+			key := path + " " + client.proto
+			var got, ok bool
+			for deadline := time.Now().Add(time.Second); !ok && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+				mu.Lock()
+				got, ok = seen[key]
+				mu.Unlock()
+			}
+			if !ok || got != want {
+				t.Errorf("%s %s: OnFinish ran %v, with the handler's own header %v, want %v", client.proto, path, ok, got, want)
+			}
+		}
 	}
 }
 

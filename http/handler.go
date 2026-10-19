@@ -384,9 +384,10 @@ func (c *Context) WriteResponse(response Response) error {
 	if c.w != nil && c.w.status != 0 {
 		return ErrResponseWritten
 	}
-	if c.hooked() != nil && response.Header != nil && !c.wrote {
-		// The hooks may change the header, which is the caller's and may be
-		// shared with other responses.
+	if hooks := c.hooked(); hooks != nil && hooks.changes && response.Header != nil && !c.wrote {
+		// The OnHeader and OnResponse hooks may change the header, which is
+		// the caller's and may be shared with other responses. OnFinish's
+		// may not, so a response only they hook is sent with it as it is.
 		response.Header = response.Header.Clone()
 	}
 	return c.writeResponse(response)
