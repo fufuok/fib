@@ -1452,6 +1452,47 @@ func TestCloseAfterSendLingerFlood(t *testing.T) {
 	}
 }
 
+// A reply made in a read round reaches the peer while the peer keeps the
+// socket full, and so does the end of output a CloseAfterSendLinger behind it
+// makes: the round flushes as it reads on, rather than only once a read comes
+// up short, which a peer sending faster than the round reads may never let
+// happen.
+func TestRoundFlushesWhilePeerFloods(t *testing.T) {
+	var waited time.Duration
+	for i := 0; i < 3; i++ {
+		var once sync.Once
+		_, client := acceptOne(t, "tcp", HandlerFuncs{
+			Data: func(c *Connection, _ []byte) {
+				once.Do(func() {
+					if err := c.Send([]byte("bye")); err != nil {
+						t.Error(err)
+					}
+					c.CloseAfterSendLinger(300 * time.Millisecond)
+				})
+			},
+		})
+		start := time.Now()
+		for j := 0; j < 8; j++ {
+			go func() {
+				chunk := make([]byte, 256<<10)
+				for {
+					if _, err := client.Write(chunk); err != nil {
+						return
+					}
+				}
+			}()
+		}
+		client.SetReadDeadline(time.Now().Add(10 * time.Second))
+		if got, err := io.ReadAll(client); err != nil || string(got) != "bye" {
+			t.Fatalf("client read %q, %v", got, err)
+		}
+		waited += time.Since(start)
+	}
+	if waited > 2*time.Second {
+		t.Fatalf("the replies and their ends took %v in all", waited)
+	}
+}
+
 // CloseRead stops OnData, and the end of input that follows, from the peer
 // half-closing, does not close the connection, which goes on sending.
 func TestCloseRead(t *testing.T) {

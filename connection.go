@@ -262,8 +262,9 @@ func (p *packedAddrPort) unpack() netip.AddrPort {
 // its OnData makes. A goroutine that answers several requests of one
 // connection away from its round corks it first, so that the answers reach
 // the socket in one write, and must Flush when it is done: nothing else
-// writes what a Cork holds, unless a read round of the connection ends
-// meanwhile and flushes it along with its own. It does nothing on a UDP
+// writes what a Cork holds, unless a read round of the connection flushes it
+// meanwhile along with its own, as one does when it ends and every 256KB it
+// reads. It does nothing on a UDP
 // connection.
 func (c *Connection) Cork() {
 	if c.udp != nil {
@@ -750,6 +751,33 @@ func (c *Connection) chargeLocked() {
 // rounds at once would otherwise read on, each to its own watermark, past a
 // budget that cannot see what they hold.
 const roundChargeBytes = 32 << 10
+
+// roundFlushBytes is how much a round reads, without a read coming up short,
+// before it hands its corked replies to the socket and looks whether the
+// connection is closing. A round otherwise ends only on a short read, which a
+// peer that sends faster than the round reads may not allow for a long time,
+// and until then a reply, and a CloseAfterSend waiting behind it, would wait
+// with it.
+const roundFlushBytes = 256 << 10
+
+// settleLongRound is what a round that has read roundFlushBytes does before
+// it reads on: it flushes the replies its cork holds, corking again for the
+// ones to come, and reports stop once the connection is closing, which ends
+// the round so that the close, which waits for it, can go ahead.
+func (c *Connection) settleLongRound() (stop bool, err error) {
+	if c.coalesces() {
+		if err := c.uncork(); err != nil {
+			return true, err
+		}
+	}
+	c.mu.Lock()
+	stop = c.closing || c.closed
+	if !stop && c.coalesces() {
+		c.corked = true
+	}
+	c.mu.Unlock()
+	return stop, nil
+}
 
 // chargeRound brings the backlog up to date before a round decides whether to
 // read on: it counts the replies its cork appended uncounted, and counts the
@@ -1562,6 +1590,9 @@ func (c *Connection) readShouldStop() bool {
 func (c *Connection) readLoop() error {
 	buf := bufferpool.Get(c.engine.readBufferSize)
 	defer bufferpool.Put(buf)
+	// read counts what the round has read since it last settled; see
+	// roundFlushBytes.
+	read := 0
 	for {
 		if c.flags.has(flagReadShut) {
 			// CloseRead, perhaps from inside OnData, ended input.
@@ -1597,6 +1628,12 @@ func (c *Connection) readLoop() error {
 				// not take, and asks the loop to pause reads if that crosses a
 				// watermark. A handler that holds reads asked the loop itself.
 				return nil
+			}
+			if read += n; read >= roundFlushBytes {
+				read = 0
+				if stop, err := c.settleLongRound(); stop || err != nil {
+					return err
+				}
 			}
 			c.chargeRound()
 			if c.readShouldStop() {
