@@ -106,6 +106,9 @@ func (s *h1Sink) End() error {
 		err = s.cc.conn.Send(lastChunk(s.r.req.Trailer))
 	}
 	s.done()
+	if err == nil {
+		s.r.requestSent()
+	}
 	return err
 }
 
@@ -176,7 +179,7 @@ func (s *h2Sink) End() error {
 		out = hc.appendTrailerLocked(nil, st)
 	} else {
 		out = h2AppendFrameHeader(nil, h2FrameData, h2FlagEndStream, st.id, 0)
-		st.localDone = true
+		st.endLocalLocked()
 	}
 	hc.sendLocked(out)
 	return nil

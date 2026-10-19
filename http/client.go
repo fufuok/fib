@@ -35,6 +35,10 @@ var (
 	// ErrUnsupportedScheme is what a request for anything but http:// or
 	// https:// gets.
 	ErrUnsupportedScheme = errors.New("http: unsupported URL scheme")
+	// ErrResponseHeaderTimeout is what a request gets when
+	// ClientConfig.ResponseHeaderTimeout runs out. errors.Is matches it
+	// against os.ErrDeadlineExceeded too.
+	ErrResponseHeaderTimeout = fmt.Errorf("http: timed out awaiting the response header: %w", os.ErrDeadlineExceeded)
 	// errRequestTimeout is what a request gets when ClientConfig.Timeout runs
 	// out. errors.Is matches it against os.ErrDeadlineExceeded.
 	errRequestTimeout = fmt.Errorf("http: request timed out: %w", os.ErrDeadlineExceeded)
@@ -47,6 +51,12 @@ type ClientConfig struct {
 	// waiting for a connection, dialing, sending and reading all count. Zero
 	// means no limit beyond the request's context.
 	Timeout time.Duration
+	// ResponseHeaderTimeout bounds the wait for a response's header once the
+	// request, its body included, has been handed to the connection; interim
+	// 1xx responses do not end it. A request past it fails with
+	// ErrResponseHeaderTimeout. Zero means no limit beyond Timeout. The two
+	// share one timer per request.
+	ResponseHeaderTimeout time.Duration
 	// DialTimeout bounds one connect. Zero leaves it to the operating system.
 	DialTimeout time.Duration
 	// Dial opens the client's connections, in place of the engine's
@@ -276,12 +286,13 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 		return
 	}
 	r := &clientRequest{req: req, data: data, body: body, upload: upload, declared: declared, chunked: chunked,
-		callback: callback, whole: whole}
+		callback: callback, whole: whole, headerWait: c.config.ResponseHeaderTimeout}
 	// Either hook can fire before it has been stored, so both are stored under
 	// the lock finish reads them under.
 	r.mu.Lock()
 	if c.config.Timeout > 0 {
-		r.timer = time.AfterFunc(c.config.Timeout, func() { r.abort(errRequestTimeout) })
+		r.timeoutAt = time.Now().Add(c.config.Timeout)
+		r.timer = time.AfterFunc(c.config.Timeout, r.expire)
 	}
 	if ctx := req.Context(); ctx.Done() != nil {
 		r.stopContext = context.AfterFunc(ctx, func() { r.abort(ctx.Err()) })
@@ -861,6 +872,15 @@ type clientRequest struct {
 	conn        *clientConn
 	timer       *time.Timer
 	stopContext func() bool
+	// timeoutAt is when ClientConfig.Timeout runs out, and headerAt when
+	// ResponseHeaderTimeout, headerWait, does, from the request's end until
+	// its header has arrived, which headerDone records; zero when there is
+	// none. timer fires at the earlier of the two, or at one passed since.
+	// Guarded by mu.
+	timeoutAt  time.Time
+	headerAt   time.Time
+	headerWait time.Duration
+	headerDone bool
 	// stream is the body stream of the response, once the callback has run on
 	// it, which fired says it has. Guarded by mu.
 	stream *ResponseStream
@@ -914,6 +934,69 @@ func (r *clientRequest) markDone() bool {
 		r.upload.Close()
 	}
 	return true
+}
+
+// requestSent starts the wait for the response's header, now that the whole
+// request has been handed to the connection. A request sent again, after a
+// reused connection turned out to be closed, starts it again.
+func (r *clientRequest) requestSent() {
+	if r.headerWait <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.headerDone || r.done.Load() {
+		return
+	}
+	r.headerAt = time.Now().Add(r.headerWait)
+	switch {
+	case !r.timeoutAt.IsZero() && !r.headerAt.Before(r.timeoutAt):
+		// Timeout ends the request first.
+	case r.timer == nil:
+		r.timer = time.AfterFunc(r.headerWait, r.expire)
+	default:
+		r.timer.Reset(r.headerWait)
+	}
+}
+
+// headerArrived ends the wait for the response's header. The timer, if it
+// was set for the header, is left to fire then and find Timeout still ahead,
+// which costs less than moving it on every request.
+func (r *clientRequest) headerArrived() {
+	if r.headerWait <= 0 {
+		return
+	}
+	r.mu.Lock()
+	r.headerDone = true
+	r.headerAt = time.Time{}
+	if r.timeoutAt.IsZero() && r.timer != nil {
+		r.timer.Stop()
+	}
+	r.mu.Unlock()
+}
+
+// expire fails the request whose Timeout or ResponseHeaderTimeout has run
+// out, or sets the timer again for whichever of them is still ahead.
+func (r *clientRequest) expire() {
+	r.mu.Lock()
+	now := time.Now()
+	var err error
+	next := r.timeoutAt
+	switch {
+	case !r.headerAt.IsZero() && !now.Before(r.headerAt):
+		err = ErrResponseHeaderTimeout
+	case !r.timeoutAt.IsZero() && !now.Before(r.timeoutAt):
+		err = errRequestTimeout
+	case next.IsZero() || !r.headerAt.IsZero() && r.headerAt.Before(next):
+		next = r.headerAt
+	}
+	if err == nil && !next.IsZero() && !r.done.Load() {
+		r.timer.Reset(next.Sub(now))
+	}
+	r.mu.Unlock()
+	if err != nil {
+		r.abort(err)
+	}
 }
 
 // begin records that the stream is about to run the callback. It reports false
@@ -1066,7 +1149,11 @@ func (cc *clientConn) send(r *clientRequest) {
 		cc.mu.Unlock()
 	}
 	// A failed send closes the connection, and OnClose then settles r.
-	if cc.conn.Send(r.data) == nil && r.upload != nil {
+	sent := cc.conn.Send(r.data) == nil
+	if sent && r.upload == nil {
+		r.requestSent()
+	}
+	if sent && r.upload != nil {
 		if push := r.upload.Pusher(); push != nil {
 			// A pushed body is sent as it is written and as the connection
 			// drains, with nothing waiting for either.
@@ -1116,6 +1203,9 @@ func (cc *clientConn) sendBody(r *clientRequest) {
 		if err == nil && r.chunked {
 			err = cc.conn.Send(lastChunk(r.req.Trailer))
 		}
+	}
+	if err == nil {
+		r.requestSent()
 	}
 	cc.mu.Lock()
 	if cc.uploading == r {
@@ -1187,6 +1277,9 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 		cc.endDeferred()
 		r.finish(nil, err)
 		return
+	}
+	if resp != nil || cc.parser.head != nil {
+		r.headerArrived()
 	}
 	if resp == nil {
 		cc.endDeferred()

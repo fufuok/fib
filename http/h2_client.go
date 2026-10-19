@@ -178,7 +178,7 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 	case len(trailer) > 0:
 		out = hc.appendTrailerLocked(out, st)
 	default:
-		st.localDone = true
+		st.endLocalLocked()
 	}
 	hc.sendLocked(out)
 	hc.mu.Unlock()
@@ -190,6 +190,13 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 		// See clientConn.send for why a goroutine of its own.
 		go hc.sendBody(st)
 	}
+}
+
+// endLocalLocked records that st's request has all been handed to the
+// connection, which starts the wait for its response's header.
+func (st *h2ClientStream) endLocalLocked() {
+	st.localDone = true
+	st.r.requestSent()
 }
 
 // liveLocked reports whether st is still open on the connection.
@@ -239,7 +246,7 @@ func (hc *h2ClientConn) sendBody(st *h2ClientStream) {
 				out = hc.appendTrailerLocked(nil, st)
 			} else {
 				out = h2AppendFrameHeader(nil, h2FrameData, h2FlagEndStream, st.id, 0)
-				st.localDone = true
+				st.endLocalLocked()
 			}
 			hc.sendLocked(out)
 		}
@@ -826,6 +833,7 @@ func (hc *h2ClientConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		}
 		return nil
 	}
+	st.r.headerArrived()
 	config := &hc.client.config
 	streams := config.StreamResponseBody && !st.r.whole && !endStream && bodyAllowed(st.r.req, resp.StatusCode) &&
 		!(resp.ContentLength >= 0 && resp.ContentLength <= max(config.StreamResponseBodyThreshold, 0))
@@ -1015,7 +1023,7 @@ func (hc *h2ClientConn) flushStreamLocked(out []byte, st *h2ClientStream) []byte
 		if last {
 			if len(st.trailer) == 0 {
 				flags = h2FlagEndStream
-				st.localDone = true
+				st.endLocalLocked()
 			}
 		}
 		out = h2AppendFrameHeader(out, h2FrameData, flags, st.id, len(chunk))
@@ -1036,6 +1044,6 @@ func (hc *h2ClientConn) appendTrailerLocked(out []byte, st *h2ClientStream) []by
 		block = hc.enc.AppendField(block, st.trailer[i], st.trailer[i+1], false)
 	}
 	st.trailer = nil
-	st.localDone = true
+	st.endLocalLocked()
 	return h2AppendHeaderBlock(out, st.id, block, true, hc.peerMaxFrame)
 }
