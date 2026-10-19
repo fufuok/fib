@@ -98,6 +98,9 @@ func DeliverResponse(resp *stdhttp.Response, abort func(error), callback func(*C
 // connection is read, on the worker that reads it. The calls are one at a time
 // and in order, so a body of any size can be taken without a goroutine and
 // without it being buffered: what holds the connection back is fn itself.
+// On HTTP/2 that worker reads every stream of the connection, so fn that
+// waits holds them all up, not only its own; a reader of Body that stalls
+// holds up only its stream.
 // A response that arrived whole is delivered in one call with fin set.
 //
 // Call OnBody from inside the callback. Called after the callback has

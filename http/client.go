@@ -93,7 +93,10 @@ type ClientConfig struct {
 	// it. Client.Go always waits for the whole response. HTTP/1 holds the
 	// connection's reads while a body waits for a reader; HTTP/2 gives a
 	// stream's window back only as its body is consumed, so a stalled reader
-	// never holds up the other streams on the connection.
+	// of Body never holds up the other streams on the connection. A function
+	// given to OnBody is different: it runs on the worker that reads the
+	// connection, so one that waits holds up the reading of every stream on
+	// it.
 	StreamResponseBody bool
 	// StreamResponseBodyThreshold keeps the smaller bodies buffered whole when
 	// StreamResponseBody is set: only a body whose Content-Length is larger
