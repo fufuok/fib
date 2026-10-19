@@ -419,6 +419,16 @@ func (c *Connection) lingerLocked() bool {
 	return true
 }
 
+// lingerOver reports whether the lingering close has been carried out, or
+// another close has overtaken it, so that what is left to read is not worth
+// reading.
+func (c *Connection) lingerOver() bool {
+	c.mu.Lock()
+	over := c.closing || c.closed
+	c.mu.Unlock()
+	return over
+}
+
 func (c *Connection) closeWithError(err error) {
 	c.mu.Lock()
 	request := !c.closing && !c.closed
@@ -1570,6 +1580,11 @@ func (c *Connection) readLoop() error {
 		if n > 0 {
 			if !c.flags.has(flagLingering) {
 				c.handler.OnData(c, buf[:n])
+			} else if c.lingerOver() {
+				// The round would otherwise drop input for as long as a
+				// peer that goes on sending keeps the socket full, and the
+				// close waits for the round to end.
+				return nil
 			}
 			if n < len(buf) {
 				// A short read means the socket buffer is empty, so the next

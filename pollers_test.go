@@ -1404,6 +1404,54 @@ func TestCloseAfterSendLinger(t *testing.T) {
 	}
 }
 
+// A lingering close that runs out of time closes even while the peer keeps
+// the socket full: the round that drops what arrives ends with the linger,
+// rather than once a read comes up short, which a peer sending faster than
+// the round drops may never let happen.
+func TestCloseAfterSendLingerFlood(t *testing.T) {
+	const linger = 300 * time.Millisecond
+	closed := make(chan error, 1)
+	_, client := acceptOne(t, "tcp", HandlerFuncs{
+		Data: func(c *Connection, _ []byte) {
+			if err := c.Send([]byte("bye")); err != nil {
+				t.Error(err)
+			}
+			c.CloseAfterSendLinger(linger)
+		},
+		Close: func(_ *Connection, err error) { closed <- err },
+	})
+	if _, err := client.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if got, err := io.ReadAll(client); err != nil || string(got) != "bye" {
+		t.Fatalf("client read %q, %v", got, err)
+	}
+	// The linger is under way: the peer now sends faster than it drops.
+	start := time.Now()
+	for i := 0; i < 8; i++ {
+		go func() {
+			chunk := make([]byte, 256<<10)
+			for {
+				if _, err := client.Write(chunk); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("OnClose: %v", err)
+		}
+		if waited := time.Since(start); waited > linger+2*time.Second {
+			t.Fatalf("closed %v after the end of the stream", waited)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the lingering connection never closed")
+	}
+}
+
 // CloseRead stops OnData, and the end of input that follows, from the peer
 // half-closing, does not close the connection, which goes on sending.
 func TestCloseRead(t *testing.T) {
