@@ -184,6 +184,10 @@ const (
 	// meets before carrying it out: a layer that answers a failed handshake
 	// with an alert has the peer hang up in reply, often before then.
 	flagCloseReason
+	// flagFileQueued marks a connection with some of a file SendFile queued
+	// still to send, which connectionDeadlines.fileBytes counts, so that
+	// what reads the backlog without the lock knows to look there too.
+	flagFileQueued
 )
 
 // attachSeq is the unit of the sequence count kept in the upper half of
@@ -533,9 +537,64 @@ func (c *Connection) releaseItemLocked(item *sendItem) {
 		c.engine.releaseSendBuffer(item.data)
 	}
 	if item.file != nil {
+		if left := item.file.remaining; left > 0 {
+			// Dropped before it all went, as a closing connection drops it.
+			c.moveFileLocked(left)
+		}
 		item.file.close()
 	}
 	*item = sendItem{}
+}
+
+// queuedLocked is all the connection still has to send: what Send queued,
+// counted or under a cork, and what is left of the files SendFile queued.
+// Callers hold c.mu.
+func (c *Connection) queuedLocked() int64 {
+	n := c.pendingBytes.Load() + c.corkedBytes
+	if d := c.deadlines; d != nil {
+		n += d.fileBytes
+	}
+	return n
+}
+
+// addFileLocked counts n bytes of a file SendFile has queued. Callers hold
+// c.mu.
+func (c *Connection) addFileLocked(n int64) {
+	d := c.deadlines
+	if d == nil {
+		d = &connectionDeadlines{}
+		c.deadlines = d
+	}
+	d.fileBytes += n
+	c.flags.set(flagFileQueued, true)
+}
+
+// moveFileLocked uncounts n bytes of a queued file without anything waiting
+// on the backlog being told: they have been read into memory to be sent,
+// where pendingBytes counts them, or dropped with a connection that is
+// closing, which tells the waiters itself. Callers hold c.mu.
+func (c *Connection) moveFileLocked(n int64) {
+	if d := c.deadlines; d != nil {
+		d.fileBytes = max(d.fileBytes-n, 0)
+		if d.fileBytes == 0 {
+			c.flags.set(flagFileQueued, false)
+		}
+	}
+}
+
+// fileSentLocked uncounts n bytes of a queued file that sendfile has handed
+// the socket, and wakes what waits for the backlog to drain, as subPending
+// does for bytes from memory. Callers hold c.mu.
+func (c *Connection) fileSentLocked(n int64) {
+	if n <= 0 {
+		return
+	}
+	c.moveFileLocked(n)
+	c.foldCorkedLocked()
+	if w := c.outputWaitLocked(); w != nil && c.queuedLocked() <= w.release {
+		w.cond.Broadcast()
+	}
+	c.fireNoticesLocked(nil)
 }
 
 // consumeLocked takes n bytes the socket accepted off the head of the queue.
@@ -551,6 +610,7 @@ func (c *Connection) consumeLocked(n int) {
 				break
 			}
 			left -= item.file.remaining
+			item.file.advance(item.file.remaining)
 			c.releaseItemLocked(item)
 			c.sendHead++
 			continue
@@ -805,7 +865,7 @@ func (c *Connection) subPending(n int64) {
 		c.pendingBytes.Store(0)
 		pending = 0
 	}
-	if w := c.outputWaitLocked(); w != nil && pending <= w.release {
+	if w := c.outputWaitLocked(); w != nil && c.queuedLocked() <= w.release {
 		w.cond.Broadcast()
 	}
 	c.fireNoticesLocked(nil)
@@ -1332,7 +1392,7 @@ func (c *Connection) fireNoticesLocked(err error) {
 	if d == nil || len(d.notices) == 0 {
 		return
 	}
-	pending := c.pendingBytes.Load()
+	pending := c.queuedLocked()
 	kept := d.notices[:0]
 	for _, n := range d.notices {
 		if err == nil && pending > n.release {
@@ -1351,12 +1411,12 @@ func (c *Connection) fireNoticesLocked(err error) {
 
 // NotifyOutput is for a writer that may not wait for this connection's
 // queued output to drain, such as one that acknowledges what it has sent here
-// to a peer elsewhere: when more than limit bytes of what Send accepted are
-// still queued for the socket it arranges for fn to run, on another
-// goroutine, once no more than half of limit are, or with syscall.EPIPE once
-// the connection is closing, and reports true; when no more than limit are,
-// it reports false and fn never runs. On a UDP connection it always reports
-// false.
+// to a peer elsewhere: when more than limit bytes of what Send and SendFile
+// accepted are still queued for the socket it arranges for fn to run, on
+// another goroutine, once no more than half of limit are, or with
+// syscall.EPIPE once the connection is closing, and reports true; when no
+// more than limit are, it reports false and fn never runs. On a UDP
+// connection it always reports false.
 func (c *Connection) NotifyOutput(limit int64, fn func(error)) bool {
 	return c.notifyOutput(limit, fn)
 }
@@ -1375,7 +1435,7 @@ func (c *Connection) notifyOutput(limit int64, fn func(error)) bool {
 	c.mu.Lock()
 	c.foldCorkedLocked()
 	closing := c.closing || c.closed || c.engine.stopping.Load()
-	if !closing && c.pendingBytes.Load() <= limit {
+	if !closing && c.queuedLocked() <= limit {
 		c.mu.Unlock()
 		return false
 	}
@@ -1412,14 +1472,15 @@ func init() {
 	}
 }
 
-// unsent is how many bytes Send accepted are still queued for the socket.
-// A flush writes and then uncounts what the socket took under c.mu, so read
-// under it the count never includes bytes already on their way; corkedBytes
-// are queued too, just not counted yet.
+// unsent is how many bytes Send accepted are still queued for the socket,
+// and what is left of the files SendFile queued. A flush writes and then
+// uncounts what the socket took under c.mu, so read under it the count never
+// includes bytes already on their way; corkedBytes are queued too, just not
+// counted yet.
 func (c *Connection) unsent() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.pendingBytes.Load() + c.corkedBytes
+	return c.queuedLocked()
 }
 
 // waitOutput waits while more than limit bytes of what Send accepted are
@@ -1438,7 +1499,7 @@ func (c *Connection) unsent() int64 {
 // by a cork is let go, as Flush lets it go, since the wait would otherwise
 // be for output nothing is going to write.
 func (c *Connection) waitOutput(limit int64) error {
-	if c.pendingBytes.Load() <= limit || c.udp != nil {
+	if c.pendingBytes.Load() <= limit && !c.flags.has(flagFileQueued) || c.udp != nil {
 		return nil
 	}
 	release := limit / 2
@@ -1466,7 +1527,7 @@ func (c *Connection) waitOutput(limit int64) error {
 			break
 		}
 		c.foldCorkedLocked()
-		if c.pendingBytes.Load() <= release {
+		if c.queuedLocked() <= release {
 			break
 		}
 		edges := w.edges
@@ -1486,7 +1547,7 @@ func (c *Connection) waitOutput(limit int64) error {
 			if w.edges != edges {
 				continue
 			}
-			if c.closing || c.closed || c.pendingBytes.Load() <= release {
+			if c.closing || c.closed || c.queuedLocked() <= release {
 				continue
 			}
 		}
@@ -1783,7 +1844,9 @@ func (c *Connection) flushLocked() error {
 			n, err = c.sysWrite(item.data[item.offset:])
 		}
 		if n > 0 {
-			if !fromFile {
+			if fromFile {
+				c.fileSentLocked(int64(n))
+			} else {
 				c.subPending(int64(n))
 			}
 			c.consumeLocked(n)
@@ -2093,6 +2156,13 @@ type connectionDeadlines struct {
 	drain *outputWait
 	// notices are the callbacks waiting in notifyOutput.
 	notices []drainNotice
+	// fileBytes is what is left to send of the files SendFile queued, which
+	// pendingBytes leaves out: sendfile sends them from the file, so they
+	// hold no memory, and neither the read-pausing watermark nor the
+	// server-wide budget counts them. What paces a writer by the backlog,
+	// waitOutput and notifyOutput, and the write deadline, count them with
+	// it; see queuedLocked.
+	fileBytes int64
 }
 
 // drainNotice is a callback waiting for the connection's queued output to
@@ -2268,13 +2338,14 @@ func (c *Connection) expireDeadline(d *deadline, write bool) {
 		stale = true
 	}
 	c.foldCorkedLocked()
+	queued := c.queuedLocked()
 	c.mu.Unlock()
 	if stale {
 		return
 	}
-	if write && c.pendingBytes.Load() == 0 {
-		// Everything Send accepted has reached the kernel, so there is no
-		// write left for the deadline to be about.
+	if write && queued == 0 {
+		// Everything Send and SendFile accepted has reached the kernel, so
+		// there is no write left for the deadline to be about.
 		return
 	}
 	if !write && c.flags.has(flagLingering) {
@@ -2305,6 +2376,12 @@ func (c *Connection) stopDeadlinesLocked() {
 // sendfile(2), without passing through user space; on Windows, NetBSD and
 // OpenBSD they are read a chunk at a time as the socket takes them. Either way the file is read only as the peer keeps up,
 // so a large file costs no more memory than a small one.
+//
+// What is left of the range to send counts in the connection's backlog as
+// NotifyOutput, a writer waiting for output to drain and the write deadline
+// see it, as bytes from Send count, so a peer that stops reading holds up
+// those as it would for bytes; it takes no memory, though, so neither
+// WriteBufferHighWatermark nor MaxPendingBytes, which bound memory, count it.
 //
 // The connection sends from its own duplicate of f's descriptor, so the
 // caller may close f as soon as SendFile returns. The file must hold the
@@ -2339,6 +2416,7 @@ func (c *Connection) SendFile(f File, offset, count int64) error {
 	}
 	direct := c.canWriteDirectlyLocked()
 	c.pushLocked(sendItem{file: seg})
+	c.addFileLocked(count)
 	c.mu.Unlock()
 	if !direct {
 		// Whatever is queued ahead of the file is being flushed, or will be

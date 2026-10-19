@@ -1361,6 +1361,8 @@ func (c *Connection) stageLocked(item *sendItem) error {
 	}
 	item.data, item.offset = s.chunk[:n], 0
 	s.advance(int64(n))
+	// The chunk moves from what is left of the file to what is in memory.
+	c.moveFileLocked(int64(n))
 	c.addPending(int64(n))
 	return nil
 }

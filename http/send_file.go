@@ -25,7 +25,10 @@ const sendFilePiece = 64 << 10
 // handler serves a file of any size without a worker held up by either: on
 // an HTTP/1 connection without a layer, such as TLS, the range goes from the
 // file to the socket by sendfile(2), as Connection.SendFile sends it, paced
-// by the socket; elsewhere it is read a piece at a time on a pool of its own
+// by the socket, and what of it is still queued counts against the
+// response's limit as written bytes do, so WriteNoWait and OnWritable see a
+// client that has stopped reading it; elsewhere it is read a piece at a time
+// on a pool of its own
 // for the disk, package sidepool's File, and each piece is written with
 // WriteNoWait, the next read waiting for OnWritable once the response is
 // above its limit.

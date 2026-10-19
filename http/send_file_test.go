@@ -158,3 +158,61 @@ func TestSendFileClientGone(t *testing.T) {
 		t.Fatal("done never ran")
 	}
 }
+
+// TestSendFileOnWritable checks that on a plain HTTP/1 connection, where
+// SendFile hands the range to sendfile, what is queued of the file counts
+// against the response's limit: OnWritable, asked once a piece has been
+// queued for a client that reads nothing, reports that it will call back,
+// and does once the client reads.
+func TestSendFileOnWritable(t *testing.T) {
+	const size = 32 << 20
+	path := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(path, make([]byte, size), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waits := make(chan bool, 1)
+	writable := make(chan error, 1)
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		f, err := os.Open(path)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		c.Retain()
+		c.SendFile(f, 0, size, func(err error) {
+			f.Close()
+			if err != nil {
+				t.Error(err)
+			}
+			waits <- c.OnWritable(func(err error) {
+				writable <- err
+				c.Release()
+			})
+		})
+	})))
+	client := hookClients(t)[0]
+	resp, err := client.Get("http://" + addr + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if !<-waits {
+		t.Fatal("OnWritable saw room with the file queued and unread")
+	}
+	select {
+	case err := <-writable:
+		t.Fatalf("OnWritable's function ran with the file unread: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if n, err := io.Copy(io.Discard, resp.Body); err != nil || n != size {
+		t.Fatalf("read %d bytes, %v", n, err)
+	}
+	select {
+	case err := <-writable:
+		if err != nil {
+			t.Fatalf("OnWritable's function heard %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("OnWritable's function never ran")
+	}
+}
