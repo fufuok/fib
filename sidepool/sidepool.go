@@ -1,7 +1,8 @@
 // Package sidepool holds the pools that run what goes on beside an engine's
 // connections rather than in them: the work of the clients built on an
 // engine — resolving the host a dial names, and handing a request, a dial or
-// a WebSocket handshake its outcome — and TLS handshakes. None of it may run
+// a WebSocket handshake its outcome — TLS handshakes, and the disk reads of
+// a file a response sends without waiting. None of it may run
 // on the goroutine that has it to do, which is an event loop or a worker
 // holding a lock more often than not, and none of it gets a goroutine of its
 // own.
@@ -33,6 +34,11 @@ const (
 	// when each handshake had a goroutine of its own; the pool retires the
 	// workers again once the handshakes are over.
 	handshakeWorkers = 1 << 16
+	// fileWorkers is the file pool's ceiling. What it runs reads a piece of
+	// a file from the disk and hands it to a response, so it bounds how many
+	// reads wait on the disk at once, which more workers would not make
+	// faster.
+	fileWorkers = 256
 	// queueSize bounds what waits for a worker in either pool, once it is at
 	// its ceiling. A submission to the client pool that finds the queue full
 	// waits for room; package tls submits to the handshake pool with TryGo,
@@ -40,7 +46,7 @@ const (
 	queueSize = 10000
 )
 
-var client, handshake lazyPool
+var client, handshake, file lazyPool
 
 // Client returns the pool the clients built on an engine run their
 // asynchronous work on: DNS lookups for a dial, and the callbacks that hand a
@@ -49,6 +55,10 @@ func Client() *taskpool.TaskPool { return client.get("fib-client", clientWorkers
 
 // Handshake returns the pool TLS handshakes run on.
 func Handshake() *taskpool.TaskPool { return handshake.get("fib-tls-handshake", handshakeWorkers) }
+
+// File returns the pool the pieces of a file a response sends without
+// waiting are read from the disk on; see http.Context.SendFile.
+func File() *taskpool.TaskPool { return file.get("fib-file", fileWorkers) }
 
 // Go runs fn on the client pool.
 func Go(fn func()) { Client().Go(fn) }
