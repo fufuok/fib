@@ -252,7 +252,6 @@ func (c *Context) recycle() {
 		*h = cancelHooks{}
 	}
 	c.server, c.parser, c.whole, c.block = nil, nil, nil, nil
-	c.value = nil
 	if st := c.route; st != nil {
 		if st.shared {
 			c.route = nil
@@ -267,13 +266,25 @@ func (c *Context) recycle() {
 // attach with Request.WithContext, a copy of the request and a context value
 // on every request. There is one slot, cleared when the request is done and
 // its Context recycled, so code that shares it agrees on what it holds;
-// several values go in a struct of the caller's. SetValue and Value are not
-// safe to call at once from different goroutines: set it before handing the
-// Context to another, as a handler does before it returns or retains.
-func (c *Context) SetValue(v any) { c.value = v }
+// several values go in a struct of the caller's. The slot lives with the
+// Context's cancellation hooks, which a recycled Context keeps for its next
+// request, so that the Context itself, which an HTTP/2 or HTTP/3 stream is
+// allocated with, does not grow by it.
+func (c *Context) SetValue(v any) {
+	c.mu.Lock()
+	c.hooks().value = v
+	c.mu.Unlock()
+}
 
 // Value returns what SetValue last set for this request, or nil.
-func (c *Context) Value() any { return c.value }
+func (c *Context) Value() any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if h := c.cancel; h != nil {
+		return h.value
+	}
+	return nil
+}
 
 // reopen readies a recycled Context for the request it is about to serve.
 func (c *Context) reopen() {
@@ -442,6 +453,9 @@ type cancelHooks struct {
 	fn   func(error)
 	ctx  context.Context
 	stop context.CancelCauseFunc
+	// value is what SetValue set, which lives here rather than in Context;
+	// see SetValue.
+	value any
 }
 
 // hooks returns the Context's cancelHooks, made the first time they are

@@ -27,7 +27,7 @@ func TestContextRecycleResetsEveryField(t *testing.T) {
 	reset := []string{
 		"Conn", "Request", "wrote", "closing", "lingers", "w", "stream", "external", "err",
 		"body", "bodyDone", "bodyHeld", "handover", "cancel", "server", "parser", "whole", "block", "streamed",
-		"route", "value",
+		"route",
 	}
 	var fields []string
 	typ := reflect.TypeFor[Context]()
