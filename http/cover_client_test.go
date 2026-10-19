@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -247,6 +248,61 @@ func TestCvCliIdleConnTimeoutHTTP1(t *testing.T) {
 		if len(h.idle) != 0 {
 			t.Fatalf("%d idle connections left", len(h.idle))
 		}
+	}
+}
+
+// A connection that goes idle again and again keeps the idle timer it was
+// first given, and is not closed by one it has outlived: with requests
+// spaced closer than IdleConnTimeout, they all take the one connection.
+func TestCvCliIdleTimerReused(t *testing.T) {
+	var conns atomic.Int32
+	u := rawServer(t, func(conn net.Conn, _ int) {
+		conns.Add(1)
+		r := bufio.NewReader(conn)
+		for {
+			if _, err := stdhttp.ReadRequest(r); err != nil {
+				return
+			}
+			if _, err := io.WriteString(conn, cvCliOK); err != nil {
+				return
+			}
+		}
+	})
+	config := DefaultClientConfig()
+	config.IdleConnTimeout = 300 * time.Millisecond
+	client := newTestClient(t, config)
+	var timer *time.Timer
+	for i := 0; i < 8; i++ {
+		resp, err := client.Go(mustRequest(t, "GET", u, nil)).Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+		readBody(t, resp)
+		var idle *clientConn
+		for deadline := time.Now().Add(time.Second); idle == nil && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			client.mu.Lock()
+			for _, h := range client.hosts {
+				if len(h.idle) == 1 {
+					idle = h.idle[0]
+				}
+			}
+			client.mu.Unlock()
+		}
+		if idle == nil {
+			t.Fatal("the connection was not kept idle")
+		}
+		client.mu.Lock()
+		got := idle.idleTimer
+		client.mu.Unlock()
+		if timer == nil {
+			timer = got
+		} else if got != timer {
+			t.Fatalf("request %d: the connection went idle with another timer", i)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if n := conns.Load(); n != 1 {
+		t.Fatalf("the requests took %d connections, want 1", n)
 	}
 }
 

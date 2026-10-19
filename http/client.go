@@ -556,10 +556,7 @@ func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
 		} else {
 			break
 		}
-		if cc.idleTimer != nil {
-			cc.idleTimer.Stop()
-			cc.idleTimer = nil
-		}
+		cc.stopIdleLocked()
 		h.waiting = h.waiting[1:]
 		work = append(work, assignment{conn: cc, req: r})
 	}
@@ -712,9 +709,7 @@ func (c *Client) release(cc *clientConn) {
 	keep := !c.closed && len(h.idle) < c.config.MaxIdleConnsPerHost
 	if keep {
 		h.idle = append(h.idle, cc)
-		if c.config.IdleConnTimeout > 0 {
-			cc.idleTimer = time.AfterFunc(c.config.IdleConnTimeout, func() { c.expireIdle(cc) })
-		}
+		c.idleLocked(cc)
 	}
 	c.mu.Unlock()
 	if !keep {
@@ -722,15 +717,44 @@ func (c *Client) release(cc *clientConn) {
 	}
 }
 
+// idleLocked starts the idle clock on a connection gone idle: it closes once
+// it has been idle for IdleConnTimeout. Callers hold c.mu.
+func (c *Client) idleLocked(cc *clientConn) {
+	d := c.config.IdleConnTimeout
+	if d <= 0 {
+		return
+	}
+	cc.idleUntil = time.Now().Add(d)
+	if cc.idleTimer == nil {
+		cc.idleTimer = time.AfterFunc(d, func() { c.expireIdle(cc) })
+	} else {
+		cc.idleTimer.Reset(d)
+	}
+}
+
+// stopIdleLocked stops the idle clock on a connection a request has taken or
+// that has closed. Callers hold Client.mu.
+func (cc *clientConn) stopIdleLocked() {
+	if !cc.idleUntil.IsZero() {
+		cc.idleUntil = time.Time{}
+		cc.idleTimer.Stop()
+	}
+}
+
 // expireIdle closes a connection that sat idle for IdleConnTimeout, unless a
-// request took it in the meantime.
+// request took it in the meantime. A timer that fires while the connection
+// goes back to idle finds it idle until later, and leaves it to the timer
+// that was reset for then.
 func (c *Client) expireIdle(cc *clientConn) {
 	c.mu.Lock()
-	var idle bool
-	if cc.h2 != nil {
-		idle = cc.streams == 0 && cc.idleTimer != nil && removeConn(&cc.host.h2, cc)
-	} else {
+	idle := !cc.idleUntil.IsZero() && !time.Now().Before(cc.idleUntil)
+	if idle && cc.h2 != nil {
+		idle = cc.streams == 0 && removeConn(&cc.host.h2, cc)
+	} else if idle {
 		idle = removeConn(&cc.host.idle, cc)
+	}
+	if idle {
+		cc.idleUntil = time.Time{}
 	}
 	c.mu.Unlock()
 	if idle {
@@ -758,7 +782,7 @@ func (c *Client) streamDone(cc *clientConn) {
 // more idle connections than MaxIdleConnsPerHost.
 func (c *Client) idleH2Locked(cc *clientConn) bool {
 	h := cc.host
-	if cc.streams > 0 || cc.idleTimer != nil {
+	if cc.streams > 0 || !cc.idleUntil.IsZero() {
 		return false
 	}
 	idle := 0
@@ -770,9 +794,7 @@ func (c *Client) idleH2Locked(cc *clientConn) bool {
 	if c.closed || idle > c.config.MaxIdleConnsPerHost {
 		return removeConn(&h.h2, cc)
 	}
-	if c.config.IdleConnTimeout > 0 {
-		cc.idleTimer = time.AfterFunc(c.config.IdleConnTimeout, func() { c.expireIdle(cc) })
-	}
+	c.idleLocked(cc)
 	return false
 }
 
@@ -791,10 +813,7 @@ func (c *Client) forget(cc *clientConn) {
 	c.mu.Lock()
 	removeConn(&h.idle, cc)
 	removeConn(&h.h2, cc)
-	if cc.idleTimer != nil {
-		cc.idleTimer.Stop()
-		cc.idleTimer = nil
-	}
+	cc.stopIdleLocked()
 	h.open--
 	work, dials := c.dispatchLocked(h)
 	c.mu.Unlock()
@@ -986,7 +1005,10 @@ type clientConn struct {
 	reused    bool
 	received  bool
 	closed    bool
-	// idleTimer is armed while the connection is idle. Guarded by Client.mu.
+	// idleUntil is when the connection, idle, is to close, and zero while it
+	// is not idle; idleTimer, made the first time it goes idle and reset each
+	// time after, fires then. Guarded by Client.mu.
+	idleUntil time.Time
 	idleTimer *time.Timer
 	// settled records that the dial has been reported to the client, which
 	// for TLS happens once the handshake is done. Guarded by mu.
