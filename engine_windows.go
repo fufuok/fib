@@ -694,11 +694,17 @@ func (e *Engine) completeAccept(op *acceptOp, err error) {
 		syscall.Closesocket(s)
 		return
 	}
-	if err == nil {
-		err = e.adopt(op.listener, s)
-	}
-	if err != nil {
+	switch {
+	case err != nil:
 		syscall.Closesocket(s)
+	case !e.accepted.take():
+		// MaxConns are open: refused as it arrives.
+		syscall.Closesocket(s)
+	default:
+		if err = e.adopt(op.listener, s); err != nil {
+			syscall.Closesocket(s)
+			e.accepted.leave()
+		}
 	}
 	// Keep the listener's accepts topped up. A client that resets between
 	// connecting and being accepted fails only its own AcceptEx, so one retry
@@ -879,6 +885,9 @@ func (e *Engine) detach(c *Connection) {
 	}
 	if h := syscall.Handle(c.handle.Swap(uintptr(syscall.InvalidHandle))); h != syscall.InvalidHandle {
 		c.closingSocket = h
+		if c.bindingID != 0 {
+			e.accepted.leave()
+		}
 		if c.udp == nil {
 			// A datagram socket has no stream to end.
 			_ = syscall.Shutdown(h, syscall.SHUT_WR)

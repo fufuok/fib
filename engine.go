@@ -145,8 +145,10 @@ type Engine struct {
 	outputWaitMu  sync.Mutex
 	outputWaiters map[*Connection]struct{}
 	// pendingTotal is the outbound total MaxPendingBytes bounds, which an
-	// engine's pollers share with it.
+	// engine's pollers share with it, as they share accepted, the count
+	// MaxConns bounds.
 	pendingTotal *atomic.Int64
+	accepted     *acceptedConns
 	// Backpressure counters, reported by Stats. They move only when a
 	// connection's reads actually pause or resume, which is rare by design.
 	readsPausedByWatermark atomic.Uint64
@@ -318,6 +320,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		sendBufferSize: bufferpool.Align(2 * config.ReadBufferSize),
 		udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout),
 		pendingTotal:   new(atomic.Int64),
+		accepted:       &acceptedConns{max: int64(config.MaxConns)},
 		handler:        handler}
 	e.readBufferSize = config.ReadBufferSize
 	e.bindConfig = config
@@ -350,7 +353,7 @@ func (e *Engine) openPollers(config Config) error {
 			writeHighWatermark: e.writeHighWatermark,
 			writeLowWatermark:  e.writeLowWatermark, maxPendingBytes: e.maxPendingBytes,
 			budgetResumeBytes: e.budgetResumeBytes, sendBufferSize: e.sendBufferSize,
-			udpIdleTimeout: e.udpIdleTimeout, pendingTotal: e.pendingTotal, handler: e.handler,
+			udpIdleTimeout: e.udpIdleTimeout, pendingTotal: e.pendingTotal, accepted: e.accepted, handler: e.handler,
 			taskPool: e.taskPool, releaseTaskPool: func() {},
 			readBufferSize: e.readBufferSize}
 		if err := p.open(config, nil); err != nil {
@@ -416,7 +419,35 @@ type Stats struct {
 	// MaxPendingBytes bounds. The replies a read round holds under its cork
 	// until it ends count only if its flush leaves them queued.
 	PendingBytes int64
+	// OpenConns is how many connections the bindings have accepted and not
+	// yet closed, which is what MaxConns bounds, and ConnsRefused how many
+	// were closed as they were accepted because MaxConns were open.
+	OpenConns    int64
+	ConnsRefused uint64
 }
+
+// acceptedConns counts the connections an engine's bindings accepted and
+// have not closed, against Config.MaxConns.
+type acceptedConns struct {
+	max     int64
+	open    atomic.Int64
+	refused atomic.Uint64
+}
+
+// take counts a connection just accepted, or reports false, and counts it
+// refused, when MaxConns are open already.
+func (a *acceptedConns) take() bool {
+	if a.open.Add(1) > a.max && a.max > 0 {
+		a.open.Add(-1)
+		a.refused.Add(1)
+		return false
+	}
+	return true
+}
+
+// leave uncounts an accepted connection that has closed, or that was
+// closed before it opened.
+func (a *acceptedConns) leave() { a.open.Add(-1) }
 
 // Stats covers the engine's pollers too, since they serve its connections.
 func (e *Engine) Stats() Stats {
@@ -425,6 +456,8 @@ func (e *Engine) Stats() Stats {
 		ReadsPausedByBudget:    e.readsPausedByBudget.Load(),
 		ReadsResumed:           e.readsResumed.Load(),
 		PendingBytes:           e.pendingTotal.Load(),
+		OpenConns:              e.accepted.open.Load(),
+		ConnsRefused:           e.accepted.refused.Load(),
 	}
 	for _, p := range e.pollers {
 		s.ReadsPausedByWatermark += p.readsPausedByWatermark.Load()
@@ -1137,7 +1170,15 @@ type Config struct {
 	// which is what DefaultConfig sets: only the per-connection watermark
 	// applies unless a deployment opts into this one.
 	MaxPendingBytes int64
-	UseWritev       bool
+	// MaxConns caps the connections the engine's bindings have accepted and
+	// not yet closed, all of them together: one accepted past it is closed
+	// at once, before any handler hears of it, and counted in
+	// Stats.ConnsRefused, so that a flood of connections costs a bounded
+	// number of descriptors and handlers. Connections the engine dials, and
+	// UDP peers, are not counted. Zero or less means no cap, which is what
+	// DefaultConfig sets.
+	MaxConns  int
+	UseWritev bool
 	// CoalesceWrites batches the replies a read round produces. With it, the
 	// sends a handler makes from OnData are held under a cork and written
 	// together, in as few writes as the socket takes, when the round ends: a

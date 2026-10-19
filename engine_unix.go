@@ -673,6 +673,10 @@ func (e *Engine) acceptConnections(listenFD int) {
 		if err != nil {
 			return
 		}
+		if !e.accepted.take() {
+			syscall.Close(fd)
+			continue
+		}
 		if !l.unix && !sys.AcceptedInheritNoDelay {
 			// Replies are written whole, so Nagle would only hold a small
 			// one back until the peer's delayed ACK.
@@ -701,6 +705,7 @@ func (e *Engine) acceptConnections(listenFD int) {
 		c.fd.Store(int32(fd))
 		if !p.request(command{kind: commandAccept, connection: c}) {
 			syscall.Close(fd)
+			e.accepted.leave()
 		}
 	}
 }
@@ -713,6 +718,7 @@ func (e *Engine) admitAccepted(c *Connection) {
 	if e.stopping.Load() {
 		c.fd.Store(-1)
 		syscall.Close(fd)
+		e.accepted.leave()
 		return
 	}
 	e.admit(c, fd)
@@ -734,6 +740,7 @@ func (e *Engine) admit(c *Connection, fd int) {
 	if err := e.registerConnection(fd, token); err != nil {
 		c.fd.Store(-1)
 		syscall.Close(fd)
+		e.accepted.leave()
 		return
 	}
 	e.trackConnection(fd, c)
@@ -757,6 +764,9 @@ func (e *Engine) detach(c *Connection) {
 		e.unregister(fd)
 	}
 	_ = syscall.Close(fd)
+	if c.bindingID != 0 {
+		e.accepted.leave()
+	}
 	if page := fd >> connPageShift; page < len(e.connections) {
 		if entries := e.connections[page]; entries != nil && entries[fd&connPageMask] == c {
 			entries[fd&connPageMask] = nil

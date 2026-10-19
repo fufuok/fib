@@ -30,6 +30,9 @@ type Engine struct {
 	pollers []*Engine
 	// acceptPlacement is Config.AcceptPlacement, kept only to warn of it.
 	acceptPlacement AcceptPlacement
+	// accepted counts the connections the bindings accepted, against
+	// Config.MaxConns.
+	accepted        acceptedConns
 	name            string
 	logStatus       bool
 	listeners       []boundListener
@@ -100,7 +103,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		return nil, err
 	}
 	pool, releasePool := acquireTaskPool(config)
-	e := &Engine{name: engineName(config), logStatus: config.LogStatus, acceptPlacement: config.AcceptPlacement, listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
+	e := &Engine{accepted: acceptedConns{max: int64(config.MaxConns)}, name: engineName(config), logStatus: config.LogStatus, acceptPlacement: config.AcceptPlacement, listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
 		connections: make(map[*Connection]struct{}), stopped: make(chan struct{}), serveErr: make(chan error, 1),
 		udpListeners: udpListeners, udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout)}
 	e.readBufferSize = config.ReadBufferSize
@@ -165,14 +168,43 @@ func (e *Engine) submit(c *Connection) bool {
 // there is no read interest for the server to pause and the counters stay at
 // zero. The method exists so that code written against either backend compiles
 // and runs on both.
+// OpenConns and ConnsRefused count against Config.MaxConns, as on the other
+// backends.
 type Stats struct {
 	ReadsPausedByWatermark uint64
 	ReadsPausedByBudget    uint64
 	ReadsResumed           uint64
 	PendingBytes           int64
+	OpenConns              int64
+	ConnsRefused           uint64
 }
 
-func (e *Engine) Stats() Stats { return Stats{} }
+func (e *Engine) Stats() Stats {
+	return Stats{OpenConns: e.accepted.open.Load(), ConnsRefused: e.accepted.refused.Load()}
+}
+
+// acceptedConns counts the connections an engine's bindings accepted and
+// have not closed, against Config.MaxConns.
+type acceptedConns struct {
+	max     int64
+	open    atomic.Int64
+	refused atomic.Uint64
+}
+
+// take counts a connection just accepted, or reports false, and counts it
+// refused, when MaxConns are open already.
+func (a *acceptedConns) take() bool {
+	if a.open.Add(1) > a.max && a.max > 0 {
+		a.open.Add(-1)
+		a.refused.Add(1)
+		return false
+	}
+	return true
+}
+
+// leave uncounts an accepted connection that has closed, or that was
+// closed before it opened.
+func (a *acceptedConns) leave() { a.open.Add(-1) }
 
 // LocalAddr returns the address of the server's first listener.
 func (e *Engine) LocalAddr() (*net.TCPAddr, error) {
@@ -305,6 +337,10 @@ func (e *Engine) serve(listener boundListener) error {
 			}
 			return err
 		}
+		if !e.accepted.take() {
+			_ = conn.Close()
+			continue
+		}
 		e.adoptWith(conn, listener.handler, nil, false, false, int32(listener.binding+1))
 	}
 }
@@ -328,6 +364,9 @@ func (e *Engine) adoptWith(conn net.Conn, handler Handler, done func(*Connection
 	if e.stopping.Load() {
 		e.mu.Unlock()
 		_ = conn.Close()
+		if id != 0 && !udp {
+			e.accepted.leave()
+		}
 		return false
 	}
 	e.connections[c] = struct{}{}
@@ -425,6 +464,9 @@ func (e *Engine) finishConnection(c *Connection, err error) {
 	c.closeDelivered, c.closing, c.scheduled = true, true, false
 	c.mu.Unlock()
 	_ = c.conn.Close()
+	if c.bindingID != 0 && !c.udp {
+		e.accepted.leave()
+	}
 	e.mu.Lock()
 	delete(e.connections, c)
 	e.mu.Unlock()
@@ -586,6 +628,11 @@ type Config struct {
 	// UDPIdleTimeout closes a silent UDP peer's connection. Zero means
 	// DefaultUDPIdleTimeout and a negative value keeps peers until closed.
 	UDPIdleTimeout time.Duration
+	// MaxConns caps the connections the engine's bindings have accepted and
+	// not yet closed, as on the other backends: one accepted past it is
+	// closed at once and counted in Stats.ConnsRefused. Zero or less means
+	// no cap.
+	MaxConns int
 	// customPoolSizing records that SetPoolSizing pinned the sizing, so that a
 	// later SetTaskPoolMode does not overwrite it.
 	customPoolSizing bool
