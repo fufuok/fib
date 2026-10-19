@@ -420,3 +420,44 @@ func (roomySink) Room() bool        { return true }
 func (roomySink) Send([]byte) error { return nil }
 func (roomySink) End() error        { return nil }
 func (roomySink) Fail(error)        {}
+
+// A pushed body closed with CloseWithTrailer sends the trailer it was
+// given, over HTTP/1 and h2c, in place of the request's Trailer, which
+// only names the field.
+func TestBodyWriterCloseWithTrailer(t *testing.T) {
+	config := DefaultConfig()
+	config.StreamRequestBody = true
+	url := "http://" + serve(t, NewHandlerWithConfig(config, HandlerFunc(fibUploadSink)))
+	h2config := uploadClientConfig()
+	h2config.UnencryptedHTTP2 = true
+	for _, tc := range []struct {
+		name   string
+		config ClientConfig
+		proto  int
+	}{{"http1", uploadClientConfig(), 1}, {"h2c", h2config, 2}} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newTestClient(t, tc.config)
+			req, body := pushRequest(t, url, -1, true)
+			future := client.Go(req)
+			payload := genBlock[:60<<10]
+			if _, err := body.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			crc := strconv.FormatUint(uint64(crc32.ChecksumIEEE(payload)), 10)
+			if err := body.CloseWithTrailer(stdhttp.Header{"X-Crc": {crc}}); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := future.Wait()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := fmt.Sprintf("%d %d %s %s", tc.proto, len(payload), crc, crc)
+			if got := readBody(t, resp); got != want {
+				t.Fatalf("server saw %q, want %q", got, want)
+			}
+			if req.Trailer.Get("X-Crc") != "" {
+				t.Fatal("CloseWithTrailer changed the request's Trailer")
+			}
+		})
+	}
+}

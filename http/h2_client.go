@@ -240,7 +240,7 @@ func (hc *h2ClientConn) sendBody(st *h2ClientStream) {
 		if hc.liveLocked(st) {
 			st.streaming = false
 			// The trailer's values are those of when the body has been read.
-			st.trailer = h2TrailerFields(r.req)
+			st.trailer = h2TrailerFields(r.req.Trailer)
 			var out []byte
 			if len(st.trailer) > 0 {
 				out = hc.appendTrailerLocked(nil, st)
@@ -263,11 +263,12 @@ func (hc *h2ClientConn) sendBody(st *h2ClientStream) {
 	r.abort(err)
 }
 
-// h2TrailerFields lists the request's trailer fields as name and value pairs,
-// leaving out any that h2RequestFields refused to announce.
-func h2TrailerFields(req *stdhttp.Request) []string {
+// h2TrailerFields lists trailer fields, a request's Trailer or what
+// CloseWithTrailer gave its body, as name and value pairs, leaving out any
+// that h2RequestFields would refuse to announce.
+func h2TrailerFields(fields stdhttp.Header) []string {
 	var trailer []string
-	for key, values := range req.Trailer {
+	for key, values := range fields {
 		name := strings.ToLower(key)
 		if !h2ValidHeaderName(name) || strings.HasPrefix(name, ":") || h2ConnectionHeaders[name] {
 			continue

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	stdhttp "net/http"
 	"sync"
 
 	"github.com/lesismal/fib/bufferpool"
@@ -59,10 +60,11 @@ type Pusher struct {
 	queued int
 	total  int64
 	// closed is set by Close, failed by CloseWithError, and stopped once the
-	// request is over.
+	// request is over. trailer is what CloseWithTrailer was given.
 	closed  bool
 	failed  error
 	stopped error
+	trailer stdhttp.Header
 	// drains are the callbacks waiting in OnDrain.
 	drains []func()
 	// sink is the transport sending the body, and declared the length its
@@ -131,6 +133,28 @@ func (p *Pusher) Close() error {
 	p.mu.Unlock()
 	p.Kick()
 	return nil
+}
+
+// CloseWithTrailer is Close, with trailer sent after the body in place of
+// its request's Trailer.
+func (p *Pusher) CloseWithTrailer(trailer stdhttp.Header) error {
+	p.mu.Lock()
+	if !p.closed && p.failed == nil {
+		p.trailer = trailer
+	}
+	p.mu.Unlock()
+	return p.Close()
+}
+
+// Trailer is the trailer to send after the body: what CloseWithTrailer was
+// given, or else fallback, the request's Trailer.
+func (p *Pusher) Trailer(fallback stdhttp.Header) stdhttp.Header {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.trailer != nil {
+		return p.trailer
+	}
+	return fallback
 }
 
 // CloseWithError ends the body short, which fails its request with err.

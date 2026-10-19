@@ -160,3 +160,30 @@ func TestBodyWriterFailures(t *testing.T) {
 		}
 	})
 }
+
+// A pushed body closed with CloseWithTrailer sends the trailer it was given
+// in place of the request's Trailer, which only names the field.
+func TestBodyWriterCloseWithTrailer(t *testing.T) {
+	client := uploadClient(t)
+	url := startServer(t, Config{StreamRequestBody: true}, uploadSink)
+	body := fibhttp.NewBodyWriter(0)
+	req := mustRequest(t, stdhttp.MethodPost, url+"/upload", nil)
+	req.Body = body
+	req.Trailer = stdhttp.Header{"X-Crc": nil}
+	future := client.Go(req)
+	payload := []byte(strings.Repeat("trailer ", 8<<10))
+	if _, err := body.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	crc := strconv.FormatUint(uint64(crc32.ChecksumIEEE(payload)), 10)
+	if err := body.CloseWithTrailer(stdhttp.Header{"X-Crc": {crc}}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := future.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := readBody(t, resp), fmt.Sprintf("%d %s %s", len(payload), crc, crc); got != want {
+		t.Fatalf("server saw %q, want %q", got, want)
+	}
+}

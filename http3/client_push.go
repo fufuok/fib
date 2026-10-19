@@ -36,7 +36,7 @@ func (s *pushSink) End() error {
 	st := s.st
 	var err error
 	// The trailer's values are those of when the body has ended.
-	if _, trailer, terr := requestFields(st.r.req, -1); terr == nil && len(trailer) > 0 {
+	if _, trailer, terr := trailerFields(s.push.Trailer(st.r.req.Trailer)); terr == nil && len(trailer) > 0 {
 		block := bufferpool.Append(nil, qpack.Prefix)
 		for _, f := range trailer {
 			block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))

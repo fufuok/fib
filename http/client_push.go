@@ -21,8 +21,14 @@ import (
 //
 // Set it as a request's Body, with ContentLength when the length is known,
 // and call Write as the body is produced, then Close, which sends the end
-// with the request's Trailer as it is then, or CloseWithError, which fails
-// the request. What waits to be sent is bounded by the producer: once more
+// with the request's Trailer as it is then, so that trailer values known
+// only once the body has been produced go with it, or CloseWithTrailer,
+// which sends the trailer it is given instead, or CloseWithError, which
+// fails the request. A trailer goes over HTTP/1 only with a chunked body,
+// which a request has when its ContentLength is unknown or its Trailer
+// names fields, and servers commonly keep only the trailer fields the
+// request named in its Trailer when it was sent, so name them there, with
+// nil values, before Do. What waits to be sent is bounded by the producer: once more
 // than the writer's limit waits, OnDrain says when to go on. A proxy forwards
 // an upload with Context.OnBody and Context.HoldBody this way:
 //
@@ -53,7 +59,8 @@ import (
 // over — answered, failed or abandoned — and OnDrain's callback runs then
 // too. The body is sent once: a request whose connection fails after some of
 // it has gone fails rather than being sent again. Another transport, such as
-// net/http's, reads it, with a Read that waits for what is written.
+// net/http's, reads it, with a Read that waits for what is written, and
+// sends the request's Trailer, never what CloseWithTrailer was given.
 type BodyWriter = reqbody.Pusher
 
 // NewBodyWriter returns an empty BodyWriter that lets limit bytes wait to be
@@ -103,7 +110,7 @@ func (s *h1Sink) Send(p []byte) error {
 func (s *h1Sink) End() error {
 	var err error
 	if s.r.chunked {
-		err = s.cc.conn.Send(lastChunk(s.r.req.Trailer))
+		err = s.cc.conn.Send(lastChunk(s.push.Trailer(s.r.req.Trailer)))
 	}
 	s.done()
 	if err == nil {
@@ -173,7 +180,7 @@ func (s *h2Sink) End() error {
 	}
 	st.streaming = false
 	// The trailer's values are those of when the body has ended.
-	st.trailer = h2TrailerFields(st.r.req)
+	st.trailer = h2TrailerFields(s.push.Trailer(st.r.req.Trailer))
 	var out []byte
 	if len(st.trailer) > 0 {
 		out = hc.appendTrailerLocked(nil, st)

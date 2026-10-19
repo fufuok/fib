@@ -615,8 +615,23 @@ func requestFields(req *stdhttp.Request, bodyLen int64) (fields, trailer []qpack
 	case method == stdhttp.MethodPost || method == stdhttp.MethodPut || method == stdhttp.MethodPatch:
 		fields = append(fields, qpack.HeaderField{Name: "content-length", Value: "0"})
 	}
-	var declared []string
-	for key, values := range req.Trailer {
+	declared, trailer, err := trailerFields(req.Trailer)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(declared) > 0 {
+		// Servers keep only the trailers a request announced, so the names
+		// go out ahead of the body in a Trailer field of this side's making.
+		slices.Sort(declared)
+		fields = append(fields, qpack.HeaderField{Name: "trailer", Value: strings.Join(declared, ",")})
+	}
+	return fields, trailer, nil
+}
+
+// trailerFields checks and lists trailer fields, a request's Trailer or what
+// CloseWithTrailer gave its body, with the names they declare.
+func trailerFields(fields stdhttp.Header) (declared []string, trailer []qpack.HeaderField, err error) {
+	for key, values := range fields {
 		name := strings.ToLower(key)
 		if !validName(name) || strings.HasPrefix(name, ":") || connectionHeaders[name] {
 			return nil, nil, errors.New("http3: invalid request trailer name " + strconv.Quote(key))
@@ -629,13 +644,7 @@ func requestFields(req *stdhttp.Request, bodyLen int64) (fields, trailer []qpack
 			trailer = append(trailer, qpack.HeaderField{Name: name, Value: value})
 		}
 	}
-	if len(declared) > 0 {
-		// Servers keep only the trailers a request announced, so the names
-		// go out ahead of the body in a Trailer field of this side's making.
-		slices.Sort(declared)
-		fields = append(fields, qpack.HeaderField{Name: "trailer", Value: strings.Join(declared, ",")})
-	}
-	return fields, trailer, nil
+	return declared, trailer, nil
 }
 
 func validMethod(method string) bool {
