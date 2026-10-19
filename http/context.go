@@ -252,6 +252,7 @@ func (c *Context) recycle() {
 		*h = cancelHooks{}
 	}
 	c.server, c.parser, c.whole, c.block = nil, nil, nil, nil
+	c.value = nil
 	if st := c.route; st != nil {
 		if st.shared {
 			c.route = nil
@@ -260,6 +261,19 @@ func (c *Context) recycle() {
 		}
 	}
 }
+
+// SetValue keeps v with the request, for whatever serves it to read back
+// with Value: an access log's entry, say, which middleware would otherwise
+// attach with Request.WithContext, a copy of the request and a context value
+// on every request. There is one slot, cleared when the request is done and
+// its Context recycled, so code that shares it agrees on what it holds;
+// several values go in a struct of the caller's. SetValue and Value are not
+// safe to call at once from different goroutines: set it before handing the
+// Context to another, as a handler does before it returns or retains.
+func (c *Context) SetValue(v any) { c.value = v }
+
+// Value returns what SetValue last set for this request, or nil.
+func (c *Context) Value() any { return c.value }
 
 // reopen readies a recycled Context for the request it is about to serve.
 func (c *Context) reopen() {

@@ -4,6 +4,7 @@ package http
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	stdhttp "net/http"
 	"os"
@@ -390,6 +391,34 @@ func TestRetainReleasedUnansweredGetsEmpty200(t *testing.T) {
 	for _, want := range []string{"", "next"} {
 		if resp, body := conn.response(stdhttp.MethodGet); resp.StatusCode != stdhttp.StatusOK || body != want {
 			t.Fatalf("got %d %q, want 200 %q", resp.StatusCode, body, want)
+		}
+	}
+}
+
+// TestContextValue checks that a value set on one request is read back by
+// what serves it, and that the next request on the connection, served by
+// the same Context when contexts are recycled, starts without it.
+func TestContextValue(t *testing.T) {
+	for _, reuse := range []bool{false, true} {
+		config := DefaultConfig()
+		config.ReuseContexts = reuse
+		addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+			before := c.Value()
+			c.SetValue(c.Request.URL.Path)
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(fmt.Sprintf("%v %v", before, c.Value())))
+		})))
+		for _, client := range hookClients(t) {
+			for _, path := range []string{"/a", "/b"} {
+				resp, err := client.Get("http://" + addr + path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if want := "<nil> " + path; string(body) != want {
+					t.Errorf("reuse=%v %s %s: %q, want %q", reuse, client.proto, path, body, want)
+				}
+			}
 		}
 	}
 }

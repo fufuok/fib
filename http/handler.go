@@ -107,6 +107,8 @@ type Context struct {
 	// route is the route a Router served the request by, and the values its
 	// parameters matched; see Param.
 	route *routeState
+	// value is what SetValue set.
+	value any
 }
 
 // Stream answers a request that arrived over a protocol served outside this
