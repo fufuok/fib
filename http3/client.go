@@ -84,6 +84,13 @@ type ClientConfig struct {
 	// is not run until that much of it has arrived. Zero streams every body
 	// as soon as its header has arrived.
 	StreamResponseBodyThreshold int64
+	// StreamUnknownLengthAtHeader runs the callback of a body of no declared
+	// length as soon as its header has arrived, rather than once
+	// StreamResponseBodyThreshold of it has, so that a body that trickles,
+	// as server-sent events do, is handed on as it comes. Bodies with a
+	// content-length are kept whole or streamed by the threshold as before.
+	// It has no effect without StreamResponseBody.
+	StreamUnknownLengthAtHeader bool
 	// MaxStreamedBodyBytes bounds a streamed body, which MaxResponseBodyBytes
 	// does not. Zero, the default, leaves a streamed body unbounded.
 	MaxStreamedBodyBytes int64
@@ -325,6 +332,15 @@ func (f *Future) Done() <-chan struct{} { return f.done }
 // Close stops the client taking requests. Requests still waiting for a
 // stream fail with ErrClientClosed and idle connections are closed;
 // requests already sent finish as they would have.
+// unknownLengthThreshold is how much of resp's body is collected before its
+// callback runs; see ClientConfig.StreamUnknownLengthAtHeader.
+func unknownLengthThreshold(config *ClientConfig, resp *stdhttp.Response) int64 {
+	if config.StreamUnknownLengthAtHeader && resp.ContentLength < 0 {
+		return 0
+	}
+	return config.StreamResponseBodyThreshold
+}
+
 func (c *Client) Close() {
 	c.mu.Lock()
 	if c.closed {
@@ -1294,7 +1310,7 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 		st.cc.mu.Unlock()
 		r := st.r
 		st.stream = fibhttp.NewResponseStream(resp, r.req, fibhttp.StreamOptions{
-			Threshold: config.StreamResponseBodyThreshold,
+			Threshold: unknownLengthThreshold(config, resp),
 			// The callback must not hold up the goroutine that hands the
 			// connection its datagrams, or nothing that arrives meanwhile is
 			// acknowledged and the socket's buffer overflows.

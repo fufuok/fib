@@ -995,6 +995,9 @@ client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
 - 触发时机：`Content-Length` 大于 `StreamResponseBodyThreshold` 的 body 在响应头到齐、且收到
   不少于阈值字节后回调；chunked 或以关闭连接为结束的 body 在累计收到超过阈值时回调，在此之前
   就收完的仍然整收。关闭（默认）时 `OnBody` 一次性交付整个 body，`fin` 为 true。
+- 长度未知的 body 缓慢涓流时（server-sent events、长轮询），等阈值会让它迟迟不到；设置
+  `StreamUnknownLengthAtHeader` 后，没有声明长度的 body 在响应头到齐时就回调，带 `Content-Length`
+  的 body 仍按阈值整收或流式交付。HTTP/1、HTTP/2 和 HTTP/3 的 client 都支持。
 - `OnBody` 必须在回调内调用。回调返回时既没有 `OnBody` 也没有读过 `resp.Body`，剩余 body
   会被读完丢弃（超过 256KB 则直接关闭连接），之后再调 `OnBody` 只会收到 `ErrResponseAbandoned`。
 - 背压：`fn` 是同步调用的，不返回就不会处理这条连接的后续数据；回调没有接管时，积压超过

@@ -92,6 +92,14 @@ type ClientConfig struct {
 	// Zero streams every body as soon as its header has arrived. It has no
 	// effect without StreamResponseBody.
 	StreamResponseBodyThreshold int64
+	// StreamUnknownLengthAtHeader runs the callback of a body of no declared
+	// length (chunked, ended by the server's close, or an HTTP/2 body that
+	// declares none) as soon as its header has arrived, rather than once
+	// StreamResponseBodyThreshold of it has, so that a body that trickles,
+	// as server-sent events and long polls do, is handed on as it comes.
+	// Bodies with a Content-Length are kept whole or streamed by the
+	// threshold as before. It has no effect without StreamResponseBody.
+	StreamUnknownLengthAtHeader bool
 	// MaxStreamedBodyBytes bounds a streamed body, which MaxResponseBodyBytes
 	// does not. Zero, the default, leaves a streamed body unbounded.
 	MaxStreamedBodyBytes int64
@@ -1221,9 +1229,19 @@ func newClientStream(cc *clientConn, r *clientRequest, head *stdhttp.Response, c
 		hooks.Hold = cc.conn.HoldReads
 	}
 	return NewResponseStream(head, r.req, StreamOptions{
-		Threshold: config.StreamResponseBodyThreshold,
+		Threshold: streamThreshold(config.StreamResponseBodyThreshold, config.StreamUnknownLengthAtHeader, head),
 		Buffer:    config.StreamResponseBodyBuffer,
 	}, hooks)
+}
+
+// streamThreshold is how much of head's body a stream collects before its
+// callback runs: none for a body of no declared length when atHeader says
+// so, and threshold otherwise.
+func streamThreshold(threshold int64, atHeader bool, head *stdhttp.Response) int64 {
+	if atHeader && head.ContentLength < 0 {
+		return 0
+	}
+	return threshold
 }
 
 // bodyStart, bodyData and bodyEnd take a streamed body from the parser.
