@@ -164,7 +164,11 @@ type ResponseNotifier interface {
 }
 
 // NewStreamContext returns the Context through which a handler answers req,
-// which arrived on conn and is answered through stream.
+// which arrived on conn and is answered through stream. conn may be nil, for
+// a stream that is not carried by a fib connection, such as one a test
+// records responses with: the Context then never touches a connection, and a
+// handler that retains the request and answers it later, from another
+// goroutine, finishes it through stream alone.
 func NewStreamContext(conn *fib.Connection, req *stdhttp.Request, stream Stream) *Context {
 	return &Context{Conn: conn, Request: req, external: stream}
 }

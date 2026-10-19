@@ -889,9 +889,10 @@ func (c *Context) giveBack(returning bool) {
 			c.WriteHeader(200)
 		}
 		_ = c.Finish()
-		if !returning {
+		if !returning && c.Conn != nil {
 			// Away from the connection's read round, nothing else will send
-			// what was just written.
+			// what was just written. A stream served outside this package
+			// with no connection sends what it is given itself.
 			_ = c.Conn.Flush()
 		}
 		if resume {
