@@ -3,7 +3,9 @@
 package http3
 
 import (
+	"fmt"
 	stdhttp "net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -95,11 +97,17 @@ func TestStreamPoolConcurrency(t *testing.T) {
 			url := startServer(t, Config{StreamPool: tt.pool}, probe.serve)
 			client := newClient(t, nil)
 			futures := make([]*Future, requests)
+			start := time.Now()
 			for i := range futures {
 				futures[i] = client.Go(mustRequest(t, stdhttp.MethodGet, url+"/held", nil))
 			}
 			if !probe.waitFor(tt.atOnce) {
-				t.Fatalf("%d of %d requests ran at once", probe.peakRunning(), tt.atOnce)
+				t.Fatalf("%d of %d requests ran at once; the requests: %s", probe.peakRunning(), tt.atOnce, futureStates(futures))
+			}
+			if took := time.Since(start); took > time.Second {
+				// It passes, but a Windows runner once took seconds here,
+				// and then 5s for none to arrive (CI run 211).
+				t.Logf("%d requests took %v to reach their handlers", tt.atOnce, took)
 			}
 			// Nothing over the limit is served while the handlers are held:
 			// the connection has stopped being read.
@@ -119,6 +127,22 @@ func TestStreamPoolConcurrency(t *testing.T) {
 			}
 		})
 	}
+}
+
+// futureStates says of each future whether it is still pending or how it
+// ended, for a test that waited on requests that never reached a handler.
+func futureStates(futures []*Future) string {
+	var states []string
+	for i, f := range futures {
+		select {
+		case <-f.Done():
+			_, err := f.Wait()
+			states = append(states, fmt.Sprintf("%d: done, err %v", i, err))
+		default:
+			states = append(states, fmt.Sprintf("%d: pending", i))
+		}
+	}
+	return strings.Join(states, "; ")
 }
 
 // A request's stream is allocated with everything serving it takes, and kept
