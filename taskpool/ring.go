@@ -8,10 +8,18 @@ import "sync/atomic"
 type cacheLinePad [128]byte
 
 type ringCell struct {
-	// seq is which lap the cell is on. It equals the position the cell will
-	// next be written at while it is free, that position plus one once a task
-	// is published in it, and the position plus the ring's size once a
-	// consumer has taken the task and handed the cell back.
+	// seq is which lap the cell is on, less the cell's index; see seqOf. The
+	// full value equals the position the cell will next be written at while
+	// it is free, that position plus one once a task is published in it, and
+	// the position plus the ring's size once a consumer has taken the task and
+	// handed the cell back.
+	//
+	// It is kept less the index so that a zeroed cell is already free for its
+	// first position, and a new ring writes none of its cells: under the race
+	// detector each address an atomic touches costs a sync object of a few
+	// hundred bytes in the detector's own memory, which for a ring of 100,000
+	// cells was tens of megabytes per pool before a task ran, and outside it
+	// the cells' pages are not touched until the queue reaches them.
 	seq  atomic.Uint64
 	task Task
 }
@@ -43,11 +51,17 @@ func newTaskRing(limit int) *taskRing {
 	for size < limit {
 		size <<= 1
 	}
-	r := &taskRing{cells: make([]ringCell, size), mask: uint64(size - 1), limit: uint64(limit)}
-	for i := range r.cells {
-		r.cells[i].seq.Store(uint64(i))
-	}
-	return r
+	return &taskRing{cells: make([]ringCell, size), mask: uint64(size - 1), limit: uint64(limit)}
+}
+
+// seqOf reads the full seq of the cell for pos.
+func (r *taskRing) seqOf(cell *ringCell, pos uint64) uint64 {
+	return cell.seq.Load() + pos&r.mask
+}
+
+// setSeq stores seq for the cell for pos.
+func (r *taskRing) setSeq(cell *ringCell, pos, seq uint64) {
+	cell.seq.Store(seq - pos&r.mask)
 }
 
 // push publishes task and reports whether there was room for it. A producer
@@ -65,7 +79,7 @@ func (r *taskRing) push(task Task) bool {
 			return false
 		}
 		cell := &r.cells[tail&r.mask]
-		seq := cell.seq.Load()
+		seq := r.seqOf(cell, tail)
 		if seq != tail {
 			if seq < tail {
 				// The consumer that took the task a lap ago has not handed
@@ -79,7 +93,7 @@ func (r *taskRing) push(task Task) bool {
 			continue
 		}
 		cell.task = task
-		cell.seq.Store(tail + 1)
+		r.setSeq(cell, tail, tail+1)
 		return true
 	}
 }
@@ -91,7 +105,7 @@ func (r *taskRing) pop() (Task, bool) {
 	for {
 		head := r.head.Load()
 		cell := &r.cells[head&r.mask]
-		seq := cell.seq.Load()
+		seq := r.seqOf(cell, head)
 		if seq != head+1 {
 			if seq == head {
 				// Empty, or its producer is still publishing.
@@ -105,7 +119,7 @@ func (r *taskRing) pop() (Task, bool) {
 		}
 		task := cell.task
 		cell.task = nil
-		cell.seq.Store(head + r.mask + 1)
+		r.setSeq(cell, head, head+r.mask+1)
 		return task, true
 	}
 }

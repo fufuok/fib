@@ -71,3 +71,58 @@ func TestTaskRingHoldsItsLimit(t *testing.T) {
 		t.Fatalf("len = %d, want 3", got)
 	}
 }
+
+// A new ring writes none of its cells, so that their pages, and under the
+// race detector the sync objects its atomics cost, come only as the queue
+// reaches them; and a zeroed cell is free for its first lap.
+func TestTaskRingStartsUntouched(t *testing.T) {
+	r := newTaskRing(1000)
+	for i := range r.cells {
+		if seq := r.cells[i].seq.Load(); seq != 0 {
+			t.Fatalf("cell %d starts at seq %d", i, seq)
+		}
+	}
+	// Many laps of a ring of four, through each position's cell in turn.
+	r = newTaskRing(4)
+	for lap := 0; lap < 1000; lap++ {
+		for i := 0; i < 4; i++ {
+			if !r.push(indexTask(lap*4 + i)) {
+				t.Fatalf("lap %d: push %d refused", lap, i)
+			}
+		}
+		if r.push(indexTask(-1)) {
+			t.Fatalf("lap %d: push past the limit taken", lap)
+		}
+		for i := 0; i < 4; i++ {
+			task, ok := r.pop()
+			if !ok || task.(indexTask) != indexTask(lap*4+i) {
+				t.Fatalf("lap %d: pop %d gave %v, %v", lap, i, task, ok)
+			}
+		}
+		if _, ok := r.pop(); ok {
+			t.Fatalf("lap %d: pop from an empty ring", lap)
+		}
+	}
+}
+
+func BenchmarkTaskRingPushPop(b *testing.B) {
+	r := newTaskRing(1024)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			for !r.push(indexTask(0)) {
+			}
+			for {
+				if _, ok := r.pop(); ok {
+					break
+				}
+			}
+		}
+	})
+}
+
+func BenchmarkNewTaskRing(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = newTaskRing(100000)
+	}
+}
