@@ -478,12 +478,18 @@ func TestRemoveUDPBindingClosesPeers(t *testing.T) {
 			}
 			addr := bindingAddrs(t, server, i, 1)[0]
 			const peers = 4
+			// Each peer keeps its socket until the binding is gone: a closed
+			// one's port may be handed to the next dial, which the server
+			// would take for the same peer.
 			for k := 0; k < peers; k++ {
 				conn, got := dialMessage(t, addr, "hi")
-				conn.Close()
+				defer conn.Close()
 				if got != "u:hi" {
 					t.Fatalf("answered %q", got)
 				}
+			}
+			if opened := log.opened.Load(); opened != peers {
+				t.Fatalf("%d peers opened, want %d", opened, peers)
 			}
 			if err := server.RemoveBinding(i); err != nil {
 				t.Fatal(err)
