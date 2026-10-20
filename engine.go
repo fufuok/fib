@@ -863,6 +863,7 @@ func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
 	c.pendingEvents |= uint16(events)
 	submit := !c.scheduled
 	c.scheduled = true
+	c.traceLocked("event %#x submit=%v", events, submit)
 	// A round already running reads the hangup only once its handler is
 	// done, which may be a long while for one that waits in OnData; see
 	// HangupHandler. The end of input a CloseRead raises, or a lingering

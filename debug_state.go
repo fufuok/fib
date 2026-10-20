@@ -42,6 +42,21 @@ func traceCallers() string {
 	return strings.Join(names, "<")
 }
 
+// traceStep records a step of c's I/O without its state, for a caller that
+// does not hold c.mu.
+func (c *Connection) traceStep(format string, args ...any) {
+	if !traceOn.Load() {
+		return
+	}
+	v, _ := traces.LoadOrStore(c, &traceRing{})
+	r := v.(*traceRing)
+	line := fmt.Sprintf("%8.3fms %s |", float64(time.Since(traceEpoch).Microseconds())/1000, fmt.Sprintf(format, args...))
+	r.mu.Lock()
+	r.ev[r.next%len(r.ev)] = line
+	r.next++
+	r.mu.Unlock()
+}
+
 type traceRing struct {
 	mu   sync.Mutex
 	ev   [256]string

@@ -1150,6 +1150,7 @@ func (c *Connection) process() {
 		}
 		events := uint32(c.pendingEvents)
 		c.pendingEvents = 0
+		c.traceLocked("round events=%#x", events)
 		closed := c.closed || c.closing
 		if c.flags.has(flagReadShut) {
 			// CloseRead ended input: what the socket still reports, the end
@@ -1673,6 +1674,7 @@ func (c *Connection) readLoop() error {
 			return nil
 		}
 		n, err := c.sysRead(buf)
+		c.traceStep("read n=%d err=%v", n, err)
 		if n > 0 {
 			if !c.flags.has(flagLingering) {
 				c.handler.OnData(c, buf[:n])

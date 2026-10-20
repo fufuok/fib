@@ -54,7 +54,7 @@ func dialIdleH2(t *testing.T, config Config, secure bool) *h2TestConn {
 			for _, c := range handler.conns {
 				var lines []string
 				for _, l := range strings.Split(debughook.ConnTrace(c), "\n") {
-					if strings.Contains(l, "deadline") {
+					if strings.Contains(l, "deadline") || strings.Contains(l, "event") || strings.Contains(l, "read n=") || strings.Contains(l, "round") {
 						if i := strings.Index(l, " | "); i >= 0 {
 							l = l[:i]
 						}
