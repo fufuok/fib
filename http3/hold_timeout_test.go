@@ -103,16 +103,27 @@ func TestReadTimeoutBeforeHandler(t *testing.T) {
 }
 
 // A body that streams after being collected keeps the deadline it had from
-// its header.
+// its header: it fails a pause short of the timeout after it begins to
+// stream, 200ms, and not a whole timeout, 400ms, which it would were the
+// deadline started again. The timeout runs from when the header reaches
+// the server, so the connection is dialed first: on a fresh one the
+// header waits for the QUIC handshake, which on a loaded runner took
+// long enough to push the failure past the old 80ms margin (CI run 203).
 func TestReadTimeoutCarriesIntoStream(t *testing.T) {
+	const timeout, pause = 400 * time.Millisecond, 200 * time.Millisecond
 	client := uploadClient(t)
-	url := startServer(t, Config{StreamRequestBody: true, StreamRequestBodyThreshold: 4 << 10, ReadBodyTimeout: 300 * time.Millisecond}, answerFailure(false))
+	url := startServer(t, Config{StreamRequestBody: true, StreamRequestBodyThreshold: 4 << 10, ReadBodyTimeout: timeout}, answerFailure(false))
+	if resp, err := client.Go(mustRequest(t, stdhttp.MethodGet, url+"/dial", nil)).Wait(); err != nil {
+		t.Fatalf("dialing: %v", err)
+	} else {
+		readBody(t, resp)
+	}
 	body := fibhttp.NewBodyWriter(0)
 	req := mustRequest(t, stdhttp.MethodPost, url+"/upload", nil)
 	req.Body = body
 	future := client.Go(req)
 	_, _ = body.Write(make([]byte, 2<<10))
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(pause)
 	_, _ = body.Write(make([]byte, 8<<10))
 	start := time.Now()
 	resp, err := future.Wait()
@@ -122,7 +133,7 @@ func TestReadTimeoutCarriesIntoStream(t *testing.T) {
 	if got := readBody(t, resp); got != os.ErrDeadlineExceeded.Error() {
 		t.Fatalf("body %q", got)
 	}
-	if waited := time.Since(start); waited > 280*time.Millisecond {
+	if waited := time.Since(start); waited > timeout-pause/2 {
 		t.Fatalf("the deadline started again when the body began to stream: %v more", waited)
 	}
 }
