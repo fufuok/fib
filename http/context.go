@@ -897,33 +897,75 @@ func (c *Context) giveBack(returning bool) {
 		}
 		if resume {
 			c.server.finishRequest(c)
+			c.drop(ctxFinishing)
+			return
 		}
-		c.drop(ctxFinishing)
+		if c.finished(next&ctxResume != 0) {
+			c.server.finishRequest(c)
+		}
 		return
+	}
+}
+
+// finished ends the writing of a response a release finished without taking
+// the duty to carry the connection on, and reports whether it takes that duty
+// now: settle leaves it for the release when the handler returns while the
+// response is being written, since the connection must not go on before the
+// response is out. owed says the duty was there already, left to the worker
+// delivering a body callback, which takes it itself unless that callback has
+// returned.
+func (c *Context) finished(owed bool) bool {
+	for {
+		w := c.word.Load()
+		next := w &^ ctxFinishing
+		// A duty settle left since the response was finished cannot be
+		// this goroutine's to leave: settle runs on the worker, which is not
+		// writing the response then.
+		take := w&ctxResume != 0 && (!owed || w&ctxDelivering == 0)
+		if take {
+			next &^= ctxResume
+		}
+		if c.word.CompareAndSwap(w, next) {
+			if w&ctxAlive != 0 && next&ctxAlive == 0 {
+				c.ended()
+			}
+			if take {
+				c.forget()
+			}
+			return take
+		}
 	}
 }
 
 // settle hands the connection over once the handler has returned: it reports
 // whether the response is finished, and otherwise leaves whoever finishes it
-// the duty of letting the connection carry on.
+// the duty of letting the connection carry on. A response a release on
+// another goroutine is still writing is not finished yet: the connection
+// going on would read what that release is still writing.
 func (c *Context) settle() bool {
 	for {
 		w := c.word.Load()
-		if ctxState(w) != ctxOpen {
+		done := ctxState(w) != ctxOpen
+		if done && w&ctxFinishing == 0 {
 			return true
 		}
-		if c.server == nil || c.parser == nil || c.word.CompareAndSwap(w, w|ctxResume) {
+		if c.server == nil || c.parser == nil {
+			return done
+		}
+		if c.word.CompareAndSwap(w, w|ctxResume) {
 			return false
 		}
 	}
 }
 
 // claimResume takes the duty a release could not, and reports that it did, so
-// that the connection is carried on exactly once.
+// that the connection is carried on exactly once. A response still being
+// written is left to the release writing it, which takes the duty once it is
+// done; see finished.
 func (c *Context) claimResume() bool {
 	for {
 		w := c.word.Load()
-		if ctxState(w) == ctxOpen || w&ctxResume == 0 {
+		if ctxState(w) == ctxOpen || w&ctxResume == 0 || w&ctxFinishing != 0 {
 			return false
 		}
 		if c.word.CompareAndSwap(w, w&^ctxResume) {
