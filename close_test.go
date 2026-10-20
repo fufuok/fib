@@ -3,6 +3,7 @@ package fib
 import (
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -84,4 +85,78 @@ func TestCloseReleasesAtOnceWhenIdle(t *testing.T) {
 		t.Fatalf("the port is still held after Close: %v", err)
 	}
 	_ = again.Close()
+}
+
+// TestCloseRunsOnClose checks that every connection Close cuts hears its
+// OnClose, once, as one closed any other way does: an idle one and one whose
+// handler is still running when Close comes, which hears it once the handler
+// has returned. A protocol lets go of what it holds for a connection there,
+// such as an HTTP/2 connection's idle timer, which otherwise kept the
+// connection, and the closed engine with it, until the timer fired.
+func TestCloseRunsOnClose(t *testing.T) {
+	for _, pollers := range []int{0, 2} {
+		var mu sync.Mutex
+		closes := make(map[*Connection]int)
+		entered, release := make(chan struct{}), make(chan struct{})
+		engine, addr, done := startShutdownEngine(t, pollers, HandlerFuncs{
+			Data: func(c *Connection, b []byte) {
+				if string(b) == "wait" {
+					close(entered)
+					<-release
+					return
+				}
+				_ = c.Send(b)
+			},
+			Close: func(c *Connection, _ error) {
+				mu.Lock()
+				closes[c]++
+				mu.Unlock()
+			},
+		})
+		idle, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := echoOnce(idle, "x"); err != nil {
+			t.Fatal(err)
+		}
+		busy, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := busy.Write([]byte("wait")); err != nil {
+			t.Fatal(err)
+		}
+		<-entered
+		engine.Stop()
+		if err := <-done; err != nil {
+			t.Errorf("pollers %d: Run: %v", pollers, err)
+		}
+		if err := engine.Close(); err != nil {
+			t.Errorf("pollers %d: Close: %v", pollers, err)
+		}
+		close(release)
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			mu.Lock()
+			n := len(closes)
+			mu.Unlock()
+			if n == 2 || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		mu.Lock()
+		if len(closes) != 2 {
+			t.Errorf("pollers %d: OnClose ran for %d of the 2 connections Close cut", pollers, len(closes))
+		}
+		for _, n := range closes {
+			if n != 1 {
+				t.Errorf("pollers %d: OnClose ran %d times for one connection", pollers, n)
+			}
+		}
+		mu.Unlock()
+		_ = idle.Close()
+		_ = busy.Close()
+	}
 }

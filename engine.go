@@ -176,7 +176,10 @@ type Engine struct {
 	// scheduled at the end of the round: stalled ones whose read it hands
 	// back, and closed ones whose last round is to run OnClose. Event-loop
 	// ownership.
-	redeliver       []*Connection
+	redeliver []*Connection
+	// cut holds the connections Close cut, whose OnClose release runs once
+	// no round does; see cutConnection. Close's, once the loop has stopped.
+	cut             []*Connection
 	taskPool        TaskPool
 	releaseTaskPool func()
 	taskWG          sync.WaitGroup
@@ -1095,7 +1098,9 @@ func (e *Engine) markClosedLocked(c *Connection, closeErr error) {
 // descriptor until the round has ended, and its socket is shut down instead,
 // which ends the connection for the peer and fails the round's reads and
 // writes without letting the descriptor be reused under it; Close releases
-// it once no round runs. Callers own the loop's state: the loop has stopped.
+// it once no round runs. Either way its OnClose is left to closeCut, which
+// release runs then too, since the round that would have run it never will.
+// Callers own the loop's state: the loop has stopped.
 func (e *Engine) cutConnection(c *Connection) {
 	if c.dialing != nil {
 		// Close fails the dial, once no round runs.
@@ -1109,6 +1114,7 @@ func (e *Engine) cutConnection(c *Connection) {
 	e.markClosedLocked(c, nil)
 	running := c.scheduled
 	c.mu.Unlock()
+	e.cut = append(e.cut, c)
 	switch {
 	case c.udp != nil && c.udp.listener != nil:
 		// A listener's peer has no socket of its own to end.
@@ -1116,6 +1122,24 @@ func (e *Engine) cutConnection(c *Connection) {
 		c.shutdownSocket()
 	default:
 		e.detach(c)
+	}
+}
+
+// closeCut runs the OnClose of every connection Close cut, once no round
+// runs, as the connection's last round would have: a handler hears that its
+// connection has ended however the engine ended it, and lets go of what it
+// holds for it, such as an HTTP/2 connection's idle timer, which would
+// otherwise keep the connection, and the engine with it, for as long as it
+// is set. It runs before the task pools are released, which OnClose may hand
+// work to. Callers own the loop's state.
+func (e *Engine) closeCut() {
+	cut := e.cut
+	e.cut = nil
+	for _, c := range cut {
+		c.mu.Lock()
+		err := c.closeReasonLocked()
+		c.mu.Unlock()
+		c.handler.OnClose(c, err)
 	}
 }
 

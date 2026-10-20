@@ -844,6 +844,7 @@ func (c *Connection) shutdownSocket() {
 // the task pool they run on is still there.
 func (e *Engine) release() error {
 	var closeErr error
+	e.closeCut()
 	for _, p := range e.pollers {
 		p.closeOnce.Do(func() {
 			p.Stop()

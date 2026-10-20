@@ -934,6 +934,7 @@ func (c *Connection) shutdownSocket() {
 // cancelled have completed.
 func (e *Engine) release() error {
 	var closeErr error
+	e.closeCut()
 	e.releaseTaskPool()
 	e.closeCommands()
 	for c := range e.conns {
