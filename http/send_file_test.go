@@ -14,9 +14,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/lesismal/fib"
+	"github.com/lesismal/fib/internal/debughook"
 	fibtls "github.com/lesismal/fib/tls"
 	"github.com/lesismal/fib/tlstest"
 )
@@ -133,7 +136,9 @@ func TestSendFileClientGone(t *testing.T) {
 		t.Fatal(err)
 	}
 	results := make(chan error, 1)
+	var served atomic.Pointer[fib.Connection]
 	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		served.Store(c.Conn)
 		f, err := os.Open(path)
 		if err != nil {
 			t.Error(err)
@@ -157,9 +162,34 @@ func TestSendFileClientGone(t *testing.T) {
 			t.Fatal("done heard nothing wrong")
 		}
 	case <-time.After(10 * time.Second):
+		state := connDebugState(served.Load())
+		t.Log(state)
+		fmt.Printf("\n::error title=TestSendFileClientGone state::%s\n", strings.ReplaceAll(state, "\n", "%0A"))
 		dumpForCI("TestSendFileClientGone stacks")
 		t.Fatal("done never ran")
 	}
+}
+
+// connDebugState describes c's I/O state, and that of the HTTP/2 connection
+// it carries, for a hung test to report. Diagnostic only.
+func connDebugState(c *fib.Connection) string {
+	if c == nil {
+		return "no connection served"
+	}
+	out := "conn: " + debughook.ConnState(c)
+	if sc, ok := c.Attachment().(*h2ServerConn); ok {
+		sc.mu.Lock()
+		out += fmt.Sprintf("\nh2: streams=%d closed=%v goAway=%v peerGoingAway=%v sendWindow=%d",
+			len(sc.streams), sc.closed, sc.goAway, sc.peerGoingAway, sc.sendWindow)
+		for id, st := range sc.streams {
+			out += fmt.Sprintf("\nstream %d: pending=%d sendWindow=%d reset=%v localDone=%v remoteDone=%v writable=%v",
+				id, len(st.pending), st.sendWindow, st.reset, st.localDone, st.remoteDone, st.out != nil && st.out.writable != nil)
+		}
+		sc.mu.Unlock()
+	} else {
+		out += fmt.Sprintf("\nattachment %T", c.Attachment())
+	}
+	return out
 }
 
 // dumpForCI prints the stacks of the goroutines in fib as a GitHub Actions
