@@ -11,6 +11,7 @@ import (
 	stdhttp "net/http"
 	"net/http/httptest"
 	"runtime"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,18 +100,23 @@ func (g *genBody) waitClosed(t *testing.T) {
 
 // heapPeak samples the live heap, collecting garbage before each sample,
 // until stop is called, which returns how far above where it started it went.
+// The live heap is what the collection found reachable. MemStats.HeapAlloc
+// would also count what was allocated while the collection ran and since: an
+// upload makes about twice its body in short-lived buffers, and on a loaded
+// machine, where a collection takes long, that counted 150MB of garbage as
+// growth.
 func heapPeak() (stop func() uint64) {
+	live := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
 	runtime.GC()
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	base := m.HeapAlloc
+	metrics.Read(live)
+	base := live[0].Value.Uint64()
 	var peak atomic.Uint64
-	done := make(chan struct{})
-	finished := make(chan struct{})
+	done, finished := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(finished)
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
+		sample := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
 		for {
 			select {
 			case <-done:
@@ -118,10 +124,9 @@ func heapPeak() (stop func() uint64) {
 			case <-ticker.C:
 			}
 			runtime.GC()
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			if m.HeapAlloc > base && m.HeapAlloc-base > peak.Load() {
-				peak.Store(m.HeapAlloc - base)
+			metrics.Read(sample)
+			if v := sample[0].Value.Uint64(); v > base && v-base > peak.Load() {
+				peak.Store(v - base)
 			}
 		}
 	}()
