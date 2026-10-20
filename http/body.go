@@ -137,10 +137,15 @@ type BodyStream struct {
 	// What still arrives is consumed to keep the connection framed, and
 	// dropped.
 	abandoned bool
-	// trailer is the request's Trailer, filled in from a chunked body's
-	// trailer section when the body ends.
-	trailer stdhttp.Header
-	request *stdhttp.Request
+	// trailer is the trailer section the body ended with. It becomes the
+	// request's Trailer only where the body's end is handed over, on the
+	// goroutine taking the body (see publishTrailerLocked), not where it
+	// arrives: the handler may be reading the Trailer the request came with
+	// meanwhile, as net/http lets it until it reads the body's end.
+	// published records that it has.
+	trailer   stdhttp.Header
+	published bool
+	request   *stdhttp.Request
 	// wantContinue is a body the client will not send until it is told to.
 	// The telling is left until the first Read, so that a handler which
 	// refuses the request answers it without the upload ever starting.
@@ -317,6 +322,9 @@ func (s *BodyStream) drain(worker bool) {
 			fin, err = true, s.err
 		}
 		s.delivered = fin
+		if fin && err == nil {
+			s.publishTrailerLocked()
+		}
 		s.mu.Unlock()
 
 		sink(pending, fin, err, worker)
@@ -382,6 +390,7 @@ func (s *BodyStream) Read(p []byte) (int, error) {
 	case s.abandoned:
 		return 0, ErrBodyAbandoned
 	case s.ended:
+		s.publishTrailerLocked()
 		return 0, io.EOF
 	case s.err != nil:
 		return 0, s.err
@@ -470,8 +479,9 @@ func (s *BodyStream) failSink(err error) bool {
 	return true
 }
 
-// Trailer is the trailer section of a chunked body, or nil. It is complete
-// only once Read has returned io.EOF; the request's Trailer is the same map.
+// Trailer is the trailer section the body ended with, or nil until it has
+// ended or when it had none. The request's Trailer becomes the same map once
+// Read has returned io.EOF, or as OnBody's function is called with fin set.
 func (s *BodyStream) Trailer() stdhttp.Header {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -568,18 +578,31 @@ func (s *BodyStream) push(data []byte) {
 	s.deliverLocked(true)
 }
 
-// finish marks the body complete and publishes its trailer.
+// finish marks the body complete and keeps its trailer, which Read and
+// drain publish as they hand the body's end over.
 func (s *BodyStream) finish(trailer stdhttp.Header) {
 	s.mu.Lock()
 	s.ended = true
 	if trailer != nil {
 		s.trailer = trailer
-		if s.request != nil {
-			s.request.Trailer = trailer
-		}
 	}
 	s.releaseLocked()
 	s.deliverLocked(true)
+}
+
+// publishTrailerLocked makes the trailer the body ended with the request's
+// Trailer, once, on the goroutine handing the body's end to the handler: the
+// one whose Read returns io.EOF, or the one calling OnBody's function with
+// fin. Until then the request keeps the Trailer it came with, the names an
+// HTTP/1 request announced, which the handler may read while the body goes
+// on arriving elsewhere, as net/http lets it. A body that ends with no
+// trailer leaves the Trailer as it is. s.mu is held.
+func (s *BodyStream) publishTrailerLocked() {
+	if s.published || s.trailer == nil || s.request == nil {
+		return
+	}
+	s.published = true
+	s.request.Trailer = s.trailer
 }
 
 // fail ends the body short, with the reason the rest will never arrive. A
