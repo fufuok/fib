@@ -11,7 +11,9 @@ import (
 	stdhttp "net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -155,8 +157,28 @@ func TestSendFileClientGone(t *testing.T) {
 			t.Fatal("done heard nothing wrong")
 		}
 	case <-time.After(10 * time.Second):
+		dumpForCI("TestSendFileClientGone stacks")
 		t.Fatal("done never ran")
 	}
+}
+
+// dumpForCI prints the stacks of the goroutines in fib as a GitHub Actions
+// error annotation, which can be read without the job's log. Diagnostic only.
+func dumpForCI(title string) {
+	buf := make([]byte, 8<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	var kept []string
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, "lesismal/fib") && !strings.Contains(g, "dumpForCI") {
+			kept = append(kept, g)
+		}
+	}
+	out := strings.Join(kept, "\n\n")
+	if len(out) > 60000 {
+		out = out[:60000]
+	}
+	out = strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A").Replace(out)
+	fmt.Printf("\n::error title=%s::%s\n", title, out)
 }
 
 // TestSendFileOnWritable checks that on a plain HTTP/1 connection, where
