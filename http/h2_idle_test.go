@@ -6,12 +6,15 @@ import (
 	stdtls "crypto/tls"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/lesismal/fib"
 	fibtls "github.com/lesismal/fib/tls"
 	"github.com/lesismal/fib/tlstest"
 )
@@ -37,7 +40,15 @@ func idleH2Handler() Handler {
 // cleartext or over TLS.
 func dialIdleH2(t *testing.T, config Config, secure bool) *h2TestConn {
 	t.Helper()
-	handler := NewHandlerWithConfig(config, idleH2Handler())
+	handler := &closeRecorder{ServerHandler: NewHandlerWithConfig(config, idleH2Handler()), start: time.Now()}
+	t.Cleanup(func() {
+		if t.Failed() {
+			// Diagnostic: why the server ended the connection, and when.
+			handler.mu.Lock()
+			t.Logf("server closes: %v", handler.closes)
+			handler.mu.Unlock()
+		}
+	})
 	if !secure {
 		return dialH2(t, serve(t, handler))
 	}
@@ -55,6 +66,22 @@ func dialIdleH2(t *testing.T, config Config, secure bool) *h2TestConn {
 	tc := newH2TestConn(t, conn)
 	tc.write(append([]byte(h2Preface), h2AppendSettings(nil)...))
 	return tc
+}
+
+// closeRecorder is a ServerHandler that records the errors its connections
+// close with, and when, for a failing test to report. Diagnostic only.
+type closeRecorder struct {
+	*ServerHandler
+	mu     sync.Mutex
+	start  time.Time
+	closes []string
+}
+
+func (h *closeRecorder) OnClose(c *fib.Connection, err error) {
+	h.mu.Lock()
+	h.closes = append(h.closes, fmt.Sprintf("%v %v after the server was made", err, time.Since(h.start)))
+	h.mu.Unlock()
+	h.ServerHandler.OnClose(c, err)
 }
 
 // expectIdleGoAway reads until the server's GOAWAY, checks it is NO_ERROR
