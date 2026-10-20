@@ -1867,6 +1867,7 @@ func (c *Connection) flushLocked() error {
 				c.traceLocked("flush short %d/%d armErr=%v", n, attempted, armErr)
 				c.mu.Unlock()
 				if armErr != nil {
+					c.closeWithError(armErr)
 					return armErr
 				}
 				if refresh {
@@ -1893,6 +1894,7 @@ func (c *Connection) flushLocked() error {
 			c.traceLocked("flush wouldblock armErr=%v", armErr)
 			c.mu.Unlock()
 			if armErr != nil {
+				c.closeWithError(armErr)
 				return armErr
 			}
 			if refresh {
@@ -1902,6 +1904,15 @@ func (c *Connection) flushLocked() error {
 		}
 		c.traceLocked("flush ret n=%d err=%v", n, err)
 		c.mu.Unlock()
+		// The socket has failed, so the connection ends here, as it does
+		// when a send finds it so: a caller that does not look at the error,
+		// such as a Flush from another goroutine, would otherwise leave it
+		// open with its output queued and nothing posted to report the
+		// failure, which on Windows, with the read the round deferred to
+		// this drain, is nothing at all.
+		if err != nil {
+			c.closeWithError(err)
+		}
 		return err
 	}
 }
