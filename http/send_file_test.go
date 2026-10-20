@@ -135,6 +135,8 @@ func TestSendFileClientGone(t *testing.T) {
 	if err := os.WriteFile(path, make([]byte, 32<<20), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	debughook.SetTrace(true)
+	t.Cleanup(func() { debughook.SetTrace(false) })
 	results := make(chan error, 1)
 	var served atomic.Pointer[fib.Connection]
 	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
@@ -165,6 +167,12 @@ func TestSendFileClientGone(t *testing.T) {
 		state := connDebugState(served.Load())
 		t.Log(state)
 		fmt.Printf("\n::error title=TestSendFileClientGone state::%s\n", strings.ReplaceAll(state, "\n", "%0A"))
+		trace := debughook.ConnTrace(served.Load())
+		if len(trace) > 60000 {
+			trace = trace[len(trace)-60000:]
+		}
+		fmt.Printf("\n::error title=TestSendFileClientGone trace::%s\n",
+			strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A").Replace(trace))
 		dumpForCI("TestSendFileClientGone stacks")
 		t.Fatal("done never ran")
 	}

@@ -795,6 +795,7 @@ func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
 		c.subPending(int64(n))
 		c.consumeLocked(n)
 	}
+	c.traceLocked("write done n=%d", n)
 	closeAfterSend := false
 	events := uint32(evOut)
 	if c.sendHead == len(c.sends) {
@@ -1059,6 +1060,7 @@ func (c *Connection) awaitWritableLocked() error {
 	c.writeInFlight = true
 	c.outstanding.Add(1)
 	var sent uint32
+	c.traceLocked("post send count=%d", count)
 	err := syscall.WSASend(c.socket(), &bufs[0], uint32(count), &sent, 0, &c.writeOp.ov, nil)
 	if err != nil && err != syscall.ERROR_IO_PENDING {
 		c.writeInFlight = false

@@ -276,6 +276,7 @@ func (c *Connection) Cork() {
 	}
 	c.mu.Lock()
 	c.corked = true
+	c.traceLocked("cork")
 	c.mu.Unlock()
 }
 
@@ -997,6 +998,7 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 		c.pushLocked(sendItem{data: data, offset: sent, pooled: true})
 	}
 	c.addPending(int64(len(queued)))
+	c.traceLocked("send queued %d direct=%v mode=%d", len(queued), direct, mode)
 	// Write interest stays armed, so queueing alone changes nothing; only a
 	// watermark crossing does. While corked the flush at the end of the read
 	// round settles the pause instead.
@@ -1137,6 +1139,7 @@ func (c *Connection) process() {
 			// nothing to wait for, and the read runs now.
 			c.readDeferred = deferred != 0
 			c.scheduled = false
+			c.traceLocked("round stop deferred=%#x", deferred)
 			closing := c.closePending
 			c.closePending = false
 			c.mu.Unlock()
@@ -1329,6 +1332,7 @@ func (c *Connection) uncork() error {
 	wasCorked := c.corked
 	c.corked = false
 	c.foldCorkedLocked()
+	c.traceLocked("uncork wasCorked=%v", wasCorked)
 	if !wasCorked || c.sendHead == len(c.sends) {
 		c.mu.Unlock()
 		return nil
@@ -1770,6 +1774,7 @@ func (c *Connection) flushOutput() error {
 // once.
 func (c *Connection) flushLocked() error {
 	if c.closing || c.closed || c.flushing || c.writeBusyLocked() {
+		c.traceLocked("flush busy")
 		usable := !c.closing && !c.closed
 		if usable {
 			// What is queued waits on another flush or a write in flight,
@@ -1797,6 +1802,7 @@ func (c *Connection) flushLocked() error {
 				c.readStalled = true
 			}
 			refresh := c.settlePauseLocked(owed)
+			c.traceLocked("flush drained owed=%v", owed)
 			if closeAfterSend && c.lingerLocked() {
 				closeAfterSend = false
 			}
@@ -1858,6 +1864,7 @@ func (c *Connection) flushLocked() error {
 				c.chargeLocked()
 				armErr := c.awaitWritableLocked()
 				refresh := c.settlePauseLocked(false)
+				c.traceLocked("flush short %d/%d armErr=%v", n, attempted, armErr)
 				c.mu.Unlock()
 				if armErr != nil {
 					return armErr
@@ -1883,6 +1890,7 @@ func (c *Connection) flushLocked() error {
 			c.chargeLocked()
 			armErr := c.awaitWritableLocked()
 			refresh := c.settlePauseLocked(false)
+			c.traceLocked("flush wouldblock armErr=%v", armErr)
 			c.mu.Unlock()
 			if armErr != nil {
 				return armErr
@@ -1892,6 +1900,7 @@ func (c *Connection) flushLocked() error {
 			}
 			return nil
 		}
+		c.traceLocked("flush ret n=%d err=%v", n, err)
 		c.mu.Unlock()
 		return err
 	}
