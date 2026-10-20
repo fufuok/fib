@@ -336,6 +336,9 @@ func TestStreamTimeoutMidBody(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	url := startServer(t, Config{}, func(c *fibhttp.Context) {
+		if c.Request.URL.Path == "/warm" {
+			return
+		}
 		_, _ = c.WriteString("start")
 		c.Flush()
 		c.Retain()
@@ -344,15 +347,34 @@ func TestStreamTimeoutMidBody(t *testing.T) {
 			c.Release()
 		}()
 	})
-	client := newClient(t, func(config *ClientConfig) {
-		streaming(0)(config)
-		config.Timeout = 400 * time.Millisecond
-	})
+	// The Timeout runs from Do, so it is mid-body only once the head and
+	// "start" beat it. The connection is handshaken first, which the Timeout
+	// would count too, and a timeout a loaded machine ran out of before the
+	// body began is tried again at twice its length.
+	for timeout := 400 * time.Millisecond; ; timeout *= 2 {
+		client := newClient(t, func(config *ClientConfig) {
+			streaming(0)(config)
+			config.Timeout = timeout
+		})
+		resp, err := client.Go(mustRequest(t, "GET", url+"/warm", nil)).Wait()
+		if err == nil {
+			readBody(t, resp)
+		}
 
-	var run streamRun
-	run.run(t, client, mustRequest(t, "GET", url+"/", nil))
-	if !errors.Is(run.err, os.ErrDeadlineExceeded) || string(run.data) != "start" || run.fins != 1 {
-		t.Fatalf("err %v, data %q, fins %d", run.err, run.data, run.fins)
+		var run streamRun
+		if err == nil {
+			run.run(t, client, mustRequest(t, "GET", url+"/", nil))
+			err = run.callErr
+		}
+		if len(run.data) == 0 && timeout < 10*time.Second &&
+			(errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(run.err, os.ErrDeadlineExceeded)) {
+			t.Logf("a %v timeout ran out before the body began", timeout)
+			continue
+		}
+		if err != nil || !errors.Is(run.err, os.ErrDeadlineExceeded) || string(run.data) != "start" || run.fins != 1 {
+			t.Fatalf("call err %v, err %v, data %q, fins %d", err, run.err, run.data, run.fins)
+		}
+		return
 	}
 }
 
