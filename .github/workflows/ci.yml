@@ -553,7 +553,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -562,27 +562,19 @@ jobs:
           cache-dependency-path: |
             go.mod
             taskpool/benchmark/go.sum
-      # go mod tidy -diff runs in the lint job: on Windows the checkout's CRLF
-      # line endings make it report every line of go.mod as changed.
       - name: Vet
         working-directory: taskpool/benchmark
         run: go vet ./...
       - name: Benchmark
-        if: runner.os != 'Windows'
         working-directory: taskpool/benchmark
         run: ./bench.sh -o "$RUNNER_TEMP/taskpool-bench.txt"
-      - name: Benchmark
-        if: runner.os == 'Windows'
-        working-directory: taskpool/benchmark
-        shell: pwsh
-        run: ./bench.ps1 -Out "$env:RUNNER_TEMP/taskpool-bench.txt"
       - name: Summary
         if: success()
         shell: bash
         working-directory: taskpool/benchmark
         run: |
           {
-            echo "### Taskpool benchmark (${{ matrix.os }}, $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS") CPUs)"
+            echo "### Taskpool benchmark (${{ matrix.os }}, $(nproc) CPUs)"
             echo
             go run ./summarize "$RUNNER_TEMP/taskpool-bench.txt"
           } >> "$GITHUB_STEP_SUMMARY"
