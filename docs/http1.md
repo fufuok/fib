@@ -360,6 +360,22 @@ Each option recycles its own object, so a handler that keeps only, say, the
 the shape the server parses itself (which `net/http` parses instead), keep
 their `Request`, `Header` and `URL` whatever the options say.
 
+### The client's request and response heads
+
+The HTTP/1 client writes a request's head and reads a response's head itself,
+as the server reads requests and writes responses, rather than through
+`net/http`'s `Request.Write` and `ReadResponse`: those cost a proxied request
+more than the rest of the client together. What it writes and reads is what
+`net/http` would, byte for byte and field for field, which tests and fuzzing
+against `net/http` check; anything outside the common shape (a request that
+sets `Close` or carries an `httptrace` trace, a host that needs cleaning, a
+method that is not a token, a response header folded over lines, an announced
+trailer, more than one `Content-Length`) goes through `net/http` as before. A
+whole chunked body without a trailer is decoded by the client too, refusing
+what `net/http`'s chunked reader refuses. Writing a proxied request takes one
+allocation and reading a plain response head five, against eight and thirteen
+through `net/http`.
+
 ### Reading the body and the query without copying
 
 `Context.Body()` returns the request body that arrived whole before the
@@ -482,6 +498,9 @@ are not fib:
 - **fib client** against Go's `net/http` server (`httptest`) and raw servers
   (HTTP/1.0 keep-alive and close-delimited responses, malformed responses).
 - **fib client against fib server**, including HTTP/1.0 and sendfile.
+- **the client's heads** (`http/client_codec_test.go`): request heads, response
+  heads and whole chunked bodies held to `net/http`'s output, by tables and by
+  fuzzing.
 - **retained responses and body callbacks** (`http/retain_test.go`):
   answering from another goroutine, a retained request holding the pipelined
   ones behind it, nested holds, `OnBody` on a buffered and on a streamed body,

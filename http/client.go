@@ -362,6 +362,9 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 // without trailers.
 func marshalRequest(req *stdhttp.Request, body []byte) ([]byte, error) {
 	http10 := req.ProtoMajor == 1 && req.ProtoMinor == 0
+	if data, ok := fastRequest(req, body, http10); ok {
+		return data, nil
+	}
 	out := req
 	if http10 {
 		clone := *req
@@ -405,22 +408,25 @@ func closeRequestBody(req *stdhttp.Request) {
 }
 
 func marshalStreamedHead(req *stdhttp.Request, declared int64, chunked bool) ([]byte, error) {
-	clone := *req
-	clone.Body, clone.GetBody = nil, nil
-	clone.ContentLength = 0
-	clone.TransferEncoding = nil
-	clone.Trailer = nil
-	var buf bytes.Buffer
-	if err := clone.Write(&buf); err != nil {
-		return nil, err
+	head, ok := fastStreamedHead(req)
+	if !ok {
+		clone := *req
+		clone.Body, clone.GetBody = nil, nil
+		clone.ContentLength = 0
+		clone.TransferEncoding = nil
+		clone.Trailer = nil
+		var buf bytes.Buffer
+		if err := clone.Write(&buf); err != nil {
+			return nil, err
+		}
+		data := buf.Bytes()
+		// net/http declares an empty body for a POST, PUT or PATCH without one.
+		if i := bytes.Index(data, []byte("\r\nContent-Length: 0\r\n")); i >= 0 {
+			data = append(data[:i+2], data[i+len("\r\nContent-Length: 0\r\n"):]...)
+		}
+		head = data[:len(data)-2]
 	}
-	data := buf.Bytes()
-	// net/http declares an empty body for a POST, PUT or PATCH without one.
-	if i := bytes.Index(data, []byte("\r\nContent-Length: 0\r\n")); i >= 0 {
-		data = append(data[:i+2], data[i+len("\r\nContent-Length: 0\r\n"):]...)
-	}
-	end := data[len(data)-2:]
-	head := append([]byte(nil), data[:len(data)-2]...)
+	end := []byte("\r\n")
 	if !chunked {
 		head = append(head, "Content-Length: "...)
 		head = strconv.AppendInt(head, declared, 10)

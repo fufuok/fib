@@ -273,6 +273,16 @@ Fiber、Gin、Echo 对各自的 context 也是这条规则。为 `net/http` 写�
 body 的请求，以及不在 server 自行解析范围内、改由 `net/http` 解析的请求，无论选项如何
 都不复用 `Request`、`Header`、`URL`。
 
+### 客户端的请求头与响应头
+
+HTTP/1 客户端像 server 读请求、写响应那样，自己写请求头、读响应头，不再经过 `net/http` 的
+`Request.Write` 和 `ReadResponse`：对代理的请求来说，这两者的开销比客户端其余部分加起来还多。
+写出和读到的内容与 `net/http` 逐字节、逐字段相同，由对照 `net/http` 的测试和模糊测试检查；常见形式
+之外的（设置了 `Close` 或带 `httptrace` 跟踪的请求、需要清理的 host、不是 token 的方法、跨行折叠的
+响应头字段、声明了 trailer、多个 `Content-Length`）仍像以前一样交给 `net/http`。没有 trailer 的整个
+分块 body 也由客户端解码，`net/http` 的分块读取器拒绝的，它同样拒绝。写一个代理请求只分配一次，
+读一个普通响应头五次，经 `net/http` 分别是八次和十三次。
+
 ### 不拷贝地读取 body 与 query
 
 `Context.Body()` 返回 handler 运行前已整体读完的请求 body（不走流式的 body 都是如此），
@@ -338,6 +348,8 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
 - **fib 客户端**对 Go `net/http` 服务端（`httptest`）和原始服务端（HTTP/1.0 keep-alive
   和以关闭连接结束的响应、格式错误的响应）。
 - **fib 客户端对 fib 服务端**，包括 HTTP/1.0 和 sendfile。
+- **客户端的头部**（`http/client_codec_test.go`）：请求头、响应头和整个分块 body，通过用例表和模糊测试
+  与 `net/http` 的结果对照。
 - **持有响应与 body 回调**（`http/retain_test.go`）：在别的 goroutine 里回复、被持有
   的请求挡住后面的流水线请求、嵌套持有、`OnBody` 对缓存 body 和流式 body、`OnBody` 只登记
   不回调、`BodyComplete`、handler 返回后才调用 `OnBody`、最后一次 body 回调之后自动释放、

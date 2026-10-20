@@ -477,7 +477,8 @@ func canonicalKey(key string) string {
 	return string(b)
 }
 
-// commonHeaderKeys interns the keys requests most often carry.
+// commonHeaderKeys interns the keys requests and, for the client, responses
+// most often carry.
 var commonHeaderKeys = func() map[string]string {
 	keys := map[string]string{}
 	for _, key := range []string{
@@ -487,6 +488,13 @@ var commonHeaderKeys = func() map[string]string {
 		"If-None-Match", "If-Range", "If-Unmodified-Since", "Keep-Alive", "Origin", "Pragma",
 		"Range", "Referer", "Te", "Trailer", "Transfer-Encoding", "Upgrade", "User-Agent", "Via",
 		"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip", "X-Request-Id",
+		"Accept-Ranges", "Access-Control-Allow-Credentials", "Access-Control-Allow-Headers",
+		"Access-Control-Allow-Methods", "Access-Control-Allow-Origin", "Access-Control-Expose-Headers",
+		"Access-Control-Max-Age", "Age", "Alt-Svc", "Content-Disposition", "Content-Language",
+		"Content-Location", "Content-Range", "Content-Security-Policy", "Etag", "Expires",
+		"Last-Modified", "Link", "Location", "Referrer-Policy", "Retry-After", "Server", "Set-Cookie",
+		"Strict-Transport-Security", "Vary", "Www-Authenticate", "X-Content-Type-Options",
+		"X-Frame-Options", "X-Xss-Protection",
 	} {
 		keys[key] = key
 	}

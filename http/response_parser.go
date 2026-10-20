@@ -261,11 +261,15 @@ func (p *responseParser) parseHead(req *stdhttp.Request) (bool, error) {
 	if headerEnd > p.maxHeader {
 		return false, ErrResponseHeaderTooLarge
 	}
-	head, err := stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(p.buffer[:headerEnd])), req)
-	if err != nil {
-		return false, fmt.Errorf("%w: %v", ErrMalformedResponse, err)
+	head, ok := parseResponseHead(p.buffer[:headerEnd], req)
+	if !ok {
+		var err error
+		head, err = stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(p.buffer[:headerEnd])), req)
+		if err != nil {
+			return false, fmt.Errorf("%w: %v", ErrMalformedResponse, err)
+		}
+		_ = head.Body.Close()
 	}
-	_ = head.Body.Close()
 	if head.StatusCode >= 100 && head.StatusCode < 200 && head.StatusCode != stdhttp.StatusSwitchingProtocols {
 		p.consume(headerEnd)
 		return true, nil
@@ -308,10 +312,19 @@ func bodyAllowed(req *stdhttp.Request, status int) bool {
 	return status >= 200 && status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified
 }
 
-// completeChunked decodes a chunked body, through net/http's own decoder so
-// that trailers land where callers expect them. The body needs no limit here:
-// chunkedEnd has framed it and refused one that decodes past maxBody.
+// completeChunked decodes a chunked body. One with no trailer, announced or
+// sent, and nothing net/http's chunked reader would refuse, is decoded here;
+// any other goes through net/http's own decoder, so that its trailer lands
+// where callers expect it and what it refuses is refused. The body needs no
+// limit here: chunkedEnd has framed it and refused one that decodes past
+// maxBody.
 func (p *responseParser) completeChunked(end int, req *stdhttp.Request) (*stdhttp.Response, error) {
+	if p.head.Trailer == nil {
+		if body, ok := decodeChunks(p.scratch[:0], p.buffer[p.headerEnd:end]); ok {
+			p.scratch = body
+			return p.complete(end, body), nil
+		}
+	}
 	var body []byte
 	full, err := stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(p.buffer[:end])), req)
 	if err == nil {
