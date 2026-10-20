@@ -276,3 +276,105 @@ func TestSendFileOnWritable(t *testing.T) {
 		t.Fatal("OnWritable's function never ran")
 	}
 }
+
+// TestSendFileStall checks, over HTTP/1.1 and HTTP/2, in cleartext and over
+// TLS, that SendFileStall cuts off a client that stops reading after its
+// stall bound, telling done so, and sends the whole file to one that reads
+// slowly, waiting for it between pieces as long as it takes something.
+func TestSendFileStall(t *testing.T) {
+	const size = 64 << 20
+	const stall = 300 * time.Millisecond
+	path := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(path, make([]byte, size), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		err error
+		at  time.Time
+	}
+	results := make(chan result, 1)
+	handler := HandlerFunc(func(c *Context) {
+		f, err := os.Open(path)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		n := int64(size)
+		if c.Request.URL.Path == "/slow" {
+			n = 8 << 20
+		}
+		c.SendFileStall(f, 0, n, stall, func(err error) {
+			f.Close()
+			results <- result{err, time.Now()}
+		})
+	})
+	serverTLS, clientTLS, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := serve(t, NewHandler(handler))
+	secure := serve(t, fibtls.NewServer(ConfigureTLS(serverTLS), NewHandler(handler)))
+	type client struct {
+		name, base string
+		*stdhttp.Client
+	}
+	var clients []client
+	for _, c := range hookClients(t) {
+		clients = append(clients, client{c.proto, "http://" + plain, c.Client})
+	}
+	for _, h2 := range []bool{false, true} {
+		transport := &stdhttp.Transport{TLSClientConfig: clientTLS.Clone(), ForceAttemptHTTP2: h2}
+		if !h2 {
+			transport.TLSNextProto = map[string]func(string, *stdtls.Conn) stdhttp.RoundTripper{}
+		}
+		t.Cleanup(transport.CloseIdleConnections)
+		clients = append(clients, client{fmt.Sprintf("tls/h2=%v", h2), "https://" + secure, &stdhttp.Client{Transport: transport}})
+	}
+	for _, cl := range clients {
+		t.Run(cl.name+"/stuck", func(t *testing.T) {
+			resp, err := cl.Get(cl.base + "/stuck")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			// Read nothing.
+			select {
+			case r := <-results:
+				if r.err == nil {
+					t.Fatal("done heard of no error with the client reading nothing")
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("a client that reads nothing was not cut off")
+			}
+		})
+		t.Run(cl.name+"/slow", func(t *testing.T) {
+			resp, err := cl.Get(cl.base + "/slow")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			buf := make([]byte, 256<<10)
+			var got int
+			for {
+				n, err := io.ReadFull(resp.Body, buf)
+				got += n
+				if err != nil {
+					break
+				}
+				// Slower than the server would send, faster than the stall.
+				time.Sleep(stall / 10)
+			}
+			if got != 8<<20 {
+				t.Fatalf("read %d bytes, want %d", got, 8<<20)
+			}
+			select {
+			case r := <-results:
+				if r.err != nil {
+					t.Fatalf("done heard %v", r.err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("done never ran")
+			}
+		})
+	}
+}

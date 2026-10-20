@@ -9,6 +9,7 @@ import (
 	stdhttp "net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/sidepool"
@@ -17,6 +18,11 @@ import (
 // sendFilePiece is how much of a file SendFile reads from the disk at a time
 // where it cannot hand the file to sendfile.
 const sendFilePiece = 64 << 10
+
+// sendFileQueuePiece is how much of a file SendFileStall queues for
+// sendfile at a time, so that it can wait for the client between pieces:
+// queued, not read, so it may be larger than a piece read.
+const sendFileQueuePiece = 256 << 10
 
 // SendFile sends n bytes of f, from offset, as the response's body, without
 // the calling goroutine waiting for the disk or for the client, and runs
@@ -42,7 +48,24 @@ const sendFilePiece = 64 << 10
 // until done runs; the range must lie within it, since a file that turns
 // out shorter ends the response short, which closes an HTTP/1 connection or
 // resets a stream. A response to HEAD sends none of the file.
+//
+// SendFile waits for the client without a bound; SendFileStall bounds it.
 func (c *Context) SendFile(f *os.File, offset, n int64, done func(error)) {
+	c.SendFileStall(f, offset, n, 0, done)
+}
+
+// SendFileStall is SendFile with every wait for the client bounded by
+// stall: the range goes a piece at a time, a piece queued for sendfile or
+// one read from the disk, and each time the response is above its limit,
+// SendFileStall waits for room under a write deadline of stall from then,
+// lifted once there is room. So a client that takes nothing of the response
+// for stall loses it, which ends with os.ErrDeadlineExceeded, closing an
+// HTTP/1 connection or resetting a stream, and one that reads slowly keeps
+// it. The last piece, once queued, is the connection's to send, under what
+// deadline the connection has. A stream that takes no write deadline, one
+// served outside this package that does not implement StreamDeadliner, is
+// waited for without one. A stall of 0 or less is SendFile's.
+func (c *Context) SendFileStall(f *os.File, offset, n int64, stall time.Duration, done func(error)) {
 	if done == nil {
 		done = func(error) {}
 	}
@@ -62,7 +85,7 @@ func (c *Context) SendFile(f *os.File, offset, n int64, done func(error)) {
 		c.WriteHeader(stdhttp.StatusOK)
 	}
 	c.Retain()
-	s := &fileSend{c: c, f: f, offset: offset, left: n, done: done}
+	s := &fileSend{c: c, f: f, offset: offset, left: n, stall: stall, done: done}
 	if n == 0 || c.Request.Method == stdhttp.MethodHead || !statusHasBody(w.status) {
 		var err error
 		switch {
@@ -78,8 +101,12 @@ func (c *Context) SendFile(f *os.File, offset, n int64, done func(error)) {
 	}
 	if c.isHTTP1() && !c.holdsWhole() && c.Conn.Layer() == nil && w.err == nil && n >= minSendFileSize &&
 		(w.declared < 0 || w.written+n <= w.declared) {
-		err := c.sendFileHTTP1(f, offset, n)
-		sidepool.Go(func() { s.finish(err) })
+		if stall <= 0 {
+			err := c.sendFileHTTP1(f, offset, n)
+			sidepool.Go(func() { s.finish(err) })
+			return
+		}
+		s.queue()
 		return
 	}
 	sidepool.File().Go(s.pump)
@@ -113,13 +140,86 @@ func (c *Context) sendFileHTTP1(f *os.File, offset, n int64) error {
 	return nil
 }
 
-// fileSend is a SendFile reading its file a piece at a time.
+// fileSend is a SendFile reading its file a piece at a time, or queuing it
+// for sendfile a piece at a time when it has a stall bound.
 type fileSend struct {
 	c      *Context
 	f      *os.File
 	offset int64
 	left   int64
+	stall  time.Duration
 	done   func(error)
+}
+
+// queue hands the range to sendfile a piece at a time, waiting for room
+// between pieces under the stall bound. It runs on the handler's goroutine
+// first, and then on OnWritable's.
+func (s *fileSend) queue() {
+	for {
+		k := min(s.left, sendFileQueuePiece)
+		if err := s.c.sendFileHTTP1(s.f, s.offset, k); err != nil {
+			sidepool.Go(func() { s.finish(err) })
+			return
+		}
+		s.offset += k
+		s.left -= k
+		if s.left == 0 {
+			sidepool.Go(func() { s.finish(nil) })
+			return
+		}
+		waiting, err := s.wait(s.requeue)
+		if err != nil {
+			sidepool.Go(func() { s.finish(err) })
+			return
+		}
+		if waiting {
+			return
+		}
+	}
+}
+
+// requeue carries on queuing once the response has room, or ends it.
+func (s *fileSend) requeue(err error) {
+	if err == nil {
+		err = s.lift()
+	}
+	if err != nil {
+		s.finish(err)
+		return
+	}
+	s.queue()
+}
+
+// wait arranges for fn to run once the response has room, under a write
+// deadline of the stall bound when there is one, and reports whether it
+// will; with room already, it reports false and fn does not run.
+func (s *fileSend) wait(fn func(error)) (bool, error) {
+	if s.stall > 0 {
+		if err := s.deadline(time.Now().Add(s.stall)); err != nil {
+			return false, err
+		}
+	}
+	if s.c.OnWritable(fn) {
+		return true, nil
+	}
+	return false, s.lift()
+}
+
+// lift takes the stall bound's write deadline off.
+func (s *fileSend) lift() error {
+	if s.stall <= 0 {
+		return nil
+	}
+	return s.deadline(time.Time{})
+}
+
+// deadline sets the response's write deadline, going on without one on a
+// stream that takes none.
+func (s *fileSend) deadline(t time.Time) error {
+	if err := s.c.SetWriteDeadline(t); err != nil && !errors.Is(err, stdhttp.ErrNotSupported) {
+		return err
+	}
+	return nil
 }
 
 // pump reads and writes pieces, on the file pool, until the response is
@@ -144,8 +244,15 @@ func (s *fileSend) pump() {
 			s.finish(werr)
 			return
 		}
-		if above && s.left > 0 && s.c.OnWritable(s.resume) {
-			return
+		if above && s.left > 0 {
+			waiting, err := s.wait(s.resume)
+			if err != nil {
+				s.finish(err)
+				return
+			}
+			if waiting {
+				return
+			}
 		}
 	}
 	s.finish(nil)
@@ -153,6 +260,9 @@ func (s *fileSend) pump() {
 
 // resume carries on once the response has room, or ends it.
 func (s *fileSend) resume(err error) {
+	if err == nil {
+		err = s.lift()
+	}
 	if err != nil {
 		s.finish(err)
 		return
