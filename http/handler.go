@@ -1186,9 +1186,14 @@ func (h *ServerHandler) sniff(c *fib.Connection, parser *Parser, data []byte) []
 
 // startH2 hands the connection, and whatever it has sent so far, to HTTP/2.
 func (h *ServerHandler) startH2(c *fib.Connection, parser *Parser, state *stdtls.ConnectionState) {
+	// The idle deadline HTTP/1 armed goes first: the bytes that end it are
+	// already in hand, and building the connection, which on an engine's
+	// first takes its stream pool, is the server's time, not the client's.
+	// Lifted after, a slow build cut off a client whose preface and first
+	// request the server held unread.
+	h.releaseTimeouts(c, parser)
 	sc := newH2ServerConn(h, c, parser.remoteAddr)
 	sc.tlsState = state
-	h.releaseTimeouts(c, parser)
 	c.SetAttachment(sc)
 	sc.start()
 	// feed copies what it is given into the connection's own buffer, so the
