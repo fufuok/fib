@@ -1,6 +1,7 @@
 package taskpool
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +14,9 @@ func (indexTask) RunTask() {}
 // Producers push through rings of every small size while consumers race to
 // pop. Every task must come out exactly once: a ring of one cell used to let
 // the producer write over a task a consumer had claimed but not yet read.
+// A producer or consumer that finds the ring full or empty yields: spinning
+// in place, it would hold a lone P until preemption took it off, 10ms a time,
+// and with GOMAXPROCS 1 the test would take minutes.
 func TestTaskRingDeliversEachTaskOnce(t *testing.T) {
 	for _, limit := range []int{1, 2, 3, 5, 8} {
 		const tasks, producers, consumers = 200000, 3, 4
@@ -28,6 +32,8 @@ func TestTaskRingDeliversEachTaskOnce(t *testing.T) {
 					if task, ok := r.pop(); ok {
 						seen[task.(indexTask)].Add(1)
 						taken.Add(1)
+					} else {
+						runtime.Gosched()
 					}
 				}
 			}()
@@ -38,6 +44,7 @@ func TestTaskRingDeliversEachTaskOnce(t *testing.T) {
 				defer wg.Done()
 				for i := p; i < tasks; i += producers {
 					for !r.push(indexTask(i)) {
+						runtime.Gosched()
 					}
 				}
 			}()
