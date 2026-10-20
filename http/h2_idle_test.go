@@ -10,11 +10,13 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/lesismal/fib"
+	"github.com/lesismal/fib/internal/debughook"
 	fibtls "github.com/lesismal/fib/tls"
 	"github.com/lesismal/fib/tlstest"
 )
@@ -41,11 +43,30 @@ func idleH2Handler() Handler {
 func dialIdleH2(t *testing.T, config Config, secure bool) *h2TestConn {
 	t.Helper()
 	handler := &closeRecorder{ServerHandler: NewHandlerWithConfig(config, idleH2Handler()), start: time.Now()}
+	debughook.SetTrace(true)
 	t.Cleanup(func() {
+		debughook.SetTrace(false)
 		if t.Failed() {
-			// Diagnostic: why the server ended the connection, and when.
+			// Diagnostic: why the server ended the connection, and when,
+			// and the deadlines it was given.
 			handler.mu.Lock()
 			t.Logf("server closes: %v", handler.closes)
+			for _, c := range handler.conns {
+				var lines []string
+				for _, l := range strings.Split(debughook.ConnTrace(c), "\n") {
+					if strings.Contains(l, "deadline") {
+						if i := strings.Index(l, " | "); i >= 0 {
+							l = l[:i]
+						}
+						lines = append(lines, l)
+					}
+				}
+				trace := strings.Join(lines, "\n")
+				if len(trace) > 3500 {
+					trace = trace[len(trace)-3500:]
+				}
+				fmt.Printf("\n::error title=%s deadlines::%s\n", t.Name(), strings.ReplaceAll(trace, "\n", "%0A"))
+			}
 			handler.mu.Unlock()
 		}
 	})
@@ -75,6 +96,14 @@ type closeRecorder struct {
 	mu     sync.Mutex
 	start  time.Time
 	closes []string
+	conns  []*fib.Connection
+}
+
+func (h *closeRecorder) OnOpen(c *fib.Connection) {
+	h.mu.Lock()
+	h.conns = append(h.conns, c)
+	h.mu.Unlock()
+	h.ServerHandler.OnOpen(c)
 }
 
 func (h *closeRecorder) OnClose(c *fib.Connection, err error) {

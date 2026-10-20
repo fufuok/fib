@@ -2329,6 +2329,13 @@ func (c *Connection) deadlinesLocked(t time.Time) *connectionDeadlines {
 // every read round does not move a timer per round, and one that moves it
 // resets the timer it has rather than make another.
 func (c *Connection) armDeadlineLocked(d *deadline, t time.Time, write bool) {
+	if traceOn.Load() {
+		in := "zero"
+		if !t.IsZero() {
+			in = time.Until(t).Round(time.Millisecond).String()
+		}
+		c.traceLocked("deadline write=%v in=%s from %s", write, in, traceCallers())
+	}
 	if d.at.Equal(t) {
 		return
 	}
@@ -2359,6 +2366,7 @@ func (c *Connection) expireDeadline(d *deadline, write bool) {
 	}
 	c.foldCorkedLocked()
 	queued := c.queuedLocked()
+	c.traceLocked("deadline expired write=%v stale=%v", write, stale)
 	c.mu.Unlock()
 	if stale {
 		return

@@ -4,6 +4,7 @@ package fib
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,27 @@ var (
 	traces     sync.Map
 	traceEpoch = time.Now()
 )
+
+// traceCallers names the functions that led to a traced step, innermost
+// first, without their packages.
+func traceCallers() string {
+	var pcs [8]uintptr
+	n := runtime.Callers(5, pcs[:])
+	frames := runtime.CallersFrames(pcs[:n])
+	var names []string
+	for {
+		f, more := frames.Next()
+		name := f.Function
+		if i := strings.LastIndexByte(name, '/'); i >= 0 {
+			name = name[i+1:]
+		}
+		names = append(names, name)
+		if !more {
+			break
+		}
+	}
+	return strings.Join(names, "<")
+}
 
 type traceRing struct {
 	mu   sync.Mutex
