@@ -1062,6 +1062,17 @@ func (e *Engine) markClosedLocked(c *Connection, closeErr error) {
 			c.releaseItemLocked(&c.sends[i])
 		}
 		c.resetQueueLocked()
+	} else {
+		// A file SendFile queued is still the connection's own duplicate of
+		// the caller's descriptor, which only a staging read under c.mu
+		// touches, never the send in flight: it closes now rather than when
+		// the collector finds it, which would hold the file open, and on
+		// Windows keep it from being removed, for as long as that takes.
+		for i := c.sendHead; i < len(c.sends); i++ {
+			if f := c.sends[i].file; f != nil {
+				f.close()
+			}
+		}
 	}
 	c.sends = nil
 	c.sendHead = 0

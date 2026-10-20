@@ -1303,9 +1303,9 @@ func (e *Engine) completeConnect(c *Connection, err error) {
 // sendfile for an overlapped socket the engine could use, so the file is read
 // a chunk at a time, each chunk once the socket has taken the one before.
 type fileSegment struct {
-	// file owns the duplicate handle. Keeping it an *os.File lets the
-	// garbage collector close it if the connection drops its queue while an
-	// overlapped send still holds a chunk.
+	// file owns the duplicate handle. A connection that closes while an
+	// overlapped send still holds a chunk closes it at once, and leaves only
+	// the chunk to the garbage collector; see markClosedLocked.
 	file      *os.File
 	offset    int64
 	remaining int64

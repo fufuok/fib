@@ -909,6 +909,60 @@ func TestSendFile(t *testing.T) {
 	}
 }
 
+// TestSendFileClosedConnectionLetsGoOfTheFile checks that a connection that
+// closes with a file SendFile queued still unsent, to a peer that reads
+// nothing, closes its own descriptor of the file by the time OnClose runs:
+// on Windows a send is then still in flight, and the file, held open until
+// the collector found the descriptor, could not be removed.
+func TestSendFileClosedConnectionLetsGoOfTheFile(t *testing.T) {
+	const size = 32 << 20
+	path, _ := writeTestFile(t, size)
+	opened := make(chan *Connection, 1)
+	closed := make(chan struct{})
+	addr := startServer(t, "tcp", "127.0.0.1:0", HandlerFuncs{
+		Open:  func(c *Connection) { opened <- c },
+		Close: func(*Connection, error) { close(closed) },
+	})
+	client, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	c := <-opened
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.SendFile(f, 0, size)
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Close once the peer's socket has stopped taking any of it, with what
+	// is left of the file queued.
+	deadline := time.Now().Add(10 * time.Second)
+	for last := int64(-1); ; {
+		n := c.unsent()
+		if n == last && n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the backlog never settled: %d bytes unsent", n)
+		}
+		last = n
+		time.Sleep(50 * time.Millisecond)
+	}
+	c.Close()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("OnClose never ran")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("the file is still held open after OnClose: %v", err)
+	}
+}
+
 // A file shorter than the range cannot deliver what was promised, so the
 // connection is closed after what the file did hold.
 func TestSendFileShortFileClosesConnection(t *testing.T) {
