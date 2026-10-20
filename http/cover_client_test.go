@@ -306,6 +306,43 @@ func TestCvCliIdleTimerReused(t *testing.T) {
 	}
 }
 
+// The idle timer is not reset each time a connection goes idle; one set
+// earlier fires, and is set again for what is left. The connection closes
+// IdleConnTimeout after it last went idle, not after it first did.
+func TestCvCliIdleTimerSetAgain(t *testing.T) {
+	closed := make(chan time.Time, 1)
+	u := rawServer(t, func(conn net.Conn, _ int) {
+		r := bufio.NewReader(conn)
+		for {
+			if _, err := stdhttp.ReadRequest(r); err != nil {
+				closed <- time.Now()
+				return
+			}
+			if _, err := io.WriteString(conn, cvCliOK); err != nil {
+				return
+			}
+		}
+	})
+	const timeout = 200 * time.Millisecond
+	config := DefaultClientConfig()
+	config.IdleConnTimeout = timeout
+	client := newTestClient(t, config)
+	var last time.Time
+	for range 3 {
+		resp, err := client.Go(mustRequest(t, "GET", u, nil)).Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+		readBody(t, resp)
+		last = time.Now()
+		time.Sleep(timeout * 3 / 4)
+	}
+	at := cvCliWait(t, closed, "the idle connection to close")
+	if early := last.Add(timeout).Sub(at); early > 0 {
+		t.Fatalf("closed %v before IdleConnTimeout after it last went idle", early)
+	}
+}
+
 // With MaxConnsPerHost reached, MaxPendingPerHost requests wait for the
 // connection and the next fails at once with ErrTooManyPending; one that
 // ended while it waited makes room for another.
