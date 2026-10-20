@@ -1143,6 +1143,11 @@ server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHa
   对 SSE 之类的流式响应请用 `Next` 跳过。
 - `OnFinish(fn)`：响应交给连接之后调用，带状态码、header 和 body 长度。
 
+只关心状态码的统计不必每个请求都注册 `OnFinish`：handler 返回后，`Status()` 不为 0 且
+`Retained()` 为 false，说明响应已经发出，`Status()` 就是它的状态码；仍被持有的请求再用
+`OnFinish`。`SetValue(v)` / `Value()` 是请求上的一个值槽，不加锁：在把请求交给别的
+goroutine 之前设置，之后（包括 `OnFinish` 里）读取。
+
 钩子按注册的逆序执行（和 defer 一样），外层中间件看到的是内层处理完的结果。compress 要放在
 etag 外面，这样 ETag 按原始 body 计算，压缩后再改成弱 ETag。
 

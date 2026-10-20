@@ -454,7 +454,7 @@ func (c *Context) switchTunnel(protocol string, header stdhttp.Header, handler T
 		}
 		return nil, err
 	}
-	c.wrote = true
+	c.wrote, c.status = true, uint16(status)
 	if hooks := c.hooked(); hooks != nil {
 		hooks.finished(status, header, 0)
 	}

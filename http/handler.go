@@ -57,11 +57,11 @@ type Context struct {
 	Conn    *fib.Connection
 	Request *stdhttp.Request
 	wrote   bool
-	// closing records that the response ends the HTTP/1 connection, so that
-	// no request pipelined behind it is served, and lingers that the close is
-	// to linger for input still arriving; see closeAfterResponse.
-	closing bool
-	lingers bool
+	// ends holds endClosing, that the response ends the HTTP/1 connection,
+	// so that no request pipelined behind it is served, and endLingers, that
+	// the close is to linger for input still arriving; see
+	// closeAfterResponse. They share a byte so that status fits the word.
+	ends uint8
 	// pooled records that the Context came from contextPool, and streamed
 	// that its request's body was still arriving when the handler ran.
 	// bodyDone records that OnBody's callback has had its last call, and
@@ -71,7 +71,16 @@ type Context struct {
 	streamed bool
 	bodyDone bool
 	bodyHeld bool
-	// w is the response being written through the ResponseWriter methods.
+	// status is the status of the response written whole or the tunnel
+	// opened, for Status; a response written through the ResponseWriter
+	// methods keeps its own in w. It sits with the flags, in their word.
+	status uint16
+	// w is the response being written through the ResponseWriter methods,
+	// or holding the hooks registered on it. Once a request has needed one,
+	// the Context keeps it, cleared, for the requests it serves after,
+	// rather than going to writerPool for each: an access log's OnFinish,
+	// on every request, needs one. A cleared writer reads as unused: no
+	// status, no hooks, nothing committed.
 	w *responseWriter
 	// stream is the HTTP/2 stream the request arrived on, or nil for HTTP/1.
 	stream *h2ServerStream
@@ -87,11 +96,12 @@ type Context struct {
 	err  error
 	// body is OnBody's callback. handover is the body OnBody was asked for
 	// while the handler ran, owed once it returns; see later. cancel holds
-	// OnCancel's and what Context handed out. deliverMu keeps body callbacks
-	// one at a time.
+	// OnCancel's, what Context handed out and SetValue's value; it is set
+	// under mu, and loaded without it by SetValue and Value. deliverMu keeps
+	// body callbacks one at a time.
 	body      BodyFunc
 	handover  func(worker bool)
-	cancel    *cancelHooks
+	cancel    atomic.Pointer[cancelHooks]
 	deliverMu sync.Mutex
 	// server and parser are the HTTP/1 connection this request arrived on,
 	// which a release away from the worker needs to carry on with. They are
@@ -108,6 +118,12 @@ type Context struct {
 	// parameters matched; see Param.
 	route *routeState
 }
+
+// The bits of Context.ends.
+const (
+	endClosing uint8 = 1 << iota
+	endLingers
+)
 
 // Stream answers a request that arrived over a protocol served outside this
 // package, as HTTP/3 is by package http3, so that the same Handler serves
@@ -339,7 +355,7 @@ func (c *Context) HoldBody(hold bool) {
 // lingering close if the request's body is still arriving.
 func (c *Context) closeAfterResponse() {
 	stream := c.RequestBody()
-	closeAfterResponse(c.Conn, c.lingers || stream != nil && stream.unfinished())
+	closeAfterResponse(c.Conn, c.ends&endLingers != 0 || stream != nil && stream.unfinished())
 }
 
 // draining reports whether the HTTP/1 connection is to finish, its engine
@@ -434,13 +450,13 @@ func (c *Context) writeResponse(response Response) error {
 	switch {
 	case c.external != nil:
 		if err = c.external.WriteResponse(c.Request, response); err == nil {
-			c.wrote = true
+			c.wrote, c.status = true, uint16(response.StatusCode)
 		}
 	case c.stream != nil:
 		// HTTP/2 multiplexes the connection, so Close retires it gracefully
 		// with GOAWAY rather than cutting the other streams short.
 		if err = c.stream.respond(c.Request, response); err == nil {
-			c.wrote = true
+			c.wrote, c.status = true, uint16(response.StatusCode)
 		}
 	default:
 		err = c.writeHTTP1(response, "")
@@ -475,9 +491,9 @@ func (c *Context) writeHTTP1(response Response, contentType string) error {
 	if err := c.sendResponse(response, contentType, closeConnection); err != nil {
 		return err
 	}
-	c.wrote = true
+	c.wrote, c.status = true, uint16(response.StatusCode)
 	if closeConnection {
-		c.closing = true
+		c.ends |= endClosing
 		c.closeAfterResponse()
 	}
 	return nil
@@ -973,7 +989,7 @@ func (h *ServerHandler) endRequestLocked(context *Context) bool {
 	// round could read it, has no response for the client to read, and
 	// answering what follows it would answer the wrong request.
 	cancelled := ctxState(context.word.Load()) == ctxCancelled
-	closing := tooMuchLeft || cancelled || context.closing || context.Request.Close
+	closing := tooMuchLeft || cancelled || context.ends&endClosing != 0 || context.Request.Close
 	if closing {
 		parser.lingers = unread
 		parser.spent = true
@@ -1077,7 +1093,7 @@ func (h *ServerHandler) refuse(c *fib.Connection, err error) {
 	// Whatever the client sent past what was refused, the rest of a body too
 	// large or a malformed request, is still arriving, and the close lingers
 	// for it, as net/http's does, so that the client reads the refusal.
-	context := &Context{Conn: c, Request: request, lingers: true}
+	context := &Context{Conn: c, Request: request, ends: endLingers}
 	_ = context.WriteResponse(Response{
 		StatusCode: status,
 		Header:     stdhttp.Header{"Content-Type": {"text/plain; charset=utf-8"}},

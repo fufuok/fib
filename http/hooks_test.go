@@ -221,3 +221,63 @@ func TestResponseHookAfterBegin(t *testing.T) {
 		}
 	}
 }
+
+// TestContextStatus has a response written each way a handler writes one,
+// over HTTP/1 and HTTP/2 and through an external stream, and checks that
+// Status is 0 before it and the response's status once it is sent, or begun
+// through the ResponseWriter methods.
+func TestContextStatus(t *testing.T) {
+	long := strings.Repeat("x", 3*writerBufferSize)
+	write := map[string]func(c *Context){
+		"respond":      func(c *Context) { _ = c.Respond(stdhttp.StatusAccepted, "text/plain", []byte("body")) },
+		"respond bare": func(c *Context) { _ = c.Respond(stdhttp.StatusAccepted, "", []byte("body")) },
+		"response": func(c *Context) {
+			_ = c.WriteResponse(Response{StatusCode: stdhttp.StatusAccepted, Body: []byte("body")})
+		},
+		"short": func(c *Context) {
+			c.WriteHeader(stdhttp.StatusAccepted)
+			_, _ = c.Write([]byte("body"))
+		},
+		"long": func(c *Context) {
+			c.WriteHeader(stdhttp.StatusAccepted)
+			_, _ = c.Write([]byte(long))
+		},
+		"implicit": func(c *Context) { _, _ = c.Write([]byte("body")) },
+	}
+	for name, fn := range write {
+		want := stdhttp.StatusAccepted
+		if name == "implicit" {
+			want = stdhttp.StatusOK
+		}
+		statuses := make(chan [2]int, 1)
+		handler := HandlerFunc(func(c *Context) {
+			before := c.Status()
+			fn(c)
+			statuses <- [2]int{before, c.Status()}
+		})
+		check := func(proto string) {
+			t.Helper()
+			if got := <-statuses; got != [2]int{0, want} {
+				t.Errorf("%s %s: Status %d before, %d after, want 0 and %d", name, proto, got[0], got[1], want)
+			}
+		}
+		addr := serve(t, NewHandler(handler))
+		for _, client := range hookClients(t) {
+			resp, err := client.Get("http://" + addr + "/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			check(client.proto)
+		}
+		var r StreamRequest
+		r.Request = stdhttp.Request{Method: stdhttp.MethodGet, URL: &r.URL, Proto: "HTTP/3", ProtoMajor: 3}
+		serveRequest(handler, r.Context(nil, discardStream{}, nil))
+		check("external")
+		r.Recycle()
+		if s := r.context.Status(); s != 0 {
+			t.Errorf("%s: Status %d once recycled", name, s)
+		}
+	}
+}

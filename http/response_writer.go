@@ -682,7 +682,11 @@ func (c *Context) commit(final bool) error {
 	w.committed = true
 	w.chunked = head.chunked
 	w.closeAfter = head.close
-	c.closing = head.close
+	if head.close {
+		c.ends |= endClosing
+	} else {
+		c.ends &^= endClosing
+	}
 	if len(w.buf) > 0 {
 		if w.chunked {
 			out = appendChunk(out, w.buf)
@@ -808,7 +812,7 @@ func (c *Context) Finish() error {
 		// request it pipelined as this one's, and so would a stream.
 		switch {
 		case c.isHTTP1():
-			c.closing = true
+			c.ends |= endClosing
 			c.closeAfterResponse()
 		case c.stream != nil:
 			c.stream.abandon()
@@ -871,7 +875,7 @@ func (c *Context) finish(w *responseWriter) error {
 		statusHasBody(w.status) {
 		// A body shorter than its Content-Length leaves the client waiting
 		// for bytes that will never come, so the connection has to end.
-		c.closing = true
+		c.ends |= endClosing
 		c.closeAfterResponse()
 	}
 	return nil

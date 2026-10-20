@@ -202,7 +202,7 @@ func (c *Context) drop(bits uint64) {
 // ended runs once nothing can reach the Context any more but the server: the
 // body's buffer goes back, and whatever the Reuse options recycle goes too.
 func (c *Context) ended() {
-	if h := c.cancel; h != nil && h.stop != nil {
+	if h := c.cancel.Load(); h != nil && h.stop != nil {
 		stop := h.stop
 		h.stop = nil
 		stop(nil)
@@ -226,7 +226,7 @@ var contextPool = sync.Pool{New: func() any { return &Context{pooled: true} }}
 // recycle clears the Context for another request. Its generation moves on,
 // so that a cancellation meant for the request it served, which OnClose makes
 // from a goroutine of its own, finds it serving another and leaves it alone.
-// Every field but mu, deliverMu, word and pooled is reset, which
+// Every field but mu, deliverMu, word and pooled is reset, w to a cleared writer, which
 // TestContextRecycleResetsEveryField holds it to.
 //
 // A recycled Context waiting for its next request reads as finished, so that
@@ -237,17 +237,18 @@ func (c *Context) recycle() {
 	gen := c.generation() + 1
 	c.word.Store(withState(gen<<ctxGenShift, ctxDone))
 	c.Conn, c.Request = nil, nil
-	c.wrote, c.closing, c.lingers, c.streamed = true, false, false, false
+	c.wrote, c.ends, c.streamed, c.status = true, 0, false, 0
 	if w := c.w; w != nil {
 		// Nothing reaches the writer but through the Context, so it is as
 		// free to serve another request, once cleared, as the Context is.
+		// The Context keeps it for its next request, which is as likely to
+		// want one.
 		w.reset()
-		writerPool.Put(w)
 	}
-	c.w, c.stream, c.external = nil, nil, nil
+	c.stream, c.external = nil, nil
 	c.err, c.body, c.bodyDone = nil, nil, false
 	c.bodyHeld, c.handover = false, nil
-	if h := c.cancel; h != nil {
+	if h := c.cancel.Load(); h != nil {
 		// Kept for the next request, which is as likely to want it.
 		*h = cancelHooks{}
 	}
@@ -270,17 +271,26 @@ func (c *Context) recycle() {
 // Context's cancellation hooks, which a recycled Context keeps for its next
 // request, so that the Context itself, which an HTTP/2 or HTTP/3 stream is
 // allocated with, does not grow by it.
+//
+// The slot takes no lock, so that keeping a value costs a request a store
+// and no more: SetValue is for whatever serves the request to call before
+// it hands the request to any other goroutine, as a middleware does before
+// it calls the next handler, and Value for whatever runs after that, the
+// OnFinish hooks included, wherever they run. Two goroutines calling
+// SetValue, or one calling SetValue while another calls Value, race.
 func (c *Context) SetValue(v any) {
-	c.mu.Lock()
-	c.hooks().value = v
-	c.mu.Unlock()
+	h := c.cancel.Load()
+	if h == nil {
+		c.mu.Lock()
+		h = c.hooks()
+		c.mu.Unlock()
+	}
+	h.value = v
 }
 
 // Value returns what SetValue last set for this request, or nil.
 func (c *Context) Value() any {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if h := c.cancel; h != nil {
+	if h := c.cancel.Load(); h != nil {
 		return h.value
 	}
 	return nil
@@ -396,6 +406,24 @@ func (c *Context) Retained() bool {
 	return ctxState(w) == ctxOpen && w&ctxHolds != 0
 }
 
+// Status returns the status of the response sent, or begun through the
+// ResponseWriter methods, so far: 0 before any, and the 101 or 2xx of a
+// tunnel opened by Upgrade or Connect. Together with Retained, it lets
+// whatever called the handler tell, once it returns, that the response is
+// settled, and what it was, without an OnFinish hook on every request: a
+// response that Status says is sent and that is not Retained is finished,
+// with that status. Call it on the goroutine that answers, or once that one
+// is known to be done.
+func (c *Context) Status() int {
+	if c.status != 0 {
+		return int(c.status)
+	}
+	if w := c.w; w != nil {
+		return w.status
+	}
+	return 0
+}
+
 // Err is why the request ended before its response did — the connection
 // closing, a read timeout, or a body that could not be read — or nil while it
 // is still going. Writing to a Context whose connection has gone fails with
@@ -461,10 +489,12 @@ type cancelHooks struct {
 // hooks returns the Context's cancelHooks, made the first time they are
 // needed. Callers hold mu.
 func (c *Context) hooks() *cancelHooks {
-	if c.cancel == nil {
-		c.cancel = new(cancelHooks)
+	h := c.cancel.Load()
+	if h == nil {
+		h = new(cancelHooks)
+		c.cancel.Store(h)
 	}
-	return c.cancel
+	return h
 }
 
 // Context is a context.Context for the request, for code that hears of a
@@ -485,7 +515,7 @@ func (c *Context) hooks() *cancelHooks {
 func (c *Context) Context() context.Context {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if h := c.cancel; h != nil && h.ctx != nil {
+	if h := c.cancel.Load(); h != nil && h.ctx != nil {
 		return h.ctx
 	}
 	// cancelWith moves the state on under mu, as OnCancel relies on too.
@@ -1006,7 +1036,7 @@ func (c *Context) cancelWith(err error, gen uint64) {
 	c.err = err
 	var onCancel func(error)
 	var stop context.CancelCauseFunc
-	if h := c.cancel; h != nil {
+	if h := c.cancel.Load(); h != nil {
 		// The context stays, for a Context asked for again to return.
 		onCancel, stop = h.fn, h.stop
 		h.fn, h.stop = nil, nil

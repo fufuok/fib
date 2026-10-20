@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -420,5 +421,81 @@ func TestContextValue(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestContextValueAnsweredLater sets a value before the handler hands its
+// request to another goroutine, which answers it; the OnFinish hook, run
+// there, reads it back. Under the race detector, it holds SetValue and
+// Value, which take no lock, to the order the request's handover gives.
+func TestContextValueAnsweredLater(t *testing.T) {
+	for _, reuse := range []bool{false, true} {
+		config := DefaultConfig()
+		config.ReuseContexts = reuse
+		got := make(chan any, 4)
+		addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+			c.SetValue(c.Request.URL.Path)
+			c.OnFinish(func(int, stdhttp.Header, int64) { got <- c.Value() })
+			c.Retain()
+			go func() {
+				_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("later"))
+				c.Release()
+			}()
+		})))
+		for _, client := range hookClients(t) {
+			for _, path := range []string{"/a", "/b"} {
+				resp, err := client.Get("http://" + addr + path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _ = io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if v := <-got; v != path {
+					t.Errorf("reuse=%v %s %s: OnFinish read %v", reuse, client.proto, path, v)
+				}
+			}
+		}
+	}
+}
+
+// TestContextKeepsWriter serves requests through one recycled StreamRequest:
+// the writer the first used, kept for the next, carries nothing over, its
+// hooks and header included.
+func TestContextKeepsWriter(t *testing.T) {
+	var r StreamRequest
+	var finished []string
+	serve := func(path string, handler HandlerFunc) *Context {
+		r.Request = stdhttp.Request{Method: stdhttp.MethodGet, URL: &r.URL, Proto: "HTTP/2.0", ProtoMajor: 2}
+		r.URL = url.URL{Path: path}
+		c := r.Context(nil, discardStream{}, nil)
+		serveRequest(handler, c)
+		return c
+	}
+	c := serve("/one", func(c *Context) {
+		c.Header().Set("X-One", "1")
+		c.OnFinish(func(int, stdhttp.Header, int64) { finished = append(finished, "one") })
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", nil)
+	})
+	r.Recycle()
+	if c.w == nil || c.w.status != 0 || c.w.hooks != nil || c.w.header != nil {
+		t.Fatalf("after recycling: writer %+v", c.w)
+	}
+	spare := c.w
+	serve("/two", func(c *Context) {
+		if c.hooked() != nil {
+			t.Error("the second request starts with hooks")
+		}
+		if h := c.Header(); len(h) != 0 {
+			t.Errorf("the second request starts with header %v", h)
+		}
+		if c.w != spare {
+			t.Error("the second request's writer is not the one kept")
+		}
+		c.OnFinish(func(int, stdhttp.Header, int64) { finished = append(finished, "two") })
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", nil)
+	})
+	r.Recycle()
+	if strings.Join(finished, ",") != "one,two" {
+		t.Errorf("finish hooks ran: %v", finished)
 	}
 }
