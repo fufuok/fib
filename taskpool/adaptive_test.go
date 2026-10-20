@@ -413,6 +413,33 @@ func TestAdaptiveShardsShareTheCeiling(t *testing.T) {
 	}
 }
 
+// A shard that has taken the whole ceiling leaves no room for another
+// shard's first worker: tasks that block on every shard still run no more at
+// once than MaxWorkers.
+func TestAdaptiveBusyShardLeavesRoomForTheOthers(t *testing.T) {
+	tp, b := shardedAdaptive(t, AdaptiveConfig{MaxWorkers: 16, QueueSize: 64})
+	defer tp.Stop()
+	blocker := newBlocker()
+	defer blocker.open()
+	for i := 0; i < 16; i++ {
+		b.shards[0].submit(taskFunc(blocker.task()))
+	}
+	waitFor(t, "the first shard's tasks to start", func() bool { return blocker.running.Load() >= 15 })
+	for _, p := range b.shards[1:] {
+		p.submit(taskFunc(blocker.task()))
+	}
+	waitFor(t, "every shard's tasks to start", func() bool { return blocker.running.Load() >= 16 })
+	time.Sleep(50 * time.Millisecond)
+	if got := tp.Workers(); got > 16 {
+		t.Fatalf("Workers() = %d, over the ceiling of 16", got)
+	}
+	if running := blocker.running.Load(); running > 16 {
+		t.Fatalf("%d tasks run at once, over the ceiling of 16", running)
+	}
+	blocker.open()
+	blocker.done.Wait()
+}
+
 // Submissions race Stop, which must not return before every task it let in
 // has run: a submission queues without the lock, so it may still be
 // publishing its task when Stop has already turned new ones away.

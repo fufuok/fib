@@ -96,6 +96,7 @@ func newAdaptiveBackend(executor *executor, config AdaptiveConfig) *adaptiveBack
 		queueSize = shards
 	}
 	b := &adaptiveBackend{interval: interval, stopJanitor: make(chan struct{}), janitorDone: make(chan struct{})}
+	b.budget.shards = int32(shards)
 	for i := 0; i < shards; i++ {
 		p := newAdaptivePool(b, executor, share(queueSize, shards, i), int32(i))
 		b.shards = append(b.shards, p)
@@ -247,9 +248,13 @@ func (b *adaptiveBackend) rescue(except *adaptivePool) {
 // workerBudget is the ceiling an adaptive pool's shards share. A shard with
 // no worker may always start one, so that a task that lands on it always has
 // a worker to run it; a shard's further workers draw on the budget, which is
-// the ceiling less the shards' first workers. The first worker of a shard
-// that had none may thus take the pool over its ceiling for a while, until a
-// shard with workers to spare lets one go; see retireOverCeiling.
+// the ceiling less a first worker for every shard, whether or not it has one
+// yet. Were it the ceiling less the first workers there are, a shard could
+// take the whole of it while the others had none, and their first workers
+// would take the pool over its ceiling for as long as its tasks ran, which
+// for tasks that block may be until they are released: MaxWorkers 16 ran 17.
+// Only a ceiling lowered below the shard count leaves the pool over it, since
+// every shard keeps its first worker; see resize.
 type workerBudget struct {
 	_ cacheLinePad
 	// extra counts the workers past each shard's first, and firsts the
@@ -257,15 +262,20 @@ type workerBudget struct {
 	extra   atomic.Int32
 	firsts  atomic.Int32
 	ceiling atomic.Int32
-	_       cacheLinePad
+	// shards is the shard count, fixed when the pool is built.
+	shards int32
+	_      cacheLinePad
 }
+
+// further is how many workers past their first the ceiling leaves the shards.
+func (b *workerBudget) further() int32 { return max(0, b.ceiling.Load()-b.shards) }
 
 // take draws one worker past a shard's first on the budget, reporting false
 // when it is spent.
 func (b *workerBudget) take() bool {
 	for {
 		extra := b.extra.Load()
-		if extra >= b.ceiling.Load()-b.firsts.Load() {
+		if extra >= b.further() {
 			return false
 		}
 		if b.extra.CompareAndSwap(extra, extra+1) {
@@ -276,12 +286,14 @@ func (b *workerBudget) take() bool {
 
 // room reports whether take would draw a worker now.
 func (b *workerBudget) room() bool {
-	return b.extra.Load() < b.ceiling.Load()-b.firsts.Load()
+	return b.extra.Load() < b.further()
 }
 
-// excess is how many workers the pool runs over its ceiling.
+// excess is how many workers past their first the shards run over what the
+// budget leaves them, which a resize that lowered the ceiling leaves them
+// doing.
 func (b *workerBudget) excess() int32 {
-	return b.extra.Load() + b.firsts.Load() - b.ceiling.Load()
+	return b.extra.Load() - b.further()
 }
 
 func (b *adaptiveBackend) janitor(interval time.Duration) {
@@ -702,10 +714,10 @@ func (p *adaptivePool) submitBatch(tasks []Task) int {
 	return submitted
 }
 
-// retireOverCeiling counts the calling worker out if the pool runs more
-// workers than its ceiling, which a resize that lowered it or another shard's
-// first worker leaves it doing, and reports whether it did. A shard's first
-// worker is not on the budget, so it stays.
+// retireOverCeiling counts the calling worker out if the shards run more
+// workers past their first than the budget leaves them, which a resize that
+// lowered the ceiling leaves them doing, and reports whether it did. A
+// shard's first worker is not on the budget, so it stays.
 func (p *adaptivePool) retireOverCeiling() bool {
 	for p.budget.excess() > 0 {
 		workers := p.workers.Load()
