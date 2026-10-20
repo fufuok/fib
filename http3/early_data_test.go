@@ -29,12 +29,12 @@ func earlyHandler(c *fibhttp.Context) {
 // to early data can come before that, and a client that goes before it has
 // only the ticket it has used, whose early data the server turns away, since
 // a ticket carries early data once.
-func settle(p *peer) {
-	p.t.Helper()
-	if r := p.do(interopSpec{Command: "waitticket"}); r.Error != "" {
-		p.t.Fatalf("waiting for the session ticket: %s", r.Error)
+func settle(t *testing.T, p *peer) {
+	t.Helper()
+	if r := p.do(t, interopSpec{Command: "waitticket"}); r.Error != "" {
+		t.Fatalf("waiting for the session ticket: %s", r.Error)
 	}
-	p.do(interopSpec{Command: "newconn"})
+	p.do(t, interopSpec{Command: "newconn"})
 }
 
 // TestEarlyDataQUICGo resumes a session with quic-go's client, which sends
@@ -54,7 +54,7 @@ func TestEarlyDataQUICGo(t *testing.T) {
 			url := startServer(t, tc.config, earlyHandler)
 			p := startPeer(t, "-mode", "client", "-url", url, "-ca", certFile, "-early")
 
-			first := p.ok(interopSpec{Path: "/first"})
+			first := p.ok(t, interopSpec{Path: "/first"})
 			if first.Resumed || first.Body != `GET early=""` {
 				t.Fatalf("first connection: resumed %v, %q", first.Resumed, first.Body)
 			}
@@ -66,8 +66,8 @@ func TestEarlyDataQUICGo(t *testing.T) {
 			// taken as early is the server's failing, and fails at once.
 			want := fmt.Sprintf("GET early=%q", tc.wantEarly)
 			for attempt := 1; ; attempt++ {
-				settle(p)
-				got := p.ok(interopSpec{Method: "GET_0RTT", Path: "/second"})
+				settle(t, p)
+				got := p.ok(t, interopSpec{Method: "GET_0RTT", Path: "/second"})
 				if !got.Resumed {
 					t.Fatal("the second connection did not resume the session")
 				}
@@ -84,15 +84,15 @@ func TestEarlyDataQUICGo(t *testing.T) {
 			}
 
 			// And again: every connection gets a ticket of its own.
-			settle(p)
-			got := p.ok(interopSpec{Method: "HEAD_0RTT", Path: "/third"})
+			settle(t, p)
+			got := p.ok(t, interopSpec{Method: "HEAD_0RTT", Path: "/third"})
 			if !got.Resumed {
 				t.Fatal("the third connection did not resume")
 			}
 
 			// A request that is not early goes the usual way.
-			settle(p)
-			got = p.ok(interopSpec{Method: "POST", Path: "/fourth", Body: "x"})
+			settle(t, p)
+			got = p.ok(t, interopSpec{Method: "POST", Path: "/fourth", Body: "x"})
 			if !got.Resumed || got.Body != `POST early=""` {
 				t.Fatalf("POST: resumed %v, %q", got.Resumed, got.Body)
 			}

@@ -226,7 +226,6 @@ func writePEM(t *testing.T) (certFile, keyFile string) {
 // peer is the interop program, running as either side, driven over its
 // standard input and output.
 type peer struct {
-	t       *testing.T
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
 	stdout  *bufio.Scanner
@@ -246,7 +245,7 @@ func startPeer(t *testing.T, args ...string) *peer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &peer{t: t, cmd: cmd, stdin: stdin, stderr: &bytes.Buffer{}}
+	p := &peer{cmd: cmd, stdin: stdin, stderr: &bytes.Buffer{}}
 	cmd.Stderr = p.stderr
 	p.stdout = bufio.NewScanner(stdout)
 	p.stdout.Buffer(make([]byte, 1<<20), 8<<20)
@@ -276,35 +275,35 @@ func (p *peer) stop() {
 }
 
 // do sends one specification and returns what the peer answers.
-func (p *peer) do(spec interopSpec) interopResult {
-	p.t.Helper()
+func (p *peer) do(t testing.TB, spec interopSpec) interopResult {
+	t.Helper()
 	line, err := json.Marshal(spec)
 	if err != nil {
-		p.t.Fatal(err)
+		t.Fatal(err)
 	}
 	if _, err := p.stdin.Write(append(line, '\n')); err != nil {
-		p.t.Fatalf("writing to the peer: %v (stderr: %s)", err, p.stderr)
+		t.Fatalf("writing to the peer: %v (stderr: %s)", err, p.stderr)
 	}
 	if !p.stdout.Scan() {
 		err := p.stdout.Err()
-		p.t.Fatalf("the peer said nothing: %v (stderr: %s)", err, p.stderr)
+		t.Fatalf("the peer said nothing: %v (stderr: %s)", err, p.stderr)
 	}
 	var result interopResult
 	if err := json.Unmarshal(p.stdout.Bytes(), &result); err != nil {
-		p.t.Fatalf("the peer said %q: %v", p.stdout.Text(), err)
+		t.Fatalf("the peer said %q: %v", p.stdout.Text(), err)
 	}
 	return result
 }
 
 // ok is do for a request that has to succeed with status 200.
-func (p *peer) ok(spec interopSpec) interopResult {
-	p.t.Helper()
-	result := p.do(spec)
+func (p *peer) ok(t testing.TB, spec interopSpec) interopResult {
+	t.Helper()
+	result := p.do(t, spec)
 	if result.Error != "" {
-		p.t.Fatalf("%s %s: %s", spec.Method, spec.Path, result.Error)
+		t.Fatalf("%s %s: %s", spec.Method, spec.Path, result.Error)
 	}
 	if result.Status != stdhttp.StatusOK {
-		p.t.Fatalf("%s %s: status %d", spec.Method, spec.Path, result.Status)
+		t.Fatalf("%s %s: status %d", spec.Method, spec.Path, result.Status)
 	}
 	return result
 }
@@ -336,7 +335,7 @@ func TestHTTP3ConformanceServer(t *testing.T) {
 	p := startPeer(t, "-mode", "client", "-url", url, "-ca", certFile)
 
 	t.Run("GET", func(t *testing.T) {
-		got := p.ok(interopSpec{Path: "/hello?echo=1"})
+		got := p.ok(t, interopSpec{Path: "/hello?echo=1"})
 		if got.Proto != "HTTP/3.0" || got.header("X-Proto") != "HTTP/3.0" {
 			t.Fatalf("proto %q, server saw %q", got.Proto, got.header("X-Proto"))
 		}
@@ -350,14 +349,14 @@ func TestHTTP3ConformanceServer(t *testing.T) {
 
 	t.Run("POST", func(t *testing.T) {
 		body := "the quick brown fox"
-		got := p.ok(interopSpec{Method: "POST", Path: "/echo?echo=1", Body: body})
+		got := p.ok(t, interopSpec{Method: "POST", Path: "/echo?echo=1", Body: body})
 		if got.Body != body || got.header("X-Body-Hash") != hashBody([]byte(body)) {
 			t.Fatalf("body %q, hash %s", got.Body, got.header("X-Body-Hash"))
 		}
 	})
 
 	t.Run("RequestHeaders", func(t *testing.T) {
-		got := p.ok(interopSpec{Path: "/h", Header: map[string][]string{
+		got := p.ok(t, interopSpec{Path: "/h", Header: map[string][]string{
 			"X-Echo-One": {"first", "second"},
 			"Cookie":     {"a=1", "b=2"},
 		}})
@@ -367,7 +366,7 @@ func TestHTTP3ConformanceServer(t *testing.T) {
 	})
 
 	t.Run("ResponseHeaders", func(t *testing.T) {
-		got := p.ok(interopSpec{Path: "/r?header=Set-Cookie:a%3D1,Set-Cookie:b%3D2,X-One:two"})
+		got := p.ok(t, interopSpec{Path: "/r?header=Set-Cookie:a%3D1,Set-Cookie:b%3D2,X-One:two"})
 		if values := got.Header["Set-Cookie"]; len(values) != 2 {
 			t.Fatalf("Set-Cookie %v", values)
 		}
@@ -378,7 +377,7 @@ func TestHTTP3ConformanceServer(t *testing.T) {
 
 	t.Run("LargeUpload", func(t *testing.T) {
 		const size = 4 << 20
-		got := p.ok(interopSpec{Method: "PUT", Path: "/up", BodySize: size})
+		got := p.ok(t, interopSpec{Method: "PUT", Path: "/up", BodySize: size})
 		if got.header("X-Body-Len") != strconv.Itoa(size) || got.header("X-Body-Hash") != hashBody(filler(size)) {
 			t.Fatalf("server saw %s bytes, hash %s", got.header("X-Body-Len"), got.header("X-Body-Hash"))
 		}
@@ -386,42 +385,42 @@ func TestHTTP3ConformanceServer(t *testing.T) {
 
 	t.Run("LargeDownload", func(t *testing.T) {
 		const size = 4 << 20
-		got := p.ok(interopSpec{Path: "/down?size=" + strconv.Itoa(size)})
+		got := p.ok(t, interopSpec{Path: "/down?size=" + strconv.Itoa(size)})
 		if got.BodyLen != size || got.BodyHash != hashBody(filler(size)) {
 			t.Fatalf("got %d bytes, hash %s", got.BodyLen, got.BodyHash)
 		}
 	})
 
 	t.Run("Concurrent", func(t *testing.T) {
-		got := p.ok(interopSpec{Path: "/c?size=4096", Count: 50})
+		got := p.ok(t, interopSpec{Path: "/c?size=4096", Count: 50})
 		if got.Count != 50 || got.BodyLen != 4096 {
 			t.Fatalf("%d requests, last %d bytes", got.Count, got.BodyLen)
 		}
 	})
 
 	t.Run("HEAD", func(t *testing.T) {
-		got := p.ok(interopSpec{Method: "HEAD", Path: "/h?size=1024"})
+		got := p.ok(t, interopSpec{Method: "HEAD", Path: "/h?size=1024"})
 		if got.BodyLen != 0 || got.header("Content-Length") != "1024" {
 			t.Fatalf("HEAD body %d, content-length %q", got.BodyLen, got.header("Content-Length"))
 		}
 	})
 
 	t.Run("NoContent", func(t *testing.T) {
-		got := p.do(interopSpec{Path: "/n?status=204&size=16"})
+		got := p.do(t, interopSpec{Path: "/n?status=204&size=16"})
 		if got.Status != stdhttp.StatusNoContent || got.BodyLen != 0 || got.header("Content-Length") != "" {
 			t.Fatalf("status %d, body %d, content-length %q", got.Status, got.BodyLen, got.header("Content-Length"))
 		}
 	})
 
 	t.Run("ResponseTrailers", func(t *testing.T) {
-		got := p.ok(interopSpec{Path: "/t?echo=1&trailer=X-Sum:42", Body: "x"})
+		got := p.ok(t, interopSpec{Path: "/t?echo=1&trailer=X-Sum:42", Body: "x"})
 		if values := got.Trailer[stdhttp.CanonicalHeaderKey("X-Sum")]; len(values) != 1 || values[0] != "42" {
 			t.Fatalf("trailers %v", got.Trailer)
 		}
 	})
 
 	t.Run("RequestTrailers", func(t *testing.T) {
-		got := p.ok(interopSpec{Method: "POST", Path: "/rt", Body: "body",
+		got := p.ok(t, interopSpec{Method: "POST", Path: "/rt", Body: "body",
 			Trailer: map[string][]string{"X-Check": {"done"}}})
 		if got.header("X-Req-Trailer-X-Check") != "done" {
 			t.Fatalf("the server saw trailers %v", got.Header)
@@ -429,14 +428,14 @@ func TestHTTP3ConformanceServer(t *testing.T) {
 	})
 
 	t.Run("InterimResponse", func(t *testing.T) {
-		got := p.ok(interopSpec{Path: "/i?interim=1&echo=1", Body: "after hints"})
+		got := p.ok(t, interopSpec{Path: "/i?interim=1&echo=1", Body: "after hints"})
 		if got.Body != "after hints" {
 			t.Fatalf("body %q", got.Body)
 		}
 	})
 
 	t.Run("Continue", func(t *testing.T) {
-		got := p.ok(interopSpec{Method: "POST", Path: "/expect?echo=1", Body: "with expect",
+		got := p.ok(t, interopSpec{Method: "POST", Path: "/expect?echo=1", Body: "with expect",
 			Header: map[string][]string{"Expect": {"100-continue"}}})
 		if got.Body != "with expect" {
 			t.Fatalf("body %q", got.Body)
@@ -444,7 +443,7 @@ func TestHTTP3ConformanceServer(t *testing.T) {
 	})
 
 	t.Run("ExpectationFailed", func(t *testing.T) {
-		got := p.do(interopSpec{Method: "POST", Path: "/expect", Body: "x",
+		got := p.do(t, interopSpec{Method: "POST", Path: "/expect", Body: "x",
 			Header: map[string][]string{"Expect": {"something-else"}}})
 		if got.Status != stdhttp.StatusExpectationFailed {
 			t.Fatalf("status %d (%s)", got.Status, got.Error)
@@ -452,14 +451,14 @@ func TestHTTP3ConformanceServer(t *testing.T) {
 	})
 
 	t.Run("BodyTooLarge", func(t *testing.T) {
-		got := p.do(interopSpec{Method: "POST", Path: "/big", BodySize: 9 << 20})
+		got := p.do(t, interopSpec{Method: "POST", Path: "/big", BodySize: 9 << 20})
 		if got.Status != stdhttp.StatusRequestEntityTooLarge {
 			t.Fatalf("status %d (%s)", got.Status, got.Error)
 		}
 	})
 
 	t.Run("HeaderTooLarge", func(t *testing.T) {
-		got := p.do(interopSpec{Path: "/hdr", Header: map[string][]string{
+		got := p.do(t, interopSpec{Path: "/hdr", Header: map[string][]string{
 			"X-Echo-Big": {strings.Repeat("v", 20<<10)},
 		}})
 		if got.Status != stdhttp.StatusRequestHeaderFieldsTooLarge && got.Error == "" {
@@ -469,7 +468,7 @@ func TestHTTP3ConformanceServer(t *testing.T) {
 
 	t.Run("StatusCodes", func(t *testing.T) {
 		for _, status := range []int{201, 301, 404, 418, 500} {
-			got := p.do(interopSpec{Path: "/s?status=" + strconv.Itoa(status)})
+			got := p.do(t, interopSpec{Path: "/s?status=" + strconv.Itoa(status)})
 			if got.Status != status {
 				t.Fatalf("status %d, want %d", got.Status, status)
 			}
@@ -478,7 +477,7 @@ func TestHTTP3ConformanceServer(t *testing.T) {
 
 	t.Run("StillServing", func(t *testing.T) {
 		// Everything above left the connection usable.
-		got := p.ok(interopSpec{Path: "/last?echo=1", Body: "alive"})
+		got := p.ok(t, interopSpec{Path: "/last?echo=1", Body: "alive"})
 		if got.Body != "alive" {
 			t.Fatalf("body %q", got.Body)
 		}
@@ -667,7 +666,7 @@ func TestHTTP3ConformanceClientGoAway(t *testing.T) {
 	}
 	slow := client.Go(mustRequest(t, stdhttp.MethodGet, url+"/slow?delay=500&size=32", nil))
 	time.Sleep(100 * time.Millisecond)
-	if result := p.do(interopSpec{Command: "shutdown"}); result.Error != "" {
+	if result := p.do(t, interopSpec{Command: "shutdown"}); result.Error != "" {
 		t.Fatalf("shutdown: %s", result.Error)
 	}
 	resp, err := slow.Wait()
