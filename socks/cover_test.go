@@ -981,21 +981,44 @@ func TestServerUDPTargets(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 
+	// The dial waits until the proxy has taken in every datagram: one sent
+	// to another destination after them, which the proxy reads after them
+	// from the same peer, has had its own dial started. A fixed pause was not
+	// enough on a loaded Windows runner, where datagrams that arrived once
+	// the dial was open went straight through: 22 answers to 32.
 	g2 := newGate()
 	proxyAddr, _ = proxy(t, Config{Dial: g2.dial})
 	u = associate(t, proxyAddr, false)
 	for i := 0; i < 2*maxWaitingDatagrams; i++ {
 		u.send(first, "w")
 	}
-	<-g2.dialed
-	time.Sleep(50 * time.Millisecond)
+	if addr := <-g2.dialed; addr != first {
+		t.Fatalf("dialed %s first, want %s", addr, first)
+	}
+	deadline := time.After(testTimeout)
+	for marked := false; !marked; {
+		u.send(second, "marker")
+		select {
+		case addr := <-g2.dialed:
+			if addr != second {
+				t.Fatalf("dialed %s, want %s", addr, second)
+			}
+			marked = true
+		case <-time.After(100 * time.Millisecond):
+		case <-deadline:
+			t.Fatal("the datagram after the waiting ones never reached the proxy")
+		}
+	}
 	close(g2.open)
 	answers := 0
 	for {
-		if _, ok := u.recv(200 * time.Millisecond); !ok {
+		got, ok := u.recv(200 * time.Millisecond)
+		if !ok {
 			break
 		}
-		answers++
+		if got == "echo:w" {
+			answers++
+		}
 	}
 	if answers == 0 || answers > maxWaitingDatagrams {
 		t.Fatalf("%d answers to %d datagrams that waited", answers, 2*maxWaitingDatagrams)
