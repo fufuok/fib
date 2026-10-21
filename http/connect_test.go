@@ -457,6 +457,71 @@ func TestConnectProxyTargetGoneFirst(t *testing.T) {
 	}
 }
 
+// The handler returns while the dial is under way, and the dial's callback
+// answers the request.
+func TestConnectProxyDoesNotWait(t *testing.T) {
+	target := echoServer(t)
+	returned := make(chan struct{})
+	connect := NewConnectProxy(ConnectProxyConfig{
+		Dial: func(engine *fib.Engine, network, addr string, timeout time.Duration, h fib.Handler,
+			done func(*fib.Connection, error)) error {
+			go func() {
+				// A handler that waited for the dial would never return.
+				select {
+				case <-returned:
+				case <-time.After(10 * time.Second):
+				}
+				if err := engine.DialWithHandler(network, addr, timeout, h, done); err != nil {
+					done(nil, err)
+				}
+			}()
+			return nil
+		},
+	})
+	proxy := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		connect.ServeHTTP(c)
+		if c.Request.Method == stdhttp.MethodConnect {
+			close(returned)
+		}
+	})))
+	conn, line := connectThrough(t, proxy, target, "")
+	if line != "HTTP/1.1 200 OK" {
+		t.Fatalf("status %q", line)
+	}
+	select {
+	case <-returned:
+	default:
+		t.Fatal("answered before the handler returned")
+	}
+	_, _ = conn.Write([]byte("through"))
+	readFull(t, conn, "through")
+}
+
+// A tunnel that carries something more often than its idle timeout stays
+// open, and one silent for longer is closed, with its target.
+func TestConnectProxyIdleTimeout(t *testing.T) {
+	const idle = 300 * time.Millisecond
+	target := echoServer(t)
+	proxy := serve(t, NewHandler(NewConnectProxy(ConnectProxyConfig{IdleTimeout: idle})))
+	conn, line := connectThrough(t, proxy, target, "")
+	if line != "HTTP/1.1 200 OK" {
+		t.Fatalf("status %q", line)
+	}
+	for range 6 {
+		time.Sleep(idle / 3)
+		_, _ = conn.Write([]byte("x"))
+		readFull(t, conn, "x")
+	}
+	start := time.Now()
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if n, err := conn.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("read %d bytes (%v) from an idle tunnel", n, err)
+	}
+	if waited := time.Since(start); waited < idle/2 || waited > 5*idle {
+		t.Fatalf("closed after %v, want about %v", waited, idle)
+	}
+}
+
 // closeWatch is a handler that says when its connection has closed.
 type closeWatch struct {
 	fib.Handler

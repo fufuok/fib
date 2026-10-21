@@ -660,6 +660,29 @@ func TestRelayBackpressure(t *testing.T) {
 	}
 }
 
+// A relay that carries something more often than its idle timeout stays
+// open, and one silent for longer is closed on both sides.
+func TestRelayIdleTimeout(t *testing.T) {
+	const idle = 300 * time.Millisecond
+	proxyAddr, _ := proxy(t, Config{IdleTimeout: idle})
+	target := echo(t)
+	conn := dialRaw(t, proxyAddr)
+	write(t, conn, append([]byte{5, 1, 0, 5, 1, 0}, addr5(t, target)...))
+	readN(t, conn, 12)
+	for range 6 {
+		time.Sleep(idle / 3)
+		write(t, conn, []byte("x"))
+		expect(t, conn, []byte("x"))
+	}
+	start := time.Now()
+	if n, err := conn.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("read %d bytes (%v) from an idle relay", n, err)
+	}
+	if waited := time.Since(start); waited < idle/2 || waited > 5*idle {
+		t.Fatalf("closed after %v, want about %v", waited, idle)
+	}
+}
+
 // When the destination closes, the client is closed once what the
 // destination sent has reached it.
 func TestRelayCloses(t *testing.T) {

@@ -60,6 +60,9 @@ type Config struct {
 	// socket open to; one more closes the one opened longest ago. Zero means
 	// DefaultMaxUDPTargets.
 	MaxUDPTargets int
+	// IdleTimeout closes both sides of a relayed CONNECT once nothing has
+	// gone either way for this long. Zero or less means no idle timeout.
+	IdleTimeout time.Duration
 }
 
 // Request is a client's request, as Config.Allow sees it.
@@ -477,7 +480,7 @@ func (s *Server) serve(sc *serverConn, req *Request) {
 // connect dials a CONNECT's destination. The destination's handler answers
 // the client once it is open, before it can relay anything.
 func (s *Server) connect(sc *serverConn, req *Request) {
-	t := &tunnel{sc: sc, client: sc.c, limit: int64(s.config.MaxQueuedBytes)}
+	t := &tunnel{sc: sc, client: sc.c, limit: int64(s.config.MaxQueuedBytes), idle: s.config.IdleTimeout}
 	err := s.config.Dial(sc.c.Engine(), "tcp", req.Addr, s.config.DialTimeout, (*tunnelTarget)(t),
 		func(_ *fib.Connection, err error) {
 			if err != nil {
@@ -520,6 +523,7 @@ func (sc *serverConn) opened(tun *tunnel, t *fib.Connection) {
 	// what the client sent early before anything it sends later: a round of
 	// the client's takes the lock before it relays.
 	sc.reply(ReplySucceeded, t.LocalAddr())
+	tun.startIdle()
 	holding := len(early) > 0 && tun.forward(sc.c, t, early)
 	sc.mu.Unlock()
 	if held && !holding {

@@ -51,6 +51,10 @@ type ConnectProxyConfig struct {
 	// side, so that a fast sender is held back by flow control rather than
 	// by memory here. Zero means DefaultConnectMaxQueuedBytes.
 	MaxQueuedBytes int
+	// IdleTimeout closes a tunnel and its connection to the target once
+	// nothing has gone either way for this long. Zero or less means no idle
+	// timeout.
+	IdleTimeout time.Duration
 	// Next serves the requests that are not CONNECTs to a host and port, an
 	// extended CONNECT among them. Nil answers them with 405 Method Not
 	// Allowed.
@@ -70,7 +74,8 @@ type ConnectProxyConfig struct {
 // http:// URL a client sends a proxy whole, in absolute form, rather than
 // through CONNECT, and is Next's to serve.
 //
-// Its handler waits for the dial, on the goroutine serving the request.
+// Its handler does not wait for the dial: it retains the request, returns,
+// and the dial's callback answers it.
 type ConnectProxy struct {
 	config ConnectProxyConfig
 }
@@ -120,13 +125,19 @@ func (p *ConnectProxy) ServeHTTP(c *Context) {
 		p.answer(c, stdhttp.StatusForbidden, nil)
 		return
 	}
-	relay := &connectRelay{limit: p.config.MaxQueuedBytes}
-	dialed := make(chan error, 1)
-	err := p.config.Dial(c.Conn.Engine(), "tcp", target, p.config.DialTimeout, (*relayTarget)(relay),
-		func(_ *fib.Connection, err error) { dialed <- err })
-	if err == nil {
-		err = <-dialed
+	relay := &connectRelay{limit: p.config.MaxQueuedBytes, idle: p.config.IdleTimeout}
+	// The request is answered once the dial is done, from its callback.
+	c.Retain()
+	if err := p.config.Dial(c.Conn.Engine(), "tcp", target, p.config.DialTimeout, (*relayTarget)(relay),
+		func(_ *fib.Connection, err error) { p.dialed(c, relay, err) }); err != nil {
+		p.dialed(c, relay, err)
 	}
+}
+
+// dialed answers the request c, retained while its target was dialed, once
+// the dial is done: the tunnel opens, or err says why it could not.
+func (p *ConnectProxy) dialed(c *Context, relay *connectRelay, err error) {
+	defer c.Release()
 	if err != nil {
 		status := stdhttp.StatusBadGateway
 		var netErr net.Error
@@ -195,6 +206,15 @@ type connectRelay struct {
 	limit  int
 	target *fib.Connection
 
+	// idle, when set, closes both sides once nothing has gone either way
+	// for that long: last is when something last did, in Unix nanoseconds,
+	// and timer, set under mu, looks at it from the tunnel's open until a
+	// side closes.
+	idle  time.Duration
+	last  atomic.Int64
+	timer *time.Timer
+	ended atomic.Bool
+
 	holdingTarget, holdingClient atomic.Bool
 
 	mu sync.Mutex
@@ -202,6 +222,45 @@ type connectRelay struct {
 	// closed: the second of the two to happen ends the tunnel.
 	tunnel       *Tunnel
 	targetClosed bool
+}
+
+// touch records that something went through the relay, for its idle
+// timeout.
+func (r *connectRelay) touch() {
+	if r.idle > 0 {
+		r.last.Store(time.Now().UnixNano())
+	}
+}
+
+// checkIdle closes a relay that carried nothing for the idle timeout, and
+// looks again when it last carried something otherwise.
+func (r *connectRelay) checkIdle() {
+	if r.ended.Load() {
+		return
+	}
+	since := time.Since(time.Unix(0, r.last.Load()))
+	r.mu.Lock()
+	t, timer := r.tunnel, r.timer
+	r.mu.Unlock()
+	if since >= r.idle {
+		_ = t.Close()
+		r.target.Close()
+		return
+	}
+	timer.Reset(r.idle - since)
+}
+
+// stopIdle stops the idle timeout once a side has closed.
+func (r *connectRelay) stopIdle() {
+	if !r.ended.CompareAndSwap(false, true) {
+		return
+	}
+	r.mu.Lock()
+	timer := r.timer
+	r.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
 }
 
 // relayTarget is the handler of the connection to the target.
@@ -216,6 +275,7 @@ func (h *relayTarget) OnOpen(c *fib.Connection) {
 // OnData sends what the target sent through the tunnel, and holds the
 // target's reads while the tunnel has more than the limit to send.
 func (h *relayTarget) OnData(c *fib.Connection, data []byte) {
+	(*connectRelay)(h).touch()
 	t := h.tunnel
 	if t.Send(data) != nil || t.Unsent() <= h.limit || !h.holdingTarget.CompareAndSwap(false, true) {
 		// A tunnel that has ended closes the target from OnTunnelClose.
@@ -232,6 +292,7 @@ func (h *relayTarget) OnData(c *fib.Connection, data []byte) {
 func (h *relayTarget) OnPriorityData(*fib.Connection, []byte) {}
 
 func (h *relayTarget) OnClose(*fib.Connection, error) {
+	(*connectRelay)(h).stopIdle()
 	h.mu.Lock()
 	h.targetClosed = true
 	t := h.tunnel
@@ -248,6 +309,10 @@ func (h *relayClient) OnTunnelOpen(t *Tunnel) {
 	h.mu.Lock()
 	h.tunnel = t
 	closed := h.targetClosed
+	if !closed && h.idle > 0 {
+		h.last.Store(time.Now().UnixNano())
+		h.timer = time.AfterFunc(h.idle, (*connectRelay)(h).checkIdle)
+	}
 	h.mu.Unlock()
 	if closed {
 		t.CloseAfterSend()
@@ -263,6 +328,7 @@ func (h *relayClient) OnTunnelOpen(t *Tunnel) {
 // OnTunnelData sends what the client sent to the target, and holds the
 // tunnel's reads while the target has more than the limit queued.
 func (h *relayClient) OnTunnelData(t *Tunnel, data []byte) {
+	(*connectRelay)(h).touch()
 	target := h.target
 	if target.Send(data) != nil || outputwait.Pending == nil || outputwait.Pending(target) <= int64(h.limit) ||
 		!h.holdingClient.CompareAndSwap(false, true) {
@@ -277,4 +343,7 @@ func (h *relayClient) OnTunnelData(t *Tunnel, data []byte) {
 	}()
 }
 
-func (h *relayClient) OnTunnelClose(*Tunnel, error) { h.target.CloseAfterSend() }
+func (h *relayClient) OnTunnelClose(*Tunnel, error) {
+	(*connectRelay)(h).stopIdle()
+	h.target.CloseAfterSend()
+}
