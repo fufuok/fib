@@ -297,7 +297,9 @@ handles it:
   **cancelled**: nothing more is written, the remaining references are void, and you are told
   **once**.
 - A handler using `OnBody` gets `err` in the callback; an async handler that only `Retain`s uses
-  `Context.OnCancel(func(error))`; you can also poll `Context.Err()`.
+  `Context.OnCancel(func(error))`; you can also poll `Context.Err()`. Every callback registered
+  is kept, and they run in the reverse of the order they were registered, so a middleware and
+  the handler inside it can each register one.
 - The notification runs on the Engine's handler pool, not on the event loop, so it cannot hold
   the server back.
 

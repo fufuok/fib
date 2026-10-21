@@ -298,7 +298,11 @@ func(c *fibhttp.Context) {
   accept an upload larger than the server will hold — `MaxStreamedBodyBytes`
   does, and zero leaves it unbounded. Growing past it fails the `Read` with
   `ErrBodyTooLarge` and ends the connection; a declared `Content-Length` past
-  it is refused with 413 before the handler runs.
+  it is refused with 413 before the handler runs. A handler or middleware
+  bounds one request's body lower with `Context.LimitBody(n)`: a body known
+  to be past `n` already is refused at once with 413, and one of no declared
+  length is ended past `n` as past `MaxStreamedBodyBytes`; a request so ended
+  and left unanswered is answered with 413.
 - **Pipelining.** A request behind a streamed one is parsed only once that
   request's response has been written, so responses keep their order.
 - **A body the handler did not read** is taken off the connection and dropped,

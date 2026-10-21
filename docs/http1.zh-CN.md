@@ -231,7 +231,9 @@ func(c *fibhttp.Context) {
 - **大小限制**：`MaxBodyBytes` 不再约束流式 body（流式的意义就是接受超过服务端内存的
   上传），改由 `MaxStreamedBodyBytes` 约束，为 0 表示不限。超限时 `Read` 返回
   `ErrBodyTooLarge` 并关闭连接；`Content-Length` 一开始就超限的请求在 handler 之前就用
-  413 拒绝。
+  413 拒绝。handler 或中间件可以用 `Context.LimitBody(n)` 给单个请求的 body 设更低的上限：
+  已知超过 `n` 的 body 立即以 413 拒绝，长度未知的 body 超过 `n` 时像超过
+  `MaxStreamedBodyBytes` 一样被结束；这样结束、又没有被回复的请求由服务端回复 413。
 - **pipelining**：排在流式请求后面的请求要等它的响应写完之后才解析，响应顺序不变。
 - **handler 没读完的 body** 会被读掉丢弃，最多 256KB，连接继续复用；超过这个量（或者
   长度未知的 chunked body）则在响应发完后关闭连接，与 `net/http` 一致。

@@ -69,7 +69,7 @@ func (r *StreamRequest) streamBody(c *Context, config BodyFeedConfig) *BodyFeed 
 	s := &BodyStream{
 		request:      &r.Request,
 		remaining:    -1,
-		limit:        config.Limit,
+		limit:        streamLimit(config.Limit),
 		highWater:    math.MaxInt,
 		wantContinue: config.Continue != nil,
 		sendContinue: config.Continue,
@@ -136,7 +136,7 @@ func (f *BodyFeed) Write(data []byte) error {
 	switch {
 	case f.declared >= 0 && s.total > f.declared:
 		err = ErrBodyOverrun
-	case s.limit > 0 && s.total > s.limit:
+	case s.limit >= 0 && s.total > s.limit:
 		err = ErrBodyTooLarge
 	}
 	s.mu.Unlock()

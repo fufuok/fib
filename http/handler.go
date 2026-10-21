@@ -351,6 +351,80 @@ func (c *Context) HoldBody(hold bool) {
 	}
 }
 
+// LimitBody bounds the request's body to n bytes, for a handler or
+// middleware that takes less than the server's limits allow: the lower of n
+// and the server's own limit applies, MaxBodyBytes for a body read whole
+// before the handler ran and MaxStreamedBodyBytes for one that streams. Call
+// it before the body is taken, on the goroutine that serves the request and
+// before anything answers it. A negative n does nothing.
+//
+// A body known to be longer already is refused at once: one that declared a
+// Content-Length past n, one that arrived whole and is longer, and one that
+// streams and has brought more than n bytes so far. LimitBody then answers
+// the request with 413 Request Entity Too Large, unless a response has been
+// begun, ends the body with ErrBodyTooLarge, which a reader or an OnBody
+// callback finds, and returns ErrBodyTooLarge; an HTTP/1 connection closes
+// after the response, since the rest of the body is still on its way, and
+// HTTP/2 and HTTP/3 refuse the rest of the stream. Otherwise it returns nil.
+//
+// A body of no declared length, HTTP/1's chunked and HTTP/2's and HTTP/3's
+// without the field, is ended once it grows past n, with ErrBodyTooLarge,
+// which Read reports and OnBody's callback is told, as for one past
+// MaxStreamedBodyBytes. A request whose body ended that way and that is let
+// go unanswered is answered with 413 rather than the empty 200 an unanswered
+// request gets.
+func (c *Context) LimitBody(n int64) error {
+	if n < 0 || c.Request == nil {
+		return nil
+	}
+	stream := c.RequestBody()
+	var over bool
+	switch {
+	case stream != nil:
+		// Both are checked: a declared length is refused whole, before any
+		// of it arrives, and what has arrived already of one that is not
+		// declared counts towards n.
+		over = stream.limitTo(n) || c.Request.ContentLength > n
+	case c.whole != nil && !c.whole.released:
+		over = int64(len(c.whole.data)) > n
+	default:
+		over = c.Request.ContentLength > n
+	}
+	if !over {
+		return nil
+	}
+	if stream != nil {
+		// The body fails first, so that the handler hears why it ended
+		// rather than that the response, written before it arrived, gave it
+		// up.
+		stream.failElsewhere(ErrBodyTooLarge)
+	}
+	if !c.begun() {
+		// The rest of a streamed body is still on its way, and an HTTP/1
+		// connection ends rather than read it, lingering so that the client
+		// reads the refusal. HTTP/2 and HTTP/3 refuse the rest of the stream
+		// alone.
+		closing := stream != nil && c.isHTTP1()
+		if closing {
+			c.ends |= endLingers
+		}
+		_ = c.WriteResponse(Response{
+			StatusCode: stdhttp.StatusRequestEntityTooLarge,
+			Header:     stdhttp.Header{"Content-Type": {"text/plain; charset=utf-8"}},
+			Body:       []byte(stdhttp.StatusText(stdhttp.StatusRequestEntityTooLarge) + "\n"),
+			Close:      closing,
+		})
+	}
+	return ErrBodyTooLarge
+}
+
+// bodyTooLarge reports whether the request's body streamed and was ended for
+// growing past its limit.
+func (c *Context) bodyTooLarge() bool {
+	stream := c.RequestBody()
+	return stream != nil && errors.Is(stream.failure(), ErrBodyTooLarge)
+}
+
 // closeAfterResponse ends the HTTP/1 connection behind the response, with a
 // lingering close if the request's body is still arriving.
 func (c *Context) closeAfterResponse() {

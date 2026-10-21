@@ -120,7 +120,7 @@ type BodyStream struct {
 	remaining int64
 	decoder   *chunkedDecoder
 	// total is how much of the body has been taken off the connection, which
-	// limit bounds; zero means unbounded.
+	// limit bounds; below zero means unbounded (see streamLimit).
 	total int64
 	limit int64
 	// highWater is how many unread bytes make the connection hold its reads,
@@ -352,7 +352,7 @@ func newBodyStream(conn *fib.Connection, request *stdhttp.Request, config Config
 		request:      request,
 		remaining:    -1,
 		decoder:      decoder,
-		limit:        config.MaxStreamedBodyBytes,
+		limit:        streamLimit(config.MaxStreamedBodyBytes),
 		highWater:    highWater,
 		wantContinue: wantContinue,
 		maxHold:      maxBodyHold(config.MaxBodyHold),
@@ -724,7 +724,8 @@ func (s *BodyStream) keepScratch(b []byte) { s.scratch = b }
 // lives under the lock because abandon reads it from the handler's goroutine
 // while the connection's worker is still delivering. It needs no check
 // against MaxStreamedBodyBytes: a Content-Length over it is refused before
-// the body streams, and no more than that length is ever claimed.
+// the body streams, and so is one over a limit LimitBody sets, and no more
+// than that length is ever claimed.
 func (s *BodyStream) reserve(n int) (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -736,13 +737,34 @@ func (s *BodyStream) reserve(n int) (int, bool) {
 	return n, s.remaining == 0
 }
 
+// limitTo lowers the body's limit to n, unless it is lower already, and
+// reports whether more than n bytes of it have arrived already.
+func (s *BodyStream) limitTo(n int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.limit < 0 || n < s.limit {
+		s.limit = n
+	}
+	return s.total > n
+}
+
+// streamLimit is a body's limit from a configured one, where zero or less
+// means none: the stream keeps -1 for none, so that LimitBody may bound a
+// body to nothing.
+func streamLimit(n int64) int64 {
+	if n <= 0 {
+		return -1
+	}
+	return n
+}
+
 // account adds n bytes to a chunked body and reports whether it has outgrown
 // the configured limit.
 func (s *BodyStream) account(n int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.total += n
-	if s.limit > 0 && s.total > s.limit {
+	if s.limit >= 0 && s.total > s.limit {
 		return ErrBodyTooLarge
 	}
 	return nil

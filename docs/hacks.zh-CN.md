@@ -262,7 +262,8 @@ c.OnBody(func(data []byte, fin bool, err error) {
 - 连接断开、读超时、body 收不完 → 请求被**取消**：不再写出任何东西，剩余引用全部作废，
   你只被告知**一次**。
 - 用了 `OnBody` 的 handler 在回调里收到 `err`；只 `Retain`、不用 `OnBody` 的异步 handler 用
-  `Context.OnCancel(func(error))`；也可以主动查 `Context.Err()`。
+  `Context.OnCancel(func(error))`；也可以主动查 `Context.Err()`。注册的每个回调都会保留，
+  按注册的逆序执行，所以中间件和它里面的 handler 可以各注册一个。
 - 通知在 Engine 的 handler 池上执行，不在事件循环上，拖不住服务端。
 
 ```go

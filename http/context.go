@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"net"
+	stdhttp "net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -250,7 +251,7 @@ func (c *Context) recycle() {
 	c.bodyHeld, c.handover = false, nil
 	if h := c.cancel.Load(); h != nil {
 		// Kept for the next request, which is as likely to want it.
-		*h = cancelHooks{}
+		h.reset()
 	}
 	c.server, c.parser, c.whole, c.block = nil, nil, nil, nil
 	if st := c.route; st != nil {
@@ -445,13 +446,18 @@ func (c *Context) Err() error {
 // body through OnBody hears the same thing there and needs no second
 // callback.
 //
-// fn runs once, on the engine's handler pool rather than in the connection's
-// round, and
-// never after the response has been written. It still has to Release what it
-// retained. Nothing more is written then, but the request, its body and the
-// Context stay the handler's until it has, and are recycled or given back
-// only after its last Release.
-// Registering it on a request that has already ended runs it at once.
+// Every callback registered is kept, and they run in the reverse of the order
+// they were registered, as the OnFinish hooks do, so that a middleware which
+// registers one before calling the handler hears of the cancellation after
+// the handler's own, as it would have left the request.
+//
+// Each fn runs once, on the engine's handler pool rather than in the
+// connection's round, and never after the response has been written. It still
+// has to Release what it retained. Nothing more is written then, but the
+// request, its body and the Context stay the handler's until it has, and are
+// recycled or given back only after its last Release.
+// Registering it on a request that has already ended runs it at once, and
+// registering it once the response has been written does nothing.
 func (c *Context) OnCancel(fn func(error)) {
 	if fn == nil {
 		return
@@ -469,21 +475,64 @@ func (c *Context) OnCancel(fn func(error)) {
 		c.mu.Unlock()
 		return
 	}
-	c.hooks().fn = fn
+	if h := c.hooks(); h.fn == nil {
+		h.fn = fn
+	} else {
+		h.add(fn)
+	}
 	c.mu.Unlock()
 }
 
-// cancelHooks is what hears of a request ending: OnCancel's callback, and the
-// context Context handed out with what cancels it, once. They share a pointer
-// so that a Context, which every HTTP/2 and HTTP/3 stream carries, grows by
-// no more than one word for them.
+// cancelHooks is what hears of a request ending: OnCancel's callbacks, and
+// the context Context handed out with what cancels it, once. They share a
+// pointer so that a Context, which every HTTP/2 and HTTP/3 stream carries,
+// grows by no more than one word for them.
 type cancelHooks struct {
+	// fn is the first OnCancel callback, and more those registered after it,
+	// so that a request with one callback, the common case, keeps it in a
+	// field and makes no slice for it. more is a pointer so that the hooks,
+	// which a recycled Context clears on every request, grow by a word only.
 	fn   func(error)
+	more *[]func(error)
 	ctx  context.Context
 	stop context.CancelCauseFunc
 	// value is what SetValue set, which lives here rather than in Context;
 	// see SetValue.
 	value any
+}
+
+// reset clears the hooks for the Context's next request, keeping the room
+// more grew to for one that registers as many callbacks.
+func (h *cancelHooks) reset() {
+	more := h.more
+	*h = cancelHooks{}
+	if more != nil {
+		clear(*more)
+		*more = (*more)[:0]
+		h.more = more
+	}
+}
+
+// add keeps a callback past the first.
+func (h *cancelHooks) add(fn func(error)) {
+	if h.more == nil {
+		h.more = &[]func(error){fn}
+		return
+	}
+	*h.more = append(*h.more, fn)
+}
+
+// runCancel runs the callbacks OnCancel registered, in the reverse of the
+// order they were registered.
+func runCancel(fn func(error), more *[]func(error), err error) {
+	if more != nil {
+		for i := len(*more) - 1; i >= 0; i-- {
+			(*more)[i](err)
+		}
+	}
+	if fn != nil {
+		fn(err)
+	}
 }
 
 // hooks returns the Context's cancelHooks, made the first time they are
@@ -915,8 +964,13 @@ func (c *Context) giveBack(returning bool) {
 		if !c.wrote && (c.w == nil || c.w.status == 0) {
 			// The last hold went without the request being answered, at the
 			// handler's return or at a Release, and there is no one left to
-			// answer it: as net/http does, that is an empty 200.
-			c.WriteHeader(200)
+			// answer it: as net/http does, that is an empty 200, or a 413
+			// for a body ended for growing past its limit; see LimitBody.
+			status := stdhttp.StatusOK
+			if c.bodyTooLarge() {
+				status = stdhttp.StatusRequestEntityTooLarge
+			}
+			c.WriteHeader(status)
 		}
 		_ = c.Finish()
 		if !returning && c.Conn != nil {
@@ -1035,11 +1089,14 @@ func (c *Context) cancelWith(err error, gen uint64) {
 	}
 	c.err = err
 	var onCancel func(error)
+	var more *[]func(error)
 	var stop context.CancelCauseFunc
 	if h := c.cancel.Load(); h != nil {
-		// The context stays, for a Context asked for again to return.
-		onCancel, stop = h.fn, h.stop
-		h.fn, h.stop = nil, nil
+		// The context stays, for a Context asked for again to return. The
+		// callbacks run outside the lock, so more is handed over whole rather
+		// than kept for the next request: one cancelled is the rare case.
+		onCancel, more, stop = h.fn, h.more, h.stop
+		h.fn, h.more, h.stop = nil, nil, nil
 	}
 	c.mu.Unlock()
 	c.forget()
@@ -1058,9 +1115,7 @@ func (c *Context) cancelWith(err error, gen uint64) {
 		}
 		c.deliverBody(nil, true, bodyErr, false)
 	}
-	if onCancel != nil {
-		onCancel(err)
-	}
+	runCancel(onCancel, more, err)
 	done := ctxCancelling
 	if owed {
 		done |= ctxConn
