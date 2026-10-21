@@ -102,6 +102,49 @@ func TestCreateUDPRefusesAHeldPort(t *testing.T) {
 	}
 }
 
+// A UDP address that leaves its port to the kernel is given one no other
+// socket holds, with ReusePort or without, although the engine's UDP sockets
+// set SO_REUSEADDR and those with ReusePort SO_REUSEPORT too: Linux's UDP
+// autobind counts a port shared through those as free, and handed two test
+// processes running at once the same port, the datagrams of one's clients
+// reaching the other's server. TCP listeners, spread or not, are held to the
+// same, which Create's claim relies on.
+func TestPortLeftToTheKernelIsUnique(t *testing.T) {
+	// Enough sockets that among the ports of the ephemeral range two would
+	// all but certainly meet, were the kernel to give out held ones.
+	const sockets = 1000
+	create := map[string]func(o Options) (int, error){
+		"udp": func(o Options) (int, error) { return CreateUDP(o, "127.0.0.1:0") },
+		"tcp": func(o Options) (int, error) { return Create(o, "127.0.0.1:0", true, false) },
+		"tcp spread": func(o Options) (int, error) {
+			return Create(o, "127.0.0.1:0", false, true)
+		},
+	}
+	for name, open := range create {
+		for _, reusePort := range []bool{false, true} {
+			o := Options{Network: name[:3] + "4", Backlog: 16, ReusePort: reusePort}
+			held := make(map[int]bool, sockets)
+			var fds []int
+			for range sockets {
+				fd, err := open(o)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fds = append(fds, fd)
+				port := boundPort(t, fd)
+				if held[port] {
+					t.Errorf("%s, ReusePort %v: port %d was given out twice", name, reusePort, port)
+					break
+				}
+				held[port] = true
+			}
+			for _, fd := range fds {
+				syscall.Close(fd)
+			}
+		}
+	}
+}
+
 // The ...Like constructors fail cleanly on a descriptor that is not a socket,
 // and the socket constructors on a family the system does not have.
 func TestListenerErrorsOnBadInput(t *testing.T) {

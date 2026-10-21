@@ -162,16 +162,27 @@ func CreateUDPLike(o Options, like int) (int, error) {
 	return bindUDPSocket(o, family, bound)
 }
 
+// bindUDPSocket binds a UDP socket to bound. A port left to the kernel is
+// bound with neither SO_REUSEADDR nor SO_REUSEPORT: Linux's UDP autobind
+// counts a port held only by sockets that set them, SO_REUSEPORT ones of the
+// same user and SO_REUSEADDR ones of anyone, as free when the new socket sets
+// them too, and gives it out again, so that two servers, of this process or
+// of another, share the port and split its datagrams between them.
+// SO_REUSEPORT is set once the port is bound, for the pollers' sockets to
+// join it with CreateUDPLike.
 func bindUDPSocket(o Options, family int, bound syscall.Sockaddr) (int, error) {
 	fd, err := sys.NewDatagramSocket(family)
 	if err != nil {
 		return -1, err
 	}
-	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-	if o.ReusePort {
-		if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, sys.SoReusePort, 1); err != nil {
-			syscall.Close(fd)
-			return -1, err
+	autobind := sockaddrPort(bound) == 0
+	if !autobind {
+		_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+		if o.ReusePort {
+			if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, sys.SoReusePort, 1); err != nil {
+				syscall.Close(fd)
+				return -1, err
+			}
 		}
 	}
 	if family == syscall.AF_INET6 {
@@ -181,7 +192,11 @@ func bindUDPSocket(o Options, family int, bound syscall.Sockaddr) (int, error) {
 		}
 		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
 	}
-	if err = syscall.Bind(fd, bound); err != nil {
+	err = syscall.Bind(fd, bound)
+	if err == nil && autobind && o.ReusePort {
+		err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, sys.SoReusePort, 1)
+	}
+	if err != nil {
 		syscall.Close(fd)
 		return -1, err
 	}
