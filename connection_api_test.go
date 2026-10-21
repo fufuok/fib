@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"syscall"
 	"testing"
@@ -358,5 +359,37 @@ func TestDialedConnectionRemoteAddrPort(t *testing.T) {
 	}
 	if g := <-got; g != addr {
 		t.Fatalf("RemoteAddrPort = %s, want %s", g, addr)
+	}
+}
+
+// SetRemoteAddrPort replaces the address a connection reports for its peer,
+// an IPv4 one mapped into IPv6 reported as IPv4, and ignores an address that
+// is not valid.
+func TestSetRemoteAddrPort(t *testing.T) {
+	got := make(chan string, 1)
+	_, addr := startEchoServer(t, DefaultConfig(), HandlerFuncs{
+		Data: func(c *Connection, _ []byte) {
+			c.SetRemoteAddrPort(netip.AddrPort{})
+			before := c.RemoteAddrPort().String()
+			c.SetRemoteAddrPort(netip.MustParseAddrPort("[::ffff:203.0.113.7]:4242"))
+			got <- before + " " + c.RemoteAddrPort().String() + " " + c.RemoteAddr().String()
+		},
+	})
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	want := conn.LocalAddr().String() + " 203.0.113.7:4242 203.0.113.7:4242"
+	select {
+	case g := <-got:
+		if g != want {
+			t.Fatalf("got %q, want %q", g, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no data arrived")
 	}
 }

@@ -140,7 +140,7 @@ type Connection struct {
 	// Guarded by mu.
 	closeCode uint8
 	// peer is the address the connection was accepted from, when accepting
-	// it told; see RemoteAddrPort.
+	// it told, or the one SetRemoteAddrPort gave; see RemoteAddrPort.
 	peer packedAddrPort
 }
 
@@ -193,6 +193,9 @@ const (
 	// still to send, which connectionDeadlines.fileBytes counts, so that
 	// what reads the backlog without the lock knows to look there too.
 	flagFileQueued
+	// flagPeerSet marks a peer address SetRemoteAddrPort gave, in peer, which
+	// RemoteAddr then reports too.
+	flagPeerSet
 )
 
 // attachSeq is the unit of the sequence count kept in the upper half of

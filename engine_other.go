@@ -689,6 +689,8 @@ type Connection struct {
 	// udpIdle, when not zero, is a listener's peer's own idle timeout in
 	// nanoseconds, in place of the engine's; a negative one keeps the peer.
 	udpIdle atomic.Int64
+	// peer is the address SetRemoteAddrPort gave, if it gave one.
+	peer *net.TCPAddr
 }
 
 // SetUDPIdleTimeout sets how long the peer of a UDP listener, which c is, may
@@ -717,12 +719,35 @@ func (c *Connection) Protocol() Protocol {
 	return ProtocolTCP
 }
 
+// SetRemoteAddrPort makes ap the peer's address, which RemoteAddrPort and
+// RemoteAddr report from then on in place of the socket's: the client's
+// that a PROXY protocol header in front of the connection's data names, for
+// a server behind a proxy that sends one. RemoteAddr reports it as a
+// *net.TCPAddr. Call it before anything else reads the address: from the
+// handler that reads the header, before it hands the connection to the one
+// that serves it. An address that is not valid or has a zone is ignored, and
+// so is any on a UDP connection, whose peer is its datagrams' source.
+func (c *Connection) SetRemoteAddrPort(ap netip.AddrPort) {
+	if c.udp || !ap.IsValid() || ap.Addr().Zone() != "" {
+		return
+	}
+	c.peer = net.TCPAddrFromAddrPort(netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()))
+}
+
 // RemoteAddr returns the peer's address.
-func (c *Connection) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
+func (c *Connection) RemoteAddr() net.Addr {
+	if c.peer != nil {
+		return c.peer
+	}
+	return c.conn.RemoteAddr()
+}
 
 // RemoteAddrPort returns the peer's IP address and port, or the zero
 // AddrPort for a peer without one, or with an IPv6 zone.
 func (c *Connection) RemoteAddrPort() netip.AddrPort {
+	if c.peer != nil {
+		return c.peer.AddrPort()
+	}
 	var ap netip.AddrPort
 	switch addr := c.conn.RemoteAddr().(type) {
 	case *net.TCPAddr:

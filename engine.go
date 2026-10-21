@@ -1885,6 +1885,22 @@ func (c *Connection) RemoteAddrPort() netip.AddrPort {
 	return sys.SockaddrAddrPort(sa)
 }
 
+// SetRemoteAddrPort makes ap the peer's address, which RemoteAddrPort and
+// RemoteAddr report from then on in place of the socket's: the client's
+// that a PROXY protocol header in front of the connection's data names, for
+// a server behind a proxy that sends one. RemoteAddr reports it as a
+// *net.TCPAddr. Call it before anything else reads the address: from the
+// handler that reads the header, before it hands the connection to the one
+// that serves it. An address that is not valid or has a zone is ignored, and
+// so is any on a UDP connection, whose peer is its datagrams' source.
+func (c *Connection) SetRemoteAddrPort(ap netip.AddrPort) {
+	if c.udp != nil || !ap.IsValid() || ap.Addr().Zone() != "" {
+		return
+	}
+	c.peer = packAddrPort(netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()))
+	c.flags.set(flagPeerSet, true)
+}
+
 // RemoteAddr returns the peer's address: a *net.UDPAddr for a UDP
 // connection, a *net.UnixAddr for a Unix socket, whose name is empty when the
 // peer never bound one, and a *net.TCPAddr otherwise. It returns nil once the
@@ -1892,6 +1908,9 @@ func (c *Connection) RemoteAddrPort() netip.AddrPort {
 func (c *Connection) RemoteAddr() net.Addr {
 	if c.udp != nil {
 		return c.udp.raddr
+	}
+	if c.flags.has(flagPeerSet) {
+		return net.TCPAddrFromAddrPort(c.peer.unpack())
 	}
 	sa, err := c.peerSockaddr()
 	if err != nil {
