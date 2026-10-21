@@ -145,6 +145,13 @@ func TestH2NewRequestAllocations(t *testing.T) {
 // Release, it reports ErrBodyReleased. That last read keeps the request past
 // its response, which only a server that does not recycle its requests
 // allows, so this one does not.
+//
+// The handler's return is a hold too, so the Release is the last one only
+// once the handler has returned. On a loaded machine the handler's goroutine
+// may not have recorded its return by the time the other one's sleep is over;
+// its return then gives the body back, on its own goroutine, while the read
+// goes on, which is a race and reads EOF, as macOS CI found. So the release
+// waits for the handler to have returned first.
 func TestH2RetainedBodyOutlivesHandler(t *testing.T) {
 	released := make(chan error, 64)
 	config := DefaultConfig()
@@ -153,6 +160,9 @@ func TestH2RetainedBodyOutlivesHandler(t *testing.T) {
 		c.Retain()
 		go func() {
 			time.Sleep(10 * time.Millisecond)
+			for c.word.Load()&ctxServed != 0 {
+				time.Sleep(time.Millisecond)
+			}
 			body, err := io.ReadAll(c.Request.Body)
 			if err != nil {
 				body = []byte(err.Error())
