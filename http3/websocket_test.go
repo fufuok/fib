@@ -27,8 +27,7 @@ type streamReader struct {
 
 func newStreamReader(t *testing.T, r *rawConn, request *quic.Stream) *streamReader {
 	sr := &streamReader{t: t, arrived: make(chan struct{}, 1)}
-	r.mu.Lock()
-	r.onStream = func(s *quic.Stream, data []byte, fin bool) {
+	r.setOnStream(func(s *quic.Stream, data []byte, fin bool) {
 		sr.mu.Lock()
 		switch {
 		case s == request:
@@ -42,8 +41,7 @@ func newStreamReader(t *testing.T, r *rawConn, request *quic.Stream) *streamRead
 		case sr.arrived <- struct{}{}:
 		default:
 		}
-	}
-	r.mu.Unlock()
+	})
 	return sr
 }
 

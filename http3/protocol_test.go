@@ -27,6 +27,26 @@ type rawConn struct {
 	resets    chan uint64
 	// onStream, when set, is handed what arrives on the streams.
 	onStream func(s *quic.Stream, data []byte, fin bool)
+	// early holds what arrived before onStream was set: the server's
+	// control stream can come right after the handshake.
+	early []streamData
+}
+
+type streamData struct {
+	s    *quic.Stream
+	data []byte
+	fin  bool
+}
+
+// setOnStream sets onStream and hands it what arrived before, in order.
+func (r *rawConn) setOnStream(f func(s *quic.Stream, data []byte, fin bool)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onStream = f
+	for _, d := range r.early {
+		f(d.s, d.data, d.fin)
+	}
+	r.early = nil
 }
 
 func (r *rawConn) OnOpen(*fib.Connection)                 {}
@@ -47,6 +67,9 @@ func (h rawHandler) OnHandshake(*quic.Conn) { close(h.r.handshake) }
 func (h rawHandler) OnStreamData(s *quic.Stream, data []byte, fin bool) {
 	h.r.mu.Lock()
 	onStream := h.r.onStream
+	if onStream == nil {
+		h.r.early = append(h.r.early, streamData{s, append([]byte(nil), data...), fin})
+	}
 	h.r.mu.Unlock()
 	if onStream != nil {
 		onStream(s, data, fin)
