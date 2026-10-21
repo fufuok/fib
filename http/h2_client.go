@@ -311,11 +311,16 @@ func h2RequestFields(r *clientRequest, secure bool) (fields, trailer []string, e
 	} else {
 		fields = append(fields, ":authority", host)
 	}
-	userAgent := false
+	userAgent, te := false, false
 	for key, values := range req.Header {
 		name := strings.ToLower(key)
-		if h2ConnectionHeaders[name] || name == "host" || name == "content-length" || name == "te" ||
-			name == "trailer" {
+		if name == "te" {
+			// Only "trailers" may go (RFC 9113 section 8.2.2), which gRPC
+			// servers ask of their clients.
+			te = te || slices.ContainsFunc(values, hasTrailersToken)
+			continue
+		}
+		if h2ConnectionHeaders[name] || name == "host" || name == "content-length" || name == "trailer" {
 			continue
 		}
 		if !h2ValidHeaderName(name) {
@@ -331,6 +336,9 @@ func h2RequestFields(r *clientRequest, secure bool) (fields, trailer []string, e
 	}
 	if !userAgent {
 		fields = append(fields, "user-agent", "Go-http-client/2.0")
+	}
+	if te {
+		fields = append(fields, "te", "trailers")
 	}
 	switch {
 	case len(r.body) > 0:
@@ -363,6 +371,16 @@ func h2RequestFields(r *clientRequest, secure bool) (fields, trailer []string, e
 		fields = append(fields, "trailer", strings.Join(declared, ","))
 	}
 	return fields, trailer, nil
+}
+
+// hasTrailersToken reports whether a TE field's value lists "trailers".
+func hasTrailersToken(value string) bool {
+	for item := range strings.SplitSeq(value, ",") {
+		if name, _, _ := strings.Cut(item, ";"); strings.EqualFold(strings.TrimSpace(name), "trailers") {
+			return true
+		}
+	}
+	return false
 }
 
 // cancel abandons r's stream, which the request's timeout or context has

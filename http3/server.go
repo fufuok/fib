@@ -91,6 +91,13 @@ type Config struct {
 	// leave Context.OnBody to the few endpoints that take large bodies. Zero
 	// streams every body as soon as its header has arrived.
 	StreamRequestBodyThreshold int64
+	// StreamRequestBodyAtHeader, with StreamRequestBody, picks requests
+	// whose bodies stream to their handlers as soon as their headers have
+	// arrived, whatever StreamRequestBodyThreshold says, as package http's
+	// Config.StreamRequestBodyAtHeader does. HTTP/3 cannot tell at the
+	// header whether a body follows that declares no content-length, so a
+	// request picked streams even if its body turns out empty.
+	StreamRequestBodyAtHeader func(*stdhttp.Request) bool
 	// MaxStreamedBodyBytes bounds a streamed body, which MaxBodyBytes does
 	// not; zero leaves it unbounded.
 	MaxStreamedBodyBytes int64
@@ -1427,6 +1434,8 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.serveTunnel()
 		return nil
 	}
+	atHeader := rs.streamed != nil && rs.sc.h.config.StreamRequestBodyAtHeader != nil &&
+		rs.sc.h.config.StreamRequestBodyAtHeader(req)
 	if cl := req.Header.Get("Content-Length"); cl != "" {
 		n, err := strconv.ParseInt(cl, 10, 64)
 		if err != nil || n < 0 {
@@ -1434,7 +1443,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 			return nil
 		}
 		config := &rs.sc.h.config
-		streams := rs.streamed != nil && n > config.StreamRequestBodyThreshold
+		streams := rs.streamed != nil && (n > config.StreamRequestBodyThreshold || n > 0 && atHeader)
 		if !streams && n > config.MaxBodyBytes || streams && config.MaxStreamedBodyBytes > 0 && n > config.MaxStreamedBodyBytes {
 			rs.reject(stdhttp.StatusRequestEntityTooLarge)
 			return nil
@@ -1447,7 +1456,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.reject(stdhttp.StatusExpectationFailed)
 		return nil
 	}
-	if rs.streamed != nil && rs.declared > rs.sc.h.config.StreamRequestBodyThreshold &&
+	if atHeader && rs.declared != 0 || rs.streamed != nil && rs.declared > rs.sc.h.config.StreamRequestBodyThreshold &&
 		rs.sc.h.config.StreamRequestBodyThreshold == 0 {
 		// The body streams to the handler, which runs now.
 		rs.startStream(nil)

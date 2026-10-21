@@ -111,6 +111,16 @@ type Config struct {
 	// bodies. Zero streams every body as soon as its header has arrived. It
 	// has no effect without StreamRequestBody.
 	StreamRequestBodyThreshold int64
+	// StreamRequestBodyAtHeader, with StreamRequestBody, picks requests
+	// whose bodies stream to their handlers as soon as their headers have
+	// arrived, whatever StreamRequestBodyThreshold says. It is called once
+	// for each request with a body still to come, on the connection's
+	// worker, with the request as its header made it; a request it reports
+	// true for runs its handler at once. A gRPC call needs this through a
+	// proxy: its client may wait for the answer to a small first message
+	// before it sends the next, and the threshold of its body would never
+	// arrive. Nil, the default, leaves every body to the threshold.
+	StreamRequestBodyAtHeader func(*stdhttp.Request) bool
 	// MaxStreamedBodyBytes bounds a streamed body, which MaxBodyBytes does
 	// not: the point of streaming is to accept an upload larger than the
 	// server is willing to hold in memory. Zero, the default, leaves a
@@ -725,7 +735,8 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 			// (RFC 9112 section 6.3).
 			req.Close = true
 		}
-		if p.config.StreamRequestBody && int64(len(p.buffer)-headerEnd) > p.config.StreamRequestBodyThreshold {
+		if p.config.StreamRequestBody && (int64(len(p.buffer)-headerEnd) > p.config.StreamRequestBodyThreshold ||
+			p.streamAtHeader(req)) {
 			// More has been sent than this server is willing to hold, and a
 			// chunked body never says how much more is coming. Hand the
 			// request over and decode the rest as it arrives.
@@ -746,11 +757,14 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 	if req.ContentLength < 0 {
 		return frameInfo{end: headerEnd, headerEnd: headerEnd, request: req, block: block}, true, nil
 	}
-	if p.config.StreamRequestBody && req.ContentLength > p.config.StreamRequestBodyThreshold {
+	if p.config.StreamRequestBody && (req.ContentLength > p.config.StreamRequestBodyThreshold ||
+		req.ContentLength > 0 && p.streamAtHeader(req)) {
 		if limit := p.config.MaxStreamedBodyBytes; limit > 0 && req.ContentLength > limit {
 			return frameInfo{}, false, ErrBodyTooLarge
 		}
-		if int64(len(p.buffer)-headerEnd) >= p.config.StreamRequestBodyThreshold {
+		// A body no larger than the threshold is here because
+		// StreamRequestBodyAtHeader picked it, and streams at once.
+		if req.ContentLength <= p.config.StreamRequestBodyThreshold || int64(len(p.buffer)-headerEnd) >= p.config.StreamRequestBodyThreshold {
 			return frameInfo{end: headerEnd, headerEnd: headerEnd, stream: true, request: req, block: block}, true, nil
 		}
 		// The handler waits until the threshold of the body has arrived.
@@ -769,6 +783,15 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		return frameInfo{}, false, nil
 	}
 	return frame, true, nil
+}
+
+// streamAtHeader reports whether StreamRequestBodyAtHeader picks req, whose
+// body is still to come, to stream from its header. It is kept out of
+// frameLength, whose requests mostly have no body to ask about.
+//
+//go:noinline
+func (p *Parser) streamAtHeader(req *stdhttp.Request) bool {
+	return p.config.StreamRequestBodyAtHeader != nil && p.config.StreamRequestBodyAtHeader(req)
 }
 
 // expectContinue notes a request, complete but for its body, that waits for

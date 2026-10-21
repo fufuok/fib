@@ -897,13 +897,15 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		sc.serveTunnel(st)
 		return nil
 	}
+	config := &sc.handler.config
+	atHeader := !endStream && config.StreamRequestBody && config.StreamRequestBodyAtHeader != nil &&
+		config.StreamRequestBodyAtHeader(req)
 	if cl := req.Header.Get("Content-Length"); cl != "" {
 		n, err := strconv.ParseInt(cl, 10, 64)
 		if err != nil || n < 0 {
 			return &H2StreamError{StreamID: id, Code: H2ProtocolError}
 		}
-		config := &sc.handler.config
-		streams := config.StreamRequestBody && !endStream && n > config.StreamRequestBodyThreshold
+		streams := config.StreamRequestBody && !endStream && (n > config.StreamRequestBodyThreshold || atHeader)
 		if !streams && n > config.MaxBodyBytes || streams && config.MaxStreamedBodyBytes > 0 && n > config.MaxStreamedBodyBytes {
 			sc.reject(st, stdhttp.StatusRequestEntityTooLarge)
 			return nil
@@ -913,7 +915,7 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	if endStream {
 		return sc.finishRequest(st)
 	}
-	if config := &sc.handler.config; config.StreamRequestBody && st.declared > config.StreamRequestBodyThreshold &&
+	if atHeader || config.StreamRequestBody && st.declared > config.StreamRequestBodyThreshold &&
 		config.StreamRequestBodyThreshold == 0 {
 		// The body streams to the handler, which runs now.
 		sc.streamRequest(st, nil)
@@ -922,7 +924,7 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	// The body is collected, whole or up to the streaming threshold, before
 	// the handler runs: the read timeouts bound that too, from here, and go
 	// on bounding a body that then streams.
-	if at := streamBodyDeadline(&sc.handler.config, time.Now()); !at.IsZero() {
+	if at := streamBodyDeadline(config, time.Now()); !at.IsZero() {
 		sc.mu.Lock()
 		sc.armReadTimerLocked(st, at)
 		sc.mu.Unlock()
