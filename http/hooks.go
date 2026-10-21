@@ -4,6 +4,7 @@ package http
 
 import (
 	stdhttp "net/http"
+	"strconv"
 )
 
 // responseHooks are the callbacks OnHeader, OnResponse and OnFinish
@@ -18,6 +19,9 @@ type responseHooks struct {
 	ran     bool
 	// response is the copy of a whole response the hooks are handed.
 	response Response
+	// filters are what the OnBodyFilter hooks returned for this response,
+	// in the order they run, while its body streams through them.
+	filters []BodyFilter
 }
 
 // responseHook is one registered callback; exactly one of its fields is set.
@@ -25,6 +29,28 @@ type responseHook struct {
 	header   func(status int, header stdhttp.Header)
 	response func(*Response)
 	finish   func(status int, header stdhttp.Header, size int64)
+	filter   func(status int, header stdhttp.Header) BodyFilter
+}
+
+// BodyFilter transforms a response body as it is written, as a compressor
+// does; see Context.OnBodyFilter. Its methods are called one at a time, from
+// the goroutines the response is written on, and must not block.
+type BodyFilter interface {
+	// Filter takes the next part of the body and returns what is sent in its
+	// place, which may be empty, as a compressor's is until it has enough to
+	// emit. The result is sent, or copied, before Filter or Close is called
+	// again, so it may be a buffer of the filter's own that it reuses.
+	Filter(p []byte) ([]byte, error)
+	// Close ends the body and returns what is left to send after it.
+	Close() ([]byte, error)
+}
+
+// BodyFlusher is implemented by a BodyFilter that can hand over what it holds
+// back without ending the body, as a compressor's sync flush does. A
+// streaming response's Flush, and FlushError, send it, so that what the
+// handler flushed reaches the client rather than waiting in the filter.
+type BodyFlusher interface {
+	Flush() ([]byte, error)
 }
 
 // OnHeader registers fn to run once, just before the response's header is
@@ -63,6 +89,35 @@ func (c *Context) OnResponse(fn func(response *Response)) {
 	if fn != nil && !c.begun() {
 		c.addHook(responseHook{response: fn})
 		c.w.hooks.whole = true
+		c.w.hooks.changes = true
+	}
+}
+
+// OnBodyFilter registers fn to run once, as the response's header is
+// settled, with its final status and its header, after the OnHeader hooks
+// registered before it and before those registered after, as they run. fn may
+// change the header, and returns a BodyFilter that every part of the body
+// goes through on its way out, or nil to leave the body as it is. It is how a
+// middleware compresses a response without holding it whole: a response the
+// handler writes through the ResponseWriter methods still streams, as it is
+// written and flushed, and one sent whole, with WriteResponse or Respond, is
+// filtered whole.
+//
+// fn is not called for a response whose status carries no body. For one sent
+// whole, the header it is given has the body's length as its Content-Length,
+// so that fn can tell a short body from a long one. A response
+// it returns a filter for is sent without a Content-Length, the length the
+// handler declared being that of the body before the filter: HTTP/1 frames
+// it with chunks, or with its length when it is sent whole. Nor does a
+// filtered body go by sendfile. A response to HEAD sends no body, so fn
+// should leave the header as a GET's would have it and return nil for one;
+// a filter it returns anyway is not used, and the header goes as fn left it.
+// Filters registered on one response run in the order their hooks do, each
+// on what the one before it returned. Registering it once the response has
+// been begun does nothing.
+func (c *Context) OnBodyFilter(fn func(status int, header stdhttp.Header) BodyFilter) {
+	if fn != nil && !c.begun() {
+		c.addHook(responseHook{filter: fn})
 		c.w.hooks.changes = true
 	}
 }
@@ -121,6 +176,18 @@ func (h *responseHooks) before(response *Response) {
 				response.Header = make(stdhttp.Header)
 			}
 			hook.header(response.StatusCode, response.Header)
+		case hook.filter != nil && statusHasBody(response.StatusCode):
+			if response.Header == nil {
+				response.Header = make(stdhttp.Header)
+			}
+			if _, ok := response.Header["Content-Length"]; !ok {
+				// The body is all here, so its length is known: the hook
+				// sees it, as it would one the handler declared.
+				response.Header["Content-Length"] = []string{strconv.Itoa(len(response.Body))}
+			}
+			if f := hook.filter(response.StatusCode, response.Header); f != nil {
+				h.filters = append(h.filters, f)
+			}
 		}
 		if response.StatusCode == 0 {
 			response.StatusCode = stdhttp.StatusOK
@@ -135,10 +202,85 @@ func (h *responseHooks) before(response *Response) {
 func (h *responseHooks) beforeHeader(status int, header stdhttp.Header) {
 	h.ran = true
 	for i := len(h.list) - 1; i >= 0; i-- {
-		if hook := h.list[i]; hook.header != nil {
+		switch hook := h.list[i]; {
+		case hook.header != nil:
 			hook.header(status, header)
+		case hook.filter != nil && statusHasBody(status):
+			if f := hook.filter(status, header); f != nil {
+				h.filters = append(h.filters, f)
+			}
 		}
 	}
+}
+
+// filter runs p through the filters, and returns what is sent in its place.
+func (h *responseHooks) filter(p []byte) ([]byte, error) {
+	for _, f := range h.filters {
+		var err error
+		if p, err = f.Filter(p); err != nil {
+			return nil, err
+		}
+	}
+	return p, nil
+}
+
+// endFilters closes the filters, each in turn, the tail of each going through
+// those after it, and returns what is left to send, in a slice of its own.
+// flush says to flush them instead, where they can, rather than close them.
+func (h *responseHooks) endFilters(flush bool) ([]byte, error) {
+	var out []byte
+	for i, f := range h.filters {
+		var tail []byte
+		var err error
+		switch {
+		case !flush:
+			tail, err = f.Close()
+		default:
+			if fl, ok := f.(BodyFlusher); ok {
+				tail, err = fl.Flush()
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, next := range h.filters[i+1:] {
+			if len(tail) == 0 {
+				break
+			}
+			if tail, err = next.Filter(tail); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, tail...)
+	}
+	if !flush {
+		h.filters = nil
+	}
+	return out, nil
+}
+
+// filterWhole runs the body of a response sent whole through the filters,
+// and leaves its length to the body that comes out.
+func (h *responseHooks) filterWhole(response *Response, head bool) error {
+	if len(h.filters) == 0 {
+		return nil
+	}
+	if head {
+		h.filters = nil
+		return nil
+	}
+	body, err := h.filter(response.Body)
+	if err != nil {
+		return err
+	}
+	out := append([]byte(nil), body...)
+	tail, err := h.endFilters(false)
+	if err != nil {
+		return err
+	}
+	response.Body = append(out, tail...)
+	delete(response.Header, "Content-Length")
+	return nil
 }
 
 // finished runs the OnFinish hooks.

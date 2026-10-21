@@ -1133,7 +1133,7 @@ handler := middleware.Chain(app,
 server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(handler)})
 ```
 
-每个 Config 都有 `Next`，返回 true 时跳过该中间件。中间件通过 `Context` 的三个钩子改写
+每个 Config 都有 `Next`，返回 true 时跳过该中间件。中间件通过 `Context` 的四个钩子改写
 响应，所以 handler 无论用 `Respond`、`WriteResponse` 还是 ResponseWriter 方法写响应都适用：
 
 - `OnHeader(fn)`：响应头定下来之前调用，拿到最终状态码，可以修改 header，不影响流式发送。
@@ -1141,6 +1141,11 @@ server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHa
   注册后 ResponseWriter 方法写的响应会整体缓存到 handler 结束再发（和 HTTP/2 一样），
   HTTP/1 上 `Flush` 不再立即发送，文件也不走 sendfile；compress 和 etag 用的就是它，
   对 SSE 之类的流式响应请用 `Next` 跳过。
+- `OnBodyFilter(fn)`：响应头定下来时调用，可以修改 header，并返回一个 `BodyFilter`，body 的每一段
+  写出时都先经过它（`Filter`），结束时 `Close` 交出剩下的部分，`Flush` 时实现了 `BodyFlusher` 的
+  过滤器交出已缓冲的部分。流式响应仍然流式发送，`Flush` 照常生效；整体发送的响应一次过滤，
+  钩子看到的 header 里有 body 的 `Content-Length`。有过滤器的响应不带 `Content-Length`、不走
+  sendfile。用它压缩响应不需要整体缓存。
 - `OnFinish(fn)`：响应交给连接之后调用，带状态码、header 和 body 长度。
 
 只关心状态码的统计不必每个请求都注册 `OnFinish`：handler 返回后，`Status()` 不为 0 且

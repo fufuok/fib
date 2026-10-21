@@ -177,6 +177,14 @@ func (c *Context) WriteHeader(status int) {
 		// hooks can change it. A response held whole runs them when it is
 		// sent instead, with its body.
 		w.hooks.beforeHeader(status, w.sent)
+		if w.hooks.filters != nil {
+			if c.Request.Method == stdhttp.MethodHead {
+				w.hooks.filters = nil
+			} else {
+				// The length declared is the body's before the filters.
+				delete(w.sent, "Content-Length")
+			}
+		}
 	}
 	if values := w.sent["Content-Length"]; len(values) == 1 {
 		if n, err := strconv.ParseInt(strings.TrimSpace(values[0]), 10, 64); err == nil && n >= 0 {
@@ -212,6 +220,31 @@ func (c *Context) Write(p []byte) (int, error) {
 	}
 	if w.status == 0 {
 		c.WriteHeader(stdhttp.StatusOK)
+	}
+	if w.filtered() && !w.finished && len(p) > 0 {
+		out, err := w.hooks.filter(p)
+		if err != nil {
+			return 0, w.fail(err)
+		}
+		if _, err := c.write(out); err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
+	return c.write(p)
+}
+
+// filtered reports whether the body goes through OnBodyFilter's filters.
+func (w *responseWriter) filtered() bool { return w.hooks != nil && w.hooks.filters != nil }
+
+// write is Write for p as it is sent, after any filters.
+func (c *Context) write(p []byte) (int, error) {
+	if c.wrote {
+		return 0, ErrResponseWritten
+	}
+	w := c.w
+	if w.err != nil {
+		return 0, w.err
 	}
 	if w.finished {
 		return 0, ErrResponseWritten
@@ -294,10 +327,15 @@ func (c *Context) WriteNoWait(p []byte) (above bool, err error) {
 	if w.declared >= 0 && w.written+int64(len(p)) > w.declared {
 		return false, stdhttp.ErrContentLength
 	}
+	if w.filtered() && len(p) > 0 {
+		if p, err = w.hooks.filter(p); err != nil {
+			return false, w.fail(err)
+		}
+	}
 	if c.Request.Method == stdhttp.MethodHead || len(p) == 0 || c.holdsWhole() ||
 		!w.committed && (len(w.buf)+len(p) <= writerBufferSize || w.holdsDeclared()) {
 		// Write only holds these back, never waits on them.
-		_, err := c.Write(p)
+		_, err := c.write(p)
 		return false, err
 	}
 	w.written += int64(len(p))
@@ -397,6 +435,17 @@ func (c *Context) FlushError() error {
 	}
 	if w.finished || c.holdsWhole() {
 		return nil
+	}
+	if w.filtered() {
+		held, err := w.hooks.endFilters(true)
+		if err != nil {
+			return w.fail(err)
+		}
+		if len(held) > 0 {
+			if _, err := c.write(held); err != nil {
+				return err
+			}
+		}
 	}
 	if !w.committed {
 		if err := c.commit(false); err != nil {
@@ -518,6 +567,12 @@ func (c *Context) ReadFrom(src io.Reader) (int64, error) {
 	}
 	if w.err != nil {
 		return 0, w.err
+	}
+	if w.filtered() {
+		// A filtered body is read and written, not sent from the file.
+		buf := bufferpool.Get(copyBufferSize)
+		defer bufferpool.Put(buf)
+		return io.CopyBuffer(writerOnly{c}, src, buf)
 	}
 	if !w.committed {
 		if err := c.commit(false); err != nil {
@@ -804,8 +859,22 @@ func (c *Context) Finish() error {
 	if w == nil || w.status == 0 || w.finished || c.wrote {
 		return nil
 	}
+	var err error
+	if w.filtered() && w.err == nil {
+		// What the filters hold back goes before the end of the body.
+		var tail []byte
+		if tail, err = w.hooks.endFilters(false); err == nil && len(tail) > 0 {
+			_, err = c.write(tail)
+		}
+		if err != nil {
+			err = w.fail(err)
+		}
+	}
 	w.finished = true
-	err := c.finish(w)
+	if err == nil {
+		// A body its filters failed cannot be ended as if it were whole.
+		err = c.finish(w)
+	}
 	if err != nil && !c.wrote {
 		// Nothing can answer the request now. A connection kept open would
 		// leave its client waiting, or reading the response to the next

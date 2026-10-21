@@ -517,8 +517,13 @@ func (c *Context) writeResponse(response Response) error {
 		// Context.
 		hooks.response = response
 		hooks.before(&hooks.response)
+		err := hooks.filterWhole(&hooks.response, c.Request.Method == stdhttp.MethodHead)
 		response = hooks.response
 		hooks.response = Response{}
+		if err != nil {
+			hooks.ran = false
+			return err
+		}
 	}
 	var err error
 	switch {
