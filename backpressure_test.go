@@ -1626,3 +1626,61 @@ func TestDeferredReadDeliveredWhileQueueStaysNonEmpty(t *testing.T) {
 		}
 	}
 }
+
+// A peer's own idle timeout takes the place of the engine's: a negative one
+// keeps the peer past the engine's, and a shorter one closes it first.
+func TestUDPPeerIdleTimeout(t *testing.T) {
+	config := DefaultConfig()
+	config.UDPIdleTimeout = 400 * time.Millisecond
+	type closing struct {
+		name string
+		err  error
+		at   time.Time
+	}
+	closed := make(chan closing, 4)
+	_, addr := startUDPServer(t, config, HandlerFuncs{
+		Open: func(c *Connection) {},
+		Data: func(c *Connection, b []byte) {
+			switch string(b) {
+			case "keep":
+				c.SetUDPIdleTimeout(-1)
+				c.SetAttachment("keep")
+			case "short":
+				c.SetUDPIdleTimeout(50 * time.Millisecond)
+				c.SetAttachment("short")
+			}
+		},
+		Close: func(c *Connection, err error) {
+			name, _ := c.Attachment().(string)
+			closed <- closing{name, err, time.Now()}
+		},
+	})
+	start := time.Now()
+	for _, payload := range []string{"keep", "short"} {
+		conn, err := net.DialUDP("udp", nil, addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if _, err := conn.Write([]byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case c := <-closed:
+		if c.name != "short" || !errors.Is(c.err, ErrUDPIdleTimeout) {
+			t.Fatalf("%q closed first, with %v; want the short one, idle", c.name, c.err)
+		}
+		// Swept every quarter of the engine's 400ms.
+		if d := c.at.Sub(start); d >= 400*time.Millisecond {
+			t.Fatalf("the short one closed after %v, not before the engine's timeout", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the short one was not closed")
+	}
+	select {
+	case c := <-closed:
+		t.Fatalf("%q closed with %v; the kept one should stay", c.name, c.err)
+	case <-time.After(time.Second):
+	}
+}

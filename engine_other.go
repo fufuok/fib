@@ -686,6 +686,23 @@ type Connection struct {
 	// udpActive is when a listener's peer last sent or was sent a datagram,
 	// in nanoseconds, for the idle timeout.
 	udpActive atomic.Int64
+	// udpIdle, when not zero, is a listener's peer's own idle timeout in
+	// nanoseconds, in place of the engine's; a negative one keeps the peer.
+	udpIdle atomic.Int64
+}
+
+// SetUDPIdleTimeout sets how long the peer of a UDP listener, which c is, may
+// be silent before its connection is closed, in place of
+// Config.UDPIdleTimeout. Zero goes back to the engine's, and a negative value
+// keeps the peer until it is closed, for a handler that times its peers out
+// itself. Peers are looked at as often as the engine's own timeout has them
+// looked at, every quarter of it, so a shorter one here may be late by up to
+// that, and while the engine's is off none is looked at. On another
+// connection it does nothing.
+func (c *Connection) SetUDPIdleTimeout(d time.Duration) {
+	if c.udp && !c.dialed {
+		c.udpIdle.Store(int64(d))
+	}
 }
 
 // Protocol returns the transport the connection runs over, which it keeps
@@ -1333,7 +1350,11 @@ func (e *Engine) sweepUDP(interval time.Duration) {
 	for _, l := range listeners {
 		l.mu.Lock()
 		for _, c := range l.peers {
-			if now-c.udpActive.Load() >= limit {
+			l := limit
+			if d := c.udpIdle.Load(); d != 0 {
+				l = d
+			}
+			if l > 0 && now-c.udpActive.Load() >= l {
 				idle = append(idle, c)
 			}
 		}

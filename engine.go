@@ -1457,6 +1457,33 @@ type udpState struct {
 	// lastActive is when the peer last sent or was sent a datagram, in
 	// nanoseconds, for the idle timeout.
 	lastActive atomic.Int64
+	// idleTimeout, when not zero, is the peer's own idle timeout in
+	// nanoseconds, in place of the engine's; a negative one keeps the peer.
+	// See SetUDPIdleTimeout.
+	idleTimeout atomic.Int64
+}
+
+// idleLimit is how long the peer may be silent before it is closed, given
+// the engine's limit: its own, if it has one. Zero or less keeps it.
+func (u *udpState) idleLimit(engine int64) int64 {
+	if d := u.idleTimeout.Load(); d != 0 {
+		return d
+	}
+	return engine
+}
+
+// SetUDPIdleTimeout sets how long the peer of a UDP listener, which c is, may
+// be silent before its connection is closed, in place of
+// Config.UDPIdleTimeout. Zero goes back to the engine's, and a negative value
+// keeps the peer until it is closed, for a handler that times its peers out
+// itself. Peers are looked at as often as the engine's own timeout has them
+// looked at, every quarter of it, so a shorter one here may be late by up to
+// that, and while the engine's is off none is looked at. On another
+// connection it does nothing.
+func (c *Connection) SetUDPIdleTimeout(d time.Duration) {
+	if c.udp != nil && c.udp.listener != nil {
+		c.udp.idleTimeout.Store(int64(d))
+	}
 }
 
 // udpListener is a bound UDP socket and the peers it has seen.
@@ -1721,7 +1748,7 @@ func (e *Engine) sweepUDP() {
 	now := time.Now().UnixNano()
 	for _, l := range e.udpListeners {
 		for _, c := range l.peers {
-			if now-c.udp.lastActive.Load() >= limit {
+			if l := c.udp.idleLimit(limit); l > 0 && now-c.udp.lastActive.Load() >= l {
 				e.closeConnection(c, ErrUDPIdleTimeout, true)
 			}
 		}
