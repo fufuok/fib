@@ -258,7 +258,7 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 // its own for a connection that failed. It must not block the engine for long,
 // and when the engine runs handlers inline it runs on the event loop itself.
 func (c *Client) Do(req *stdhttp.Request, callback func(*ClientResponse, error)) {
-	c.do(req, callback, false)
+	c.do(req, callback, false, nil)
 }
 
 // Start is Do, and returns a Call that abandons the request, for a caller
@@ -267,7 +267,29 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*ClientResponse, error))
 // costs a few allocations a request, and a Call costs none. A context that
 // can be cancelled is still watched as Do watches it.
 func (c *Client) Start(req *stdhttp.Request, callback func(*ClientResponse, error)) Call {
-	return Call{r: c.do(req, callback, false)}
+	return Call{r: c.do(req, callback, false, nil)}
+}
+
+// StartUpgrade is Start for a request that asks the server to switch to
+// another protocol, as a WebSocket handshake does, with its Connection and
+// Upgrade fields. If the server answers 101 Switching Protocols, the
+// connection leaves the client, no longer counted against
+// MaxConnsPerHost, and becomes a tunnel: ClientResponse.Tunnel, in the
+// callback, is it, and handler takes what the server sends through it,
+// beginning with OnTunnelOpen once the callback has returned and what
+// arrived behind the 101 queued till then. Any other answer is an ordinary
+// response, with no tunnel, and handler is never called.
+//
+// The switch needs an HTTP/1.1 connection: a request that would go out on a
+// multiplexed one, HTTP/2's, fails with ErrNotUpgradable.
+func (c *Client) StartUpgrade(req *stdhttp.Request, handler TunnelHandler, callback func(*ClientResponse, error)) Call {
+	if handler == nil {
+		if callback != nil {
+			callback(nil, errors.New("http: invalid upgrade"))
+		}
+		return Call{}
+	}
+	return Call{r: c.do(req, callback, true, handler)}
 }
 
 // Call is a request Start sent, for abandoning it while it is in flight.
@@ -294,7 +316,7 @@ func (c Call) Cancel(err error) {
 // do is Do, with whole set when the response must arrive whole whatever the
 // client's configuration says. It returns the request, or nil for one it
 // rejected outright.
-func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error), whole bool) *clientRequest {
+func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error), whole bool, tunnel TunnelHandler) *clientRequest {
 	if callback == nil {
 		callback = func(*ClientResponse, error) {}
 	}
@@ -339,7 +361,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 		return nil
 	}
 	r := &clientRequest{req: req, data: data, body: body, upload: upload, declared: declared, chunked: chunked,
-		callback: callback, whole: whole, headerWait: c.config.ResponseHeaderTimeout}
+		callback: callback, whole: whole, tunnel: tunnel, headerWait: c.config.ResponseHeaderTimeout}
 	// Either hook can fire before it has been stored, so both are stored under
 	// the lock finish reads them under.
 	r.mu.Lock()
@@ -474,7 +496,7 @@ func (c *Client) Go(req *stdhttp.Request) *Future {
 		}
 		f.err = err
 		close(f.done)
-	}, true)
+	}, true, nil)
 	return f
 }
 
@@ -992,9 +1014,11 @@ type clientRequest struct {
 	chunked  bool
 	callback func(*ClientResponse, error)
 	// whole asks for the response to arrive whole even when the client would
-	// stream it.
-	whole bool
-	done  atomic.Bool
+	// stream it. tunnel is StartUpgrade's handler, for a 101 to switch the
+	// connection to.
+	whole  bool
+	tunnel TunnelHandler
+	done   atomic.Bool
 	// retried records that the request has already been sent again once, after
 	// a reused connection turned out to be closed.
 	retried bool
@@ -1220,6 +1244,9 @@ type clientConn struct {
 	client *Client
 	host   *hostPool
 	conn   *fib.Connection
+	// feed is the tunnel the connection became after a 101; see
+	// switchTunnel. Set and read only by the worker reading the connection.
+	feed *TunnelFeed
 	// parser is used only by the worker reading the connection, and so are
 	// feeding, which says OnData is in the parser, and deferred, the stream
 	// whose end was held back until it is out.
@@ -1404,6 +1431,11 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 		cc.h2.feed(data)
 		return
 	}
+	if cc.feed != nil {
+		// The connection switched protocols, and is a tunnel's.
+		_ = cc.feed.Write(data)
+		return
+	}
 	cc.mu.Lock()
 	r := cc.current
 	closed := cc.closed
@@ -1435,6 +1467,10 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	}
 	if resp == nil {
 		cc.endDeferred()
+		return
+	}
+	if r.tunnel != nil && resp.StatusCode == stdhttp.StatusSwitchingProtocols {
+		cc.switchTunnel(conn, r, resp)
 		return
 	}
 	// Bytes past the response, a protocol switch, or either side asking to
@@ -1469,6 +1505,32 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	if !streamed {
 		r.finish(resp, nil)
 	}
+}
+
+// switchTunnel makes cc, whose request r StartUpgrade sent and the server
+// answered with 101, r's tunnel: it leaves the client, what follows the 101
+// is the tunnel's first data, and r's callback gets the response with the
+// tunnel before handler hears from it. It runs on the worker reading the
+// connection, which holds every OnData until it returns.
+func (cc *clientConn) switchTunnel(conn *fib.Connection, r *clientRequest, resp *stdhttp.Response) {
+	rest := cc.parser.takeBuffered()
+	feed := NewTunnelFeed(conn, conn, 0)
+	cc.mu.Lock()
+	cc.current = nil
+	cc.feed = feed
+	cc.mu.Unlock()
+	r.detach()
+	cc.client.forget(cc)
+	_ = feed.Write(rest)
+	bufferpool.Put(rest)
+	if !r.markDone() {
+		// Abandoned as the answer came: the tunnel goes with it.
+		conn.Close()
+		return
+	}
+	t := feed.Tunnel()
+	r.callback(&ClientResponse{Response: resp, tunnel: t}, nil)
+	t.open(r.tunnel)
 }
 
 // endDeferred ends the streamed body whose end bodyEnd held back.
@@ -1547,6 +1609,11 @@ func (cc *clientConn) bodyEnd() {
 }
 
 func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
+	if cc.feed != nil {
+		// A tunnel's connection, which the client forgot when it switched.
+		cc.feed.End(err)
+		return
+	}
 	cc.mu.Lock()
 	settled := cc.settled
 	cc.mu.Unlock()

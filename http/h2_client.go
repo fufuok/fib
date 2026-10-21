@@ -149,6 +149,11 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 		return
 	}
 	fields, trailer, err := h2RequestFields(r, hc.cc.host.target.secure)
+	if err == nil && r.tunnel != nil {
+		// A switch of protocols takes a connection of its own, which a
+		// multiplexed one is not.
+		err = ErrNotUpgradable
+	}
 	if err != nil {
 		hc.mu.Unlock()
 		r.detach()

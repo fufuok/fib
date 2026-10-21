@@ -92,6 +92,14 @@ func (p *responseParser) reset() {
 	}
 }
 
+// takeBuffered returns the bytes held beyond the last complete response, in a
+// pooled buffer that is the caller's, and leaves the parser empty.
+func (p *responseParser) takeBuffered() []byte {
+	data := bufferpool.Append(nil, p.buffer)
+	p.reset()
+	return data
+}
+
 // buffered reports whether bytes are held beyond the last complete response.
 func (p *responseParser) buffered() bool { return len(p.buffer) > 0 }
 

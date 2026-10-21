@@ -886,6 +886,14 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 	parser.mu.Lock()
 	defer parser.mu.Unlock()
+	if parser.upgraded {
+		// A retained request switched the connection while this round waited
+		// for the parser: what it read is the tunnel's.
+		if feed, ok := c.Attachment().(*TunnelFeed); ok {
+			_ = feed.Write(data)
+		}
+		return
+	}
 	if parser.spent {
 		// The connection is ending, or has become HTTP/2; what is still
 		// arriving belongs to a message this parser will not answer.
@@ -1133,6 +1141,14 @@ func (h *ServerHandler) recycle(context *Context) {
 func (h *ServerHandler) finishRequest(context *Context) {
 	c, parser := context.Conn, context.parser
 	parser.mu.Lock()
+	if parser.upgraded {
+		// Switched to a tunnel after its handler returned (see Upgrade): the
+		// connection is the tunnel's, and there is nothing to carry on.
+		parser.busy = false
+		parser.mu.Unlock()
+		context.drop(ctxConn)
+		return
+	}
 	closing := h.endRequestLocked(context)
 	lingers := parser.lingers
 	parser.mu.Unlock()

@@ -5,6 +5,7 @@ package http3
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net"
 	stdhttp "net/http"
 	"strings"
@@ -394,5 +395,98 @@ func TestCcWriteOnTheReaderAfterTimeout(t *testing.T) {
 	w.send(t, h3Request{path: "/"}, false)
 	if err := results.expect(t, "write"); err == nil {
 		t.Fatal("writes went on past the write timeout")
+	}
+}
+
+// A retained extended CONNECT switched after its handler has returned, as a
+// proxy switches one once its upstream has accepted: the DATA the client
+// sent before the 200 is the tunnel's first.
+func TestCcTunnelLateUpgrade(t *testing.T) {
+	results := make(ccvResults, 4)
+	base := startServer(t, Config{}, func(c *fibhttp.Context) {
+		c.Retain()
+		go func() {
+			defer c.Release()
+			time.Sleep(200 * time.Millisecond)
+			h := &ccvTunnel{data: func(tn *fibhttp.Tunnel, data []byte) {
+				results.report("data "+string(data), tn.Send(data))
+			}}
+			_, err := c.Upgrade("ccv", nil, h)
+			results.report("upgrade", err)
+		}()
+	})
+	w := dialH3Wire(t, nil, base)
+	s, err := w.qc.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write(ccvConnect("/late"), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write(dataFrame([]byte("early")), false); err != nil {
+		t.Fatal(err)
+	}
+	// The queued DATA is handed over as the tunnel opens, inside Upgrade.
+	for _, what := range []string{"data early", "upgrade"} {
+		if err := results.expect(t, what); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	w.await(s.ID(), "the echo", func(st *h3WireStream) bool {
+		return st.status == stdhttp.StatusOK && string(st.body) == "early"
+	})
+}
+
+// The client sends a CONNECT whose header has :protocol as an extended
+// CONNECT (RFC 9220), as net/http's HTTP/2 transport does: the server's
+// tunnel takes the body as it is written, and its answer streams back.
+func TestClientExtendedConnect(t *testing.T) {
+	base := startServer(t, Config{}, func(c *fibhttp.Context) {
+		h := &ccvTunnel{data: func(tn *fibhttp.Tunnel, data []byte) { _ = tn.Send(bytes.ToUpper(data)) }}
+		if _, err := c.Upgrade("ccv", nil, h); err != nil {
+			_ = c.Respond(stdhttp.StatusBadRequest, "text/plain", []byte(err.Error()))
+		}
+	})
+	client := newClient(t, func(c *ClientConfig) {
+		c.StreamResponseBody = true
+		c.StreamUnknownLengthAtHeader = true
+	})
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	req := mustRequest(t, stdhttp.MethodConnect, base+"/chat?x=1", pr)
+	req.Header.Set(":protocol", "ccv")
+	got := make(chan string, 4)
+	answered := make(chan int, 1)
+	client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
+		if err != nil {
+			t.Errorf("CONNECT: %v", err)
+			answered <- 0
+			return
+		}
+		answered <- resp.StatusCode
+		resp.OnBody(func(data []byte, fin bool, err error) {
+			if len(data) > 0 {
+				got <- string(data)
+			}
+		})
+	})
+	if _, err := pw.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case status := <-answered:
+		if status != stdhttp.StatusOK {
+			t.Fatalf("status %d", status)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no answer")
+	}
+	select {
+	case s := <-got:
+		if s != "HELLO" {
+			t.Fatalf("echo %q", s)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no echo")
 	}
 }

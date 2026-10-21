@@ -612,9 +612,26 @@ func requestFields(req *stdhttp.Request, bodyLen int64) (fields, trailer []qpack
 		return nil, nil, errors.New("http3: invalid method " + strconv.Quote(method))
 	}
 	fields = []qpack.HeaderField{{Name: ":method", Value: method}}
-	if method == stdhttp.MethodConnect {
+	protocol := ""
+	if values := req.Header[":protocol"]; method == stdhttp.MethodConnect && len(values) == 1 {
+		protocol = values[0]
+	}
+	switch {
+	case protocol != "":
+		// An extended CONNECT (RFC 9220), as net/http's HTTP/2 transport
+		// takes one: :protocol in the header, and the target's scheme and
+		// path beside it.
+		if !sendableValue(protocol) {
+			return nil, nil, errors.New("http3: invalid :protocol " + strconv.Quote(protocol))
+		}
+		fields = append(fields,
+			qpack.HeaderField{Name: ":protocol", Value: protocol},
+			qpack.HeaderField{Name: ":scheme", Value: "https"},
+			qpack.HeaderField{Name: ":authority", Value: host},
+			qpack.HeaderField{Name: ":path", Value: req.URL.RequestURI()})
+	case method == stdhttp.MethodConnect:
 		fields = append(fields, qpack.HeaderField{Name: ":authority", Value: host})
-	} else {
+	default:
 		fields = append(fields,
 			qpack.HeaderField{Name: ":scheme", Value: "https"},
 			qpack.HeaderField{Name: ":authority", Value: host},
@@ -623,7 +640,7 @@ func requestFields(req *stdhttp.Request, bodyLen int64) (fields, trailer []qpack
 	userAgent := false
 	for key, values := range req.Header {
 		name := strings.ToLower(key)
-		if connectionHeaders[name] || name == "host" || name == "content-length" || name == "te" {
+		if connectionHeaders[name] || name == "host" || name == "content-length" || name == "te" || name == ":protocol" {
 			continue
 		}
 		if !validName(name) {

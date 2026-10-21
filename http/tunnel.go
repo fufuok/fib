@@ -376,8 +376,13 @@ func (t *Tunnel) WaitSendable(limit int) error {
 // only its stream switches. Upgrade reports ErrNotUpgradable for any other
 // request.
 //
-// It is called by the handler, before it returns and before it has written
-// any of the response; handler's OnTunnelOpen has run by the time it returns.
+// It is called by the handler, before it has written any of the response:
+// before it returns, or later, from any goroutine, on a request it retained,
+// as a proxy does once the server it passes the request on to has accepted
+// the switch. A retained HTTP/1 request holds its connection meanwhile:
+// nothing the client sends after it is read as another request, and it is
+// the tunnel's first data once the switch is made. handler's OnTunnelOpen
+// has run by the time Upgrade returns.
 func (c *Context) Upgrade(protocol string, header stdhttp.Header, handler TunnelHandler) (*Tunnel, error) {
 	if handler == nil || protocol == "" || !validHeaderValue(protocol) {
 		return nil, errors.New("http: invalid upgrade")
@@ -398,8 +403,8 @@ func (c *Context) Upgrade(protocol string, header stdhttp.Header, handler Tunnel
 // request is a CONNECT that names no :protocol (RFC 9113 section 8.5, RFC
 // 9114 section 4.4), and only its stream switches. Connect reports
 // ErrNotUpgradable for any other request, and like Upgrade it is called by
-// the handler before it returns and before it has written any of the
-// response.
+// the handler before it has written any of the response, before it returns
+// or later on a request it retained.
 func (c *Context) Connect(header stdhttp.Header, handler TunnelHandler) (*Tunnel, error) {
 	if handler == nil {
 		return nil, errors.New("http: invalid upgrade")
@@ -413,7 +418,8 @@ func (c *Context) switchTunnel(protocol string, header stdhttp.Header, handler T
 	if c.begun() {
 		return nil, ErrResponseWritten
 	}
-	if !c.handling() || protocol == "" && c.Request.Method != stdhttp.MethodConnect {
+	late := !c.handling()
+	if late && !c.Retained() || protocol == "" && c.Request.Method != stdhttp.MethodConnect {
 		return nil, ErrNotUpgradable
 	}
 	upgrader, _ := c.external.(StreamUpgrader)
@@ -441,10 +447,21 @@ func (c *Context) switchTunnel(protocol string, header stdhttp.Header, handler T
 		t, err = upgrader.Upgrade(c.Request, protocol, header)
 	case c.stream != nil:
 		t, err = c.stream.upgrade(c.Request, protocol, header)
-	case protocol == "":
-		t, err = c.connectHTTP1(header)
 	default:
-		t, err = c.upgradeHTTP1(protocol, header)
+		if late && c.parser != nil {
+			// Away from the round that served the request, the connection is
+			// the parser's: a round reading it waits for the switch, and then
+			// hands what it read to the tunnel.
+			c.parser.mu.Lock()
+		}
+		if protocol == "" {
+			t, err = c.connectHTTP1(header)
+		} else {
+			t, err = c.upgradeHTTP1(protocol, header)
+		}
+		if late && c.parser != nil {
+			c.parser.mu.Unlock()
+		}
 	}
 	if err != nil {
 		if hooks := c.hooked(); hooks != nil {
@@ -469,7 +486,7 @@ func (c *Context) switchTunnel(protocol string, header stdhttp.Header, handler T
 func (c *Context) upgradeHTTP1(protocol string, header stdhttp.Header) (*Tunnel, error) {
 	parser, server := c.parser, c.server
 	request := c.Request
-	if parser == nil || server == nil || parser.stream != nil || !request.ProtoAtLeast(1, 1) ||
+	if parser == nil || server == nil || parser.stream != nil || parser.spent || !request.ProtoAtLeast(1, 1) ||
 		!headerHasToken(request.Header, "Connection", "upgrade") || !upgradeOffers(request.Header, protocol) {
 		return nil, ErrNotUpgradable
 	}
@@ -492,7 +509,7 @@ func (c *Context) upgradeHTTP1(protocol string, header stdhttp.Header) (*Tunnel,
 func (c *Context) connectHTTP1(header stdhttp.Header) (*Tunnel, error) {
 	parser, server := c.parser, c.server
 	request := c.Request
-	if parser == nil || server == nil || parser.stream != nil || request.ContentLength != 0 ||
+	if parser == nil || server == nil || parser.stream != nil || parser.spent || request.ContentLength != 0 ||
 		len(request.TransferEncoding) > 0 {
 		return nil, ErrNotUpgradable
 	}

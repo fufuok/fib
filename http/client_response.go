@@ -53,7 +53,14 @@ type ClientResponse struct {
 	s *ResponseStream
 	// abort gives the response up; see Close.
 	abort func(error)
+	// tunnel is what a 101 to StartUpgrade's request switched to.
+	tunnel *Tunnel
 }
+
+// Tunnel returns the tunnel the connection became when the server answered
+// a request sent with Client.StartUpgrade with 101 Switching Protocols, and
+// nil for any other response.
+func (c *ClientResponse) Tunnel() *Tunnel { return c.tunnel }
 
 // NewBufferedBody returns the Body for a response that arrived whole, which
 // DeliverResponse can hand to OnBody without copying it. The body does not
