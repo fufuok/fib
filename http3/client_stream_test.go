@@ -324,7 +324,7 @@ func TestStreamCloseKeepsConnection(t *testing.T) {
 	}
 	run.run(t, client, mustRequest(t, "GET", url+"/big", nil))
 	if !errors.Is(run.err, fibhttp.ErrResponseAbandoned) || run.fins != 1 {
-		t.Fatalf("err %v, fins %d", run.err, run.fins)
+		t.Fatalf("err %v, call err %v, fins %d", run.err, run.callErr, run.fins)
 	}
 	resp, err := client.Go(mustRequest(t, "GET", url+"/after", nil)).Wait()
 	if err != nil || readBody(t, resp) != "after" {
