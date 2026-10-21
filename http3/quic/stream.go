@@ -379,6 +379,9 @@ func (s *Stream) onDataAcked(off, n uint64, fin bool) {
 		s.finAcked = true
 	}
 	s.conn.maybeFinish(s)
+	// A unidirectional stream that is not finished may be all a close is
+	// waiting for.
+	s.conn.closeIfDoneLocked()
 }
 
 func (s *Stream) onDataLost(off, n uint64, fin bool) {
@@ -427,6 +430,12 @@ func (s *Stream) sendDone() bool {
 		return s.resetAcked
 	}
 	return s.finAcked && s.send.allAcked()
+}
+
+// unacked reports whether the stream has written data, or its end, that the
+// peer has yet to acknowledge.
+func (s *Stream) unacked() bool {
+	return s.hasSend && !s.reset && (!s.send.allAcked() || s.finQueued && !s.finAcked)
 }
 
 // onStreamFrame takes in a STREAM frame.

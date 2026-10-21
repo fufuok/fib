@@ -65,6 +65,66 @@ func TestCloseWhenDone(t *testing.T) {
 	}
 }
 
+// What a unidirectional stream was written before CloseWhenDone reaches the
+// peer before the close does, as HTTP/3's GOAWAY on its control stream must,
+// even when it was written while the handler was being called, which holds
+// what is written until the calls end.
+func TestCloseWhenDoneSendsWritten(t *testing.T) {
+	p := newTestPair(t, 0, nil)
+	var id atomic.Uint64
+	p.serverH.onData = func(s *Stream, _ []byte, fin bool) {
+		if !fin {
+			return
+		}
+		u, err := s.Conn().OpenUniStream()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		id.Store(u.ID())
+		if err := u.Write([]byte("goaway"), false); err != nil {
+			t.Error(err)
+		}
+		s.Conn().CloseWhenDone(5, "idle")
+	}
+	u, err := p.client.OpenUniStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := u.Write([]byte("hello"), true); err != nil {
+		t.Fatal(err)
+	}
+	var ae *ApplicationError
+	if err := waitClose(t, p.clientH); !errors.As(err, &ae) || ae.Code != 5 {
+		t.Fatalf("client closed with %v", err)
+	}
+	if got := p.clientH.received(id.Load()); string(got) != "goaway" {
+		t.Fatalf("the client got %q before the close", got)
+	}
+}
+
+// A close that waits for unidirectional data the peer will not take, held
+// back by its flow control, waits only so long.
+func TestCloseWhenDoneBounded(t *testing.T) {
+	p := newTestPair(t, 0, func(client, _ *Config) { client.StreamReceiveWindow = 1 << 10 })
+	p.clientH.onData = func(s *Stream, _ []byte, _ bool) { s.HoldCredit() }
+	u, err := p.server.OpenUniStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := u.Write(make([]byte, 64<<10), false); err != nil {
+		t.Fatal(err)
+	}
+	p.server.CloseWhenDone(5, "idle")
+	var ae *ApplicationError
+	if err := waitClose(t, p.clientH); !errors.As(err, &ae) || ae.Code != 5 {
+		t.Fatalf("client closed with %v", err)
+	}
+	if got := len(p.clientH.received(u.ID())); got == 0 || got >= 64<<10 {
+		t.Fatalf("the client got %d bytes", got)
+	}
+}
+
 // A client opens no more bidirectional streams than the server allows, and
 // unidirectional ones on a count of their own.
 func TestStreamLimits(t *testing.T) {

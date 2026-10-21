@@ -365,8 +365,11 @@ type Conn struct {
 
 	closed   bool
 	closeErr error
-	// closeWhenDone is the close CloseWhenDone asked for.
+	// closeWhenDone is the close CloseWhenDone asked for, and closeDeadline,
+	// once every bidirectional stream is finished, how long it still waits
+	// for the peer to acknowledge what the others were written.
 	closeWhenDone *ApplicationError
+	closeDeadline time.Time
 	// closePacket is the datagram that carried this side's CONNECTION_CLOSE,
 	// kept until closingUntil, the end of the closing period (RFC 9000
 	// section 10.2.1), to send again to what still arrives: the first may
@@ -760,7 +763,10 @@ func (c *Conn) Close(code uint64, reason string) {
 // CloseWhenDone closes the connection with an application error code once
 // every bidirectional stream is finished, its data delivered: a graceful
 // end, for after the application protocol has told the peer to open no
-// more.
+// more. What was written to unidirectional streams, which may never end, is
+// delivered too, the message that told the peer so among it: the close waits
+// for the peer to acknowledge it, three probe timeouts at most, rather than
+// overtake it.
 func (c *Conn) CloseWhenDone(code uint64, reason string) {
 	c.mu.Lock()
 	if !c.closed && c.closeWhenDone == nil {
@@ -775,8 +781,25 @@ func (c *Conn) closeIfDoneLocked() {
 	if c.closeWhenDone == nil || c.closed {
 		return
 	}
-	for id := range c.streams {
+	unacked := false
+	for id, s := range c.streams {
 		if isBidi(id) {
+			// One the peer opened since, to be refused, starts the wait
+			// again once it is finished.
+			c.closeDeadline = time.Time{}
+			return
+		}
+		unacked = unacked || s.unacked()
+	}
+	if unacked {
+		// What is written is sent after the handler's calls, or by the
+		// goroutine sending already, and a close now would go before it.
+		now := c.now()
+		if c.closeDeadline.IsZero() {
+			c.closeDeadline = now.Add(3 * c.rtt.pto())
+			c.armTimerLocked(now)
+		}
+		if now.Before(c.closeDeadline) {
 			return
 		}
 	}
@@ -1830,6 +1853,7 @@ func (c *Conn) armTimerLocked(now time.Time) {
 	earliest(c.lossDeadline)
 	earliest(c.flushDeadline)
 	earliest(c.pathDeadline)
+	earliest(c.closeDeadline)
 	if s := &c.spaces[spaceApp]; s.ackPending && !s.ackNow {
 		earliest(s.ackDeadline)
 	}
@@ -1877,6 +1901,9 @@ func (c *Conn) onTimer() {
 		c.terminateLocked(ErrHandshakeTimeout)
 	case !now.Before(c.idleDeadline()):
 		c.terminateLocked(ErrIdleTimeout)
+	case !c.closeDeadline.IsZero() && !now.Before(c.closeDeadline):
+		c.closeIfDoneLocked()
+		c.armTimerLocked(now)
 	default:
 		due := false
 		if !c.pathDeadline.IsZero() && !now.Before(c.pathDeadline) {
