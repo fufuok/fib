@@ -108,6 +108,11 @@ type Connection struct {
 	// was still queued, and ended. Whatever empties the queue owes the
 	// connection that read.
 	readDeferred bool
+	// hupOwed records that the peer ended its side while a read was stalled
+	// or deferred. The edge that said so has been taken, and a read that
+	// empties the socket stops at a short read without reaching the end, so
+	// the round that next reads is handed the end with it.
+	hupOwed bool
 	// closePending records that the loop has closed the connection and left
 	// OnClose, and the release of the descriptor, to its last round; see
 	// Engine.closeConnection. Guarded by mu.
@@ -1138,6 +1143,7 @@ func (c *Connection) process() {
 			// it back. A queue that drained since the read was deferred leaves
 			// nothing to wait for, and the read runs now.
 			c.readDeferred = deferred != 0
+			c.hupOwed = c.hupOwed || deferred&evRdHup != 0
 			c.scheduled = false
 			c.traceLocked("round stop deferred=%#x", deferred)
 			closing := c.closePending
@@ -1150,6 +1156,10 @@ func (c *Connection) process() {
 		}
 		events := uint32(c.pendingEvents)
 		c.pendingEvents = 0
+		if c.hupOwed && events&evIn != 0 {
+			events |= evRdHup
+			c.hupOwed = false
+		}
 		c.traceLocked("round events=%#x", events)
 		closed := c.closed || c.closing
 		if c.flags.has(flagReadShut) {
@@ -1234,7 +1244,11 @@ func (c *Connection) process() {
 				// The handler holds reads, so what the peer sent before it
 				// ended is still in the socket, behind the end. The read the
 				// release hands back takes it and then the end, which closes
-				// the connection as it would have here.
+				// the connection as it would have here: the end is owed
+				// with it, since its edge is spent.
+				c.mu.Lock()
+				c.hupOwed = true
+				c.mu.Unlock()
 				c.stallRead()
 			} else {
 				closeErr = io.EOF
