@@ -71,7 +71,13 @@ func (h *ServerHandler) Upgrade(c *epollhttp.Context, header stdhttp.Header) (*C
 	}
 	compress := result.extensions != ""
 	u := &upgradedConn{handler: h, request: request}
-	u.ws = Connection{subprotocol: result.subprotocol, compress: compress, windowBits: uint8(result.deflate.windowBits)}
+	// The handshake of RFC 6455 is an HTTP/1.1 upgrade, which switches the
+	// whole connection, while an extended CONNECT switches its stream alone;
+	// see Connection.Conn. Only package http's own HTTP/1.1 server switches
+	// such a handshake: a protocol served outside it switches extended
+	// CONNECTs alone (see http.StreamUpgrader).
+	u.ws = Connection{subprotocol: result.subprotocol, wholeConn: !extended, compress: compress,
+		windowBits: uint8(result.deflate.windowBits)}
 	u.parser = Parser{maxMessageBytes: h.config.MaxMessageBytes, deflate: compress,
 		contextTakeover: compress && result.deflate.peerContextTakeover, perFrame: h.frames != nil}
 	if _, err := c.Upgrade("websocket", response, u); err != nil {

@@ -164,9 +164,18 @@ type Connection struct {
 	conn        transport
 	subprotocol string
 	closeState  atomic.Pointer[connectionCloseState]
-	closeSent   atomic.Bool
+	// session is what SetSession last stored, in a box of its own so that
+	// any value, nil and values of differing types included, is swapped
+	// with one atomic store. It is nil until then, and for a nil value.
+	session   atomic.Pointer[any]
+	closeSent atomic.Bool
 	// client marks the dialing side, whose frames must be masked.
 	client bool
+	// wholeConn says conn is the http.Tunnel of a request switched on
+	// HTTP/1.1, which has its connection to itself from then on, so that
+	// Conn may hand that connection out. A tunnel over HTTP/2 or HTTP/3 is
+	// one stream of a connection that goes on carrying others.
+	wholeConn bool
 	// compress says permessage-deflate is in use, and windowBits bounds how
 	// far back what this side sends may refer.
 	compress   bool
@@ -196,6 +205,67 @@ type connectionCloseState struct {
 }
 
 func (c *Connection) Subprotocol() string { return c.subprotocol }
+
+// SetSession keeps v with the connection, for the application to read back
+// with Session: the state it looks up for every message, set once in
+// OnOpen, rather than kept in a map of its own keyed by connection. There is
+// one slot, so code that shares it agrees on what it holds. v may be any
+// value, nil included, and need not be of the type of the one it replaces.
+//
+// SetSession and Session are safe to call from any goroutine: the slot is
+// stored and loaded atomically, and a Session that returns what a
+// SetSession stored also sees what that goroutine wrote before it. Storing
+// a value other than nil allocates a small box for it. The slot outlives
+// the connection's close, so OnClose can still read it, and it is not
+// cleared: whatever refers to the Connection keeps its session alive too.
+func (c *Connection) SetSession(v any) {
+	if v == nil {
+		c.session.Store(nil)
+		return
+	}
+	c.session.Store(&v)
+}
+
+// Session returns what SetSession last stored, or nil before the first call.
+func (c *Connection) Session() any {
+	if v := c.session.Load(); v != nil {
+		return *v
+	}
+	return nil
+}
+
+// Conn returns the fib.Connection that carries this WebSocket's frames and
+// nothing else, for what Connection's own methods do not reach, such as
+// HoldReads, SetWriteBackpressure, NotifyOutput and SetWriteDeadline. It is:
+//
+//   - for a connection that came to a ServerHandler serving an engine itself,
+//     or that a Dialer opened, the connection itself;
+//   - for one that ServerHandler.Upgrade switched from an HTTP/1.1 request,
+//     the connection the request arrived on, which the WebSocket has to
+//     itself from then on;
+//   - for one that ServerHandler.Upgrade opened over HTTP/2 or HTTP/3, nil:
+//     the WebSocket is one stream of a connection shared with other
+//     requests, which nothing done for one of them may touch.
+//
+// nil therefore means a shared transport, which is not to be used. Over TLS
+// the connection is the one TLS runs on. Writing to it directly skips the
+// WebSocket framing and closing it skips the close handshake, which is what
+// the Connection's own methods are for.
+//
+// Which it is is settled when the WebSocket opens, so Conn may be called
+// from OnOpen on, from any goroutine, and it keeps returning the same
+// connection once that has closed.
+func (c *Connection) Conn() *fib.Connection {
+	switch conn := c.conn.(type) {
+	case *fib.Connection:
+		return conn
+	case *epollhttp.Tunnel:
+		if c.wholeConn {
+			return conn.Conn()
+		}
+	}
+	return nil
+}
 
 func (c *Connection) WriteMessage(opcode Opcode, payload []byte) error {
 	if opcode != Text && opcode != Binary {
@@ -336,7 +406,7 @@ func (c *Connection) sendClose(payload []byte) error {
 }
 
 // connectionState is what a server keeps for each connection. Every
-// connection of a server has one, so it is kept within 160 bytes on a 64-bit
+// connection of a server has one, so it is kept within 176 bytes on a 64-bit
 // platform, a size class of its own: the parser holds the state of only some
 // messages behind a pointer, and whether the handshake is done is read from
 // websocket rather than kept beside it.

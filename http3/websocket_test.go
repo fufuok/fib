@@ -130,10 +130,16 @@ func TestWebSocketOverExtendedConnect(t *testing.T) {
 		},
 		Close: func(_ *websocket.Connection, code uint16, _ string, _ error) { closed <- code },
 	})
+	// sharedConn reports whether the WebSocket's Conn is nil, as it is for a
+	// stream of a connection that goes on carrying others.
+	sharedConn := make(chan bool, 1)
 	base := startServer(t, Config{}, func(c *fibhttp.Context) {
-		if _, err := ws.Upgrade(c, nil); err != nil {
+		conn, err := ws.Upgrade(c, nil)
+		if err != nil {
 			t.Logf("upgrade: %v", err)
+			return
 		}
+		sharedConn <- conn.Conn() == nil
 	})
 	r := dialRaw(t, base)
 	s, err := r.qc.OpenStream()
@@ -173,6 +179,14 @@ func TestWebSocketOverExtendedConnect(t *testing.T) {
 		}
 	}
 	expectEcho("early")
+	select {
+	case isNil := <-sharedConn:
+		if !isNil {
+			t.Fatal("Conn of a WebSocket over HTTP/3 is not nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Upgrade did not return")
+	}
 	if err := s.Write(dataFrame(maskedFrame(websocket.Text, []byte("over h3"))), false); err != nil {
 		t.Fatal(err)
 	}
