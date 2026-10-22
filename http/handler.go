@@ -425,6 +425,16 @@ func (c *Context) bodyTooLarge() bool {
 	return stream != nil && errors.Is(stream.failure(), ErrBodyTooLarge)
 }
 
+// bodyFailed reports whether the request's body streamed and failed: grew
+// past its limit, was misframed, held too long or cut. The rest of it was
+// never read, so an HTTP/1 response says the connection ends, as it does once
+// the response is out; a client told otherwise would send its next request on
+// a connection that is closing.
+func (c *Context) bodyFailed() bool {
+	stream := c.RequestBody()
+	return stream != nil && stream.failure() != nil
+}
+
 // closeAfterResponse ends the HTTP/1 connection behind the response, with a
 // lingering close if the request's body is still arriving.
 func (c *Context) closeAfterResponse() {
@@ -566,7 +576,7 @@ func (c *Context) writeHTTP1(response Response, contentType string) error {
 		response.StatusCode = stdhttp.StatusOK
 	}
 	closeConnection := response.Close || c.Request.Close || headerHasToken(response.Header, "Connection", "close") ||
-		c.draining()
+		c.draining() || c.bodyFailed()
 	if err := c.sendResponse(response, contentType, closeConnection); err != nil {
 		return err
 	}

@@ -702,7 +702,7 @@ func (c *Context) commit(final bool) error {
 	w := c.w
 	req := c.Request
 	head := responseHead{status: w.status, header: w.sent, contentLength: -1}
-	head.close = c.Request.Close || headerHasToken(w.sent, "Connection", "close") || c.draining()
+	head.close = c.Request.Close || headerHasToken(w.sent, "Connection", "close") || c.draining() || c.bodyFailed()
 	http11 := req.ProtoAtLeast(1, 1)
 	w.trailers = announcedTrailers(w.sent)
 	w.sniff()

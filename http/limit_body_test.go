@@ -3,8 +3,10 @@
 package http
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"net"
 	stdhttp "net/http"
 	"strconv"
 	"testing"
@@ -223,5 +225,57 @@ func TestLimitBodyToNothing(t *testing.T) {
 			t.Fatalf("%s of %d bytes: status %d %q, want %d", tt.framing, tt.size, status, got, tt.status)
 		}
 		w.close()
+	}
+}
+
+// TestLimitBodyEndedPastTheLimitCloses checks that on HTTP/1 the 413 for a
+// body of no declared length, ended past its limit once OnBody had it, says
+// the connection ends, as it does: the rest of the body is never read. A
+// client told the connection stays open sends its next request on one that
+// is closing, as Go's did in fit's CI, and has it reset. Both the server's
+// 413, for a handler that leaves the request unanswered, and a handler's
+// own 413 say so.
+func TestLimitBodyEndedPastTheLimitCloses(t *testing.T) {
+	config := DefaultConfig()
+	config.StreamRequestBody = true
+	through := make(chan struct{}, 1)
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		if c.LimitBody(limitBodyN) != nil {
+			return
+		}
+		through <- struct{}{}
+		c.OnBody(func(_ []byte, _ bool, err error) {
+			if errors.Is(err, ErrBodyTooLarge) && c.Request.URL.Path == "/self" {
+				_ = c.Respond(stdhttp.StatusRequestEntityTooLarge, "text/plain", []byte("too large\n"))
+			}
+		})
+	})))
+	for _, path := range []string{"/server", "/self"} {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		first, rest := limitBodyParts(make([]byte, 500), make([]byte, 4<<10), false)
+		if _, err := conn.Write(append([]byte("POST "+path+" HTTP/1.1\r\nHost: fib\r\nTransfer-Encoding: chunked\r\n\r\n"), first...)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-through:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the handler never let the body through", path)
+		}
+		// What is past the limit is refused as it arrives; the server may
+		// have closed by the time all of it is written.
+		_, _ = conn.Write(rest)
+		res, err := stdhttp.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		res.Body.Close()
+		conn.Close()
+		if res.StatusCode != stdhttp.StatusRequestEntityTooLarge || !res.Close {
+			t.Fatalf("%s: status %d, Connection %q, want 413 and close", path, res.StatusCode, res.Header.Get("Connection"))
+		}
 	}
 }
