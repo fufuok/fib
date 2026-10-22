@@ -4,9 +4,12 @@ package fib
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
 	"syscall"
 
 	"github.com/lesismal/fib/internal/listener"
@@ -178,18 +181,73 @@ func (e *Engine) balanceGroups(i int, groups [][]int) {
 		return
 	}
 	for _, group := range groups {
-		if len(group) < 2 {
-			continue
-		}
-		b, err := newReusePortBalancer(group)
-		if err != nil {
-			e.logBalanceFallback(err)
-			continue
-		}
-		e.listenMu.Lock()
-		e.balancers = append(e.balancers, bindingBalancer{binding: i, b: b})
-		e.listenMu.Unlock()
+		e.attachBalancer(i, group)
 	}
+}
+
+// attachBalancer round-robins one listening group. In a prefork child it
+// shares one selector across the children through bpffs, registering this
+// child's sockets in the whole group by their place in it; otherwise it
+// balances this engine's own pollers, which needs at least two. A group it
+// cannot balance keeps the kernel's hash, logged once.
+func (e *Engine) attachBalancer(binding int, group []int) {
+	if len(group) == 0 {
+		return
+	}
+	var (
+		b   *reusePortBalancer
+		err error
+	)
+	if dir, child, children, ok := preforkBalance(); ok {
+		k := len(group)
+		path := dir + "/" + addrKey(group[0])
+		b, err = openPinnedReusePortBalancer(path, children*k, (child-1)*k, group)
+	} else {
+		if len(group) < 2 {
+			return
+		}
+		b, err = newReusePortBalancer(group)
+	}
+	if err != nil {
+		e.logBalanceFallback(err)
+		return
+	}
+	e.listenMu.Lock()
+	e.balancers = append(e.balancers, bindingBalancer{binding: binding, b: b})
+	e.listenMu.Unlock()
+}
+
+// preforkBalance reports the shared bpffs directory and this child's place
+// among the prefork children, when it is one and a directory was handed down;
+// see Config.BalanceReusePort and package prefork.
+func preforkBalance() (dir string, child, children int, ok bool) {
+	dir = os.Getenv(preforkBPFFSEnv)
+	if dir == "" {
+		return "", 0, 0, false
+	}
+	child, _ = strconv.Atoi(os.Getenv(preforkChildEnv))
+	children, _ = strconv.Atoi(os.Getenv(preforkChildrenEnv))
+	if child < 1 || children < 2 {
+		return "", 0, 0, false
+	}
+	return dir, child, children, true
+}
+
+// addrKey is a filename-safe key for the address fd is bound to, the same in
+// every child, so they pin one selector per shared address. It avoids dots,
+// which bpffs refuses in a pin name.
+func addrKey(fd int) string {
+	sa, err := syscall.Getsockname(fd)
+	if err != nil {
+		return "addr"
+	}
+	switch a := sa.(type) {
+	case *syscall.SockaddrInet4:
+		return fmt.Sprintf("%d-%d-%d-%d_%d", a.Addr[0], a.Addr[1], a.Addr[2], a.Addr[3], a.Port)
+	case *syscall.SockaddrInet6:
+		return fmt.Sprintf("v6_%x_%d", a.Addr, a.Port)
+	}
+	return "addr"
 }
 
 // balanceInitialGroups attaches a selector to the reuseport groups of the
@@ -221,17 +279,7 @@ func (e *Engine) balanceInitialGroups() {
 		}
 	}
 	for i, g := range groups {
-		if len(g) < 2 {
-			continue
-		}
-		b, err := newReusePortBalancer(g)
-		if err != nil {
-			e.logBalanceFallback(err)
-			continue
-		}
-		e.listenMu.Lock()
-		e.balancers = append(e.balancers, bindingBalancer{binding: bindings[i], b: b})
-		e.listenMu.Unlock()
+		e.attachBalancer(bindings[i], g)
 	}
 }
 

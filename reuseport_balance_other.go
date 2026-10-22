@@ -12,7 +12,7 @@ func newReusePortBalancer([]int) (*reusePortBalancer, error) {
 }
 
 // openPinnedReusePortBalancer reports that balancing is unsupported.
-func openPinnedReusePortBalancer(string, int, int, int) (*reusePortBalancer, error) {
+func openPinnedReusePortBalancer(string, int, int, []int) (*reusePortBalancer, error) {
 	return nil, errReusePortBalanceUnsupported
 }
 

@@ -46,6 +46,9 @@ import (
 const (
 	childEnv    = "FIB_PREFORK_CHILD"
 	childrenEnv = "FIB_PREFORK_CHILDREN"
+	// bpffsEnv carries the bpffs directory the children pin their shared
+	// reuseport selectors under; fib reads it too. See Config.BalanceReusePort.
+	bpffsEnv = "FIB_PREFORK_BPFFS"
 )
 
 // DefaultProcsPerChild is the GOMAXPROCS a child runs with when
@@ -81,6 +84,15 @@ type Config struct {
 	// exit once it has sent them SIGTERM, after which it kills them. Zero or
 	// less means DefaultShutdownTimeout.
 	ShutdownTimeout time.Duration
+	// BalanceReusePort has the master hand its children a bpffs directory
+	// under which they pin one eBPF selector per shared address, so that new
+	// connections are spread over the children round-robin rather than by the
+	// kernel's hash of their addresses; the children's engines turn it on with
+	// fib.Config.BalanceReusePort. It needs Linux with bpffs mounted (at
+	// /sys/fs/bpf) and CAP_BPF; without them the master hands nothing down and
+	// the children keep the kernel's hash. The directory, and the pins under
+	// it, are removed when the master exits.
+	BalanceReusePort bool
 }
 
 // IsChild reports whether this process is a child Run started.
@@ -171,11 +183,22 @@ func master(ctx context.Context, config Config) error {
 		return fmt.Errorf("prefork: %w", err)
 	}
 
+	// The children pin one shared reuseport selector per address under this
+	// directory, so that connections spread over them round-robin; it and its
+	// pins go when the master exits. An empty dir, where the platform or
+	// bpffs cannot, leaves the children the kernel's hash.
+	var bpffsDir string
+	if config.BalanceReusePort {
+		if bpffsDir = setupBPFFS(); bpffsDir != "" {
+			defer removeBPFFS(bpffsDir)
+		}
+	}
+
 	children := make([]*child, 0, n)
 	exited := make(chan *child, n)
 	var failure error
 	for i := 1; i <= n; i++ {
-		c, err := start(path, i, n, procs)
+		c, err := start(path, i, n, procs, bpffsDir)
 		if err != nil {
 			failure = err
 			break
@@ -229,12 +252,16 @@ func master(ctx context.Context, config Config) error {
 }
 
 // start starts child index of the program at path, one of n children, with
-// procs Ps.
-func start(path string, index, n, procs int) (*child, error) {
+// procs Ps. bpffsDir, when set, is where the children pin their shared
+// reuseport selectors; see Config.BalanceReusePort.
+func start(path string, index, n, procs int, bpffsDir string) (*child, error) {
 	cmd := exec.Command(path, os.Args[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = append(os.Environ(), childEnv+"="+strconv.Itoa(index), childrenEnv+"="+strconv.Itoa(n),
 		"GOMAXPROCS="+strconv.Itoa(procs))
+	if bpffsDir != "" {
+		cmd.Env = append(cmd.Env, bpffsEnv+"="+bpffsDir)
+	}
 	cmd.SysProcAttr = sysProcAttr()
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("prefork: start child %d: %w", index, err)

@@ -3,10 +3,24 @@
 package fib
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"unsafe"
 )
+
+// lastPinErr records why the pinned balancer last fell back, for a test to
+// print; it is unused in normal operation.
+var lastPinErr error
+
+// pinFallback records a stage and its error for lastPinErr, and folds it to
+// the unsupported sentinel as unsupportedIfDenied does.
+func pinFallback(stage string, err error) error {
+	lastPinErr = fmt.Errorf("%s: %w", stage, err)
+	return unsupportedIfDenied(err)
+}
 
 // This file carries fib's whole eBPF dependency: a hand-assembled
 // BPF_PROG_TYPE_SK_REUSEPORT program and the two maps it needs, loaded
@@ -269,11 +283,134 @@ func newReusePortBalancer(fds []int) (*reusePortBalancer, error) {
 	return b, nil
 }
 
-// openPinnedReusePortBalancer is the cross-process form, for prefork's
-// children: not yet implemented, so the caller keeps plain SO_REUSEPORT
-// across the children.
-func openPinnedReusePortBalancer(string, int, int, int) (*reusePortBalancer, error) {
-	return nil, errReusePortBalanceUnsupported
+type bpfObjAttr struct {
+	pathname  uint64
+	bpfFD     uint32
+	fileFlags uint32
+}
+
+// objPin pins the object fd into bpffs at path, so another process can open
+// it by that path with objGet.
+func objPin(fd int, path string) error {
+	p := append([]byte(path), 0)
+	attr := bpfObjAttr{pathname: uint64(uintptr(unsafe.Pointer(&p[0]))), bpfFD: uint32(fd)}
+	_, errno := bpf(bpfObjPin, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+	runtime.KeepAlive(p)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// objGet opens the object pinned in bpffs at path, or reports the errno; it
+// returns ENOENT when nothing is pinned there yet.
+func objGet(path string) (int, error) {
+	p := append([]byte(path), 0)
+	attr := bpfObjAttr{pathname: uint64(uintptr(unsafe.Pointer(&p[0])))}
+	fd, errno := bpf(bpfObjGet, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+	runtime.KeepAlive(p)
+	if errno != 0 {
+		return -1, errno
+	}
+	return fd, nil
+}
+
+// openPinnedReusePortBalancer round-robins a reuseport group whose sockets
+// span several processes, as prefork's children do: one selector and its maps
+// are shared through bpffs, pinned at path ("_sock", "_ctr", "_prog" beside
+// it, whose parent directory the caller has made). The group holds size
+// sockets in all; this process registers its fds at baseIndex and on, and
+// attaches the selector to its first. The first process to arrive creates and
+// pins the objects under a lock; the rest open them. It falls back like
+// newReusePortBalancer where bpf(2) is refused.
+func openPinnedReusePortBalancer(path string, size, baseIndex int, fds []int) (*reusePortBalancer, error) {
+	if size < 2 || len(fds) == 0 {
+		return nil, errReusePortBalanceUnsupported
+	}
+	unlock, err := lockPin(path)
+	if err != nil {
+		lastPinErr = fmt.Errorf("lock %s: %w", path, err)
+		return nil, errReusePortBalanceUnsupported
+	}
+	defer unlock()
+
+	b := &reusePortBalancer{sockarray: -1, counter: -1, prog: -1}
+	prog, err := objGet(path + "_prog")
+	if err == nil {
+		b.prog = prog
+		sock, err := objGet(path + "_sock")
+		if err != nil {
+			b.Close()
+			return nil, pinFallback("objGet sock", err)
+		}
+		b.sockarray = sock
+	} else {
+		sock, err := createMap(bpfMapTypeReusePortSockHash, 4, 4, size)
+		if err != nil {
+			return nil, pinFallback("createMap sock", err)
+		}
+		b.sockarray = sock
+		counter, err := createMap(bpfMapTypeArray, 4, 4, 1)
+		if err != nil {
+			b.Close()
+			return nil, pinFallback("createMap counter", err)
+		}
+		b.counter = counter
+		prog, err := loadProgram(selectProgram(counter, sock, size))
+		if err != nil {
+			b.Close()
+			return nil, pinFallback("loadProgram", err)
+		}
+		b.prog = prog
+		for _, pin := range []struct {
+			fd   int
+			path string
+		}{{sock, path + "_sock"}, {counter, path + "_ctr"}, {prog, path + "_prog"}} {
+			if err := objPin(pin.fd, pin.path); err != nil {
+				b.Close()
+				return nil, pinFallback("objPin "+pin.path, err)
+			}
+		}
+	}
+	for j, fd := range fds {
+		if err := registerSocket(b.sockarray, baseIndex+j, fd); err != nil {
+			b.Close()
+			return nil, err
+		}
+	}
+	if err := attach(fds[0], b.prog); err != nil {
+		b.Close()
+		return nil, err
+	}
+	return b, nil
+}
+
+// lockPin serializes the children racing to create the pinned objects for
+// path, so that one creates and pins them and the rest open them. bpffs holds
+// only pinned objects, not lock files, so the lock lives in the temp
+// directory, named for path.
+func lockPin(path string) (func(), error) {
+	name := make([]byte, 0, len(path))
+	for i := 0; i < len(path); i++ {
+		if c := path[i]; c == '/' || c == ':' {
+			name = append(name, '_')
+		} else {
+			name = append(name, c)
+		}
+	}
+	lockPath := filepath.Join(os.TempDir(), "fib-reuseport-"+string(name)+".lock")
+	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
+		syscall.Close(fd)
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(fd, syscall.LOCK_UN)
+		_ = syscall.Close(fd)
+	}, nil
 }
 
 // unsupportedIfDenied turns the "not permitted" errors, which mean the
