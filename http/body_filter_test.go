@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -272,6 +274,202 @@ func TestBodyFilterChainAndSkips(t *testing.T) {
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%s fail: the handler did not write", client.proto)
+		}
+	}
+}
+
+// recordFilter passes a body through and reports how it ends: "close", or
+// "abort" with the error, on ends.
+type recordFilter struct {
+	ends     chan string
+	closeErr error
+	ended    atomic.Int32
+}
+
+// end returns what, or that the filter was ended before.
+func (f *recordFilter) end(what string) string {
+	if f.ended.Add(1) > 1 {
+		return what + " again"
+	}
+	return what
+}
+
+func (f *recordFilter) Filter(p []byte) ([]byte, error) { return p, nil }
+
+func (f *recordFilter) Close() ([]byte, error) {
+	f.ends <- f.end("close")
+	return nil, f.closeErr
+}
+
+func (f *recordFilter) Abort(err error) {
+	if err == nil {
+		f.ends <- "abort without a reason"
+		return
+	}
+	f.ends <- f.end("abort")
+}
+
+// TestBodyFilterAbort checks that a filter whose response ends without its
+// body ending is aborted, once, and not closed: a response to HEAD, one
+// whose client goes in the middle of it, one retained and cancelled, and
+// the filters after one whose Close fails; and that one that ends is closed
+// and not aborted.
+func TestBodyFilterAbort(t *testing.T) {
+	ends := make(chan string, 16)
+	gone := make(chan struct{}, 1)
+	chunk := []byte(strings.Repeat("x", 16<<10))
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		path := c.Request.URL.Path
+		if path == "/chain" {
+			// Registered first, so run last: aborted when the other's
+			// Close fails.
+			c.OnBodyFilter(func(int, stdhttp.Header) BodyFilter { return &recordFilter{ends: ends} })
+			c.OnBodyFilter(func(int, stdhttp.Header) BodyFilter {
+				return &recordFilter{ends: make(chan string, 1), closeErr: errFilter}
+			})
+		} else {
+			c.OnBodyFilter(func(int, stdhttp.Header) BodyFilter { return &recordFilter{ends: ends} })
+		}
+		switch path {
+		case "/whole", "/chain":
+			_ = c.Respond(200, "text/plain", chunk)
+		case "/streamed":
+			for range 4 {
+				_, _ = c.Write(chunk)
+			}
+		case "/gone":
+			_, _ = c.Write(chunk)
+			c.Flush()
+			select {
+			case <-gone:
+			case <-time.After(5 * time.Second):
+			}
+			for i := 0; i < 1000; i++ {
+				if _, err := c.Write(chunk); err != nil {
+					return
+				}
+				c.Flush()
+				time.Sleep(time.Millisecond)
+			}
+		case "/retained":
+			c.Retain()
+			c.OnCancel(func(error) { c.Release() })
+			_, _ = c.Write(chunk)
+			c.Flush()
+		}
+	})))
+	want := func(t *testing.T, what string) {
+		t.Helper()
+		select {
+		case got := <-ends:
+			if got != what {
+				t.Fatalf("%s, want %s", got, what)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no %s", what)
+		}
+		select {
+		case got := <-ends:
+			t.Fatalf("then %s", got)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	for _, client := range hookClients(t) {
+		t.Run(client.proto, func(t *testing.T) {
+			for _, tt := range []struct{ method, path, end string }{
+				{"GET", "/whole", "close"},
+				{"GET", "/streamed", "close"},
+				{"HEAD", "/whole", "abort"},
+				{"HEAD", "/streamed", "abort"},
+			} {
+				req, _ := stdhttp.NewRequest(tt.method, "http://"+addr+tt.path, nil)
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				want(t, tt.end)
+			}
+			if resp, err := client.Get("http://" + addr + "/chain"); err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+			// The failed response's filters are aborted, and so are those
+			// of the error response fib then makes, whose own Close fails.
+			for got := range ends {
+				if got != "abort" {
+					t.Fatalf("/chain: %s", got)
+				}
+				if len(ends) == 0 {
+					time.Sleep(50 * time.Millisecond)
+					if len(ends) == 0 {
+						break
+					}
+				}
+			}
+			for _, path := range []string{"/gone", "/retained"} {
+				ctx, cancel := context.WithCancel(context.Background())
+				req, _ := stdhttp.NewRequestWithContext(ctx, "GET", "http://"+addr+path, nil)
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.ReadFull(resp.Body, make([]byte, 1024)); err != nil {
+					t.Fatal(err)
+				}
+				cancel()
+				resp.Body.Close()
+				gone <- struct{}{}
+				want(t, "abort")
+				select {
+				case <-gone:
+				default:
+				}
+			}
+		})
+	}
+}
+
+// TestBodyFilterLengthAfterFilter checks that a hook that runs after one
+// that returned a filter is given no Content-Length, which would be the
+// length of the body before that filter, whether the response is sent whole
+// or streamed with a length declared.
+func TestBodyFilterLengthAfterFilter(t *testing.T) {
+	lengths := make(chan string, 4)
+	body := strings.Repeat("x", 100<<10)
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		// Registered first, so run last: after the upper-casing filter.
+		c.OnBodyFilter(func(_ int, h stdhttp.Header) BodyFilter {
+			lengths <- "after:" + h.Get("Content-Length")
+			return nil
+		})
+		c.OnBodyFilter(func(_ int, h stdhttp.Header) BodyFilter {
+			lengths <- "first:" + h.Get("Content-Length")
+			return &upperFilter{}
+		})
+		if c.Request.URL.Path == "/whole" {
+			_ = c.Respond(200, "text/plain", []byte(body))
+			return
+		}
+		c.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = io.WriteString(c, body)
+	})))
+	for _, client := range hookClients(t) {
+		for _, path := range []string{"/whole", "/declared"} {
+			resp, err := client.Get("http://" + addr + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if string(got) != strings.ToUpper(body)+"!" {
+				t.Errorf("%s %s: %d bytes", client.proto, path, len(got))
+			}
+			first, after := <-lengths, <-lengths
+			if first != "first:"+fmt.Sprint(len(body)) || after != "after:" {
+				t.Errorf("%s %s: %s, then %s", client.proto, path, first, after)
+			}
 		}
 	}
 }

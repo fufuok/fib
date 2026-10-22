@@ -3,6 +3,7 @@
 package http
 
 import (
+	"errors"
 	stdhttp "net/http"
 	"strconv"
 )
@@ -51,6 +52,30 @@ type BodyFilter interface {
 // handler flushed reaches the client rather than waiting in the filter.
 type BodyFlusher interface {
 	Flush() ([]byte, error)
+}
+
+// BodyAborter is implemented by a BodyFilter that holds something to give
+// back, an encoder from a pool or a copy of the body, when its response ends
+// without the body ending: the response failed as it was written, its
+// client went first, it was never finished, or it answers HEAD and sends no
+// body. Abort is called in place of Close, once, with why, after the last
+// Filter or Flush and on the goroutine that ends or recycles the response.
+// A filter that does not implement it is dropped then without a word.
+type BodyAborter interface {
+	Abort(err error)
+}
+
+// errBodyUnended is why a filter is aborted when its response ended without
+// the body ending and without an error of its own.
+var errBodyUnended = errors.New("http: the response ended before its body did")
+
+// abortFilters aborts the filters fs, which will not be closed, for err.
+func abortFilters(fs []BodyFilter, err error) {
+	for _, f := range fs {
+		if a, ok := f.(BodyAborter); ok {
+			a.Abort(err)
+		}
+	}
 }
 
 // OnHeader registers fn to run once, just before the response's header is
@@ -108,10 +133,13 @@ func (c *Context) OnResponse(fn func(response *Response)) {
 // so that fn can tell a short body from a long one. A response
 // it returns a filter for is sent without a Content-Length, the length the
 // handler declared being that of the body before the filter: HTTP/1 frames
-// it with chunks, or with its length when it is sent whole. Nor does a
-// filtered body go by sendfile. A response to HEAD sends no body, so fn
+// it with chunks, or with its length when it is sent whole. Once one hook has
+// returned a filter, the hooks after it are given no Content-Length either,
+// since the body their filters see is what that filter makes of it. Nor does
+// a filtered body go by sendfile. A response to HEAD sends no body, so fn
 // should leave the header as a GET's would have it and return nil for one;
-// a filter it returns anyway is not used, and the header goes as fn left it.
+// a filter it returns anyway is aborted (see BodyAborter), and the header
+// goes as fn left it.
 // Filters registered on one response run in the order their hooks do, each
 // on what the one before it returned. Registering it once the response has
 // been begun does nothing.
@@ -180,13 +208,16 @@ func (h *responseHooks) before(response *Response) {
 			if response.Header == nil {
 				response.Header = make(stdhttp.Header)
 			}
-			if _, ok := response.Header["Content-Length"]; !ok {
+			if _, ok := response.Header["Content-Length"]; !ok && len(h.filters) == 0 {
 				// The body is all here, so its length is known: the hook
 				// sees it, as it would one the handler declared.
 				response.Header["Content-Length"] = []string{strconv.Itoa(len(response.Body))}
 			}
 			if f := hook.filter(response.StatusCode, response.Header); f != nil {
 				h.filters = append(h.filters, f)
+				// The hooks after it are given what it makes of the body,
+				// whose length is not known.
+				delete(response.Header, "Content-Length")
 			}
 		}
 		if response.StatusCode == 0 {
@@ -208,6 +239,7 @@ func (h *responseHooks) beforeHeader(status int, header stdhttp.Header) {
 		case hook.filter != nil && statusHasBody(status):
 			if f := hook.filter(status, header); f != nil {
 				h.filters = append(h.filters, f)
+				delete(header, "Content-Length")
 			}
 		}
 	}
@@ -241,6 +273,11 @@ func (h *responseHooks) endFilters(flush bool) ([]byte, error) {
 			}
 		}
 		if err != nil {
+			if !flush {
+				// The ones after it will not be closed now.
+				abortFilters(h.filters[i+1:], err)
+				h.filters = nil
+			}
 			return nil, err
 		}
 		for _, next := range h.filters[i+1:] {
@@ -248,6 +285,10 @@ func (h *responseHooks) endFilters(flush bool) ([]byte, error) {
 				break
 			}
 			if tail, err = next.Filter(tail); err != nil {
+				if !flush {
+					abortFilters(h.filters[i+1:], err)
+					h.filters = nil
+				}
 				return nil, err
 			}
 		}
@@ -266,6 +307,7 @@ func (h *responseHooks) filterWhole(response *Response, head bool) error {
 		return nil
 	}
 	if head {
+		abortFilters(h.filters, errBodyUnended)
 		h.filters = nil
 		return nil
 	}

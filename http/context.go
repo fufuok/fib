@@ -203,6 +203,15 @@ func (c *Context) drop(bits uint64) {
 // ended runs once nothing can reach the Context any more but the server: the
 // body's buffer goes back, and whatever the Reuse options recycle goes too.
 func (c *Context) ended() {
+	if w := c.w; w != nil && w.hooks != nil && w.hooks.filters != nil {
+		// Filters the response never closed: it failed, or never ended.
+		err := w.err
+		if err == nil {
+			err = errBodyUnended
+		}
+		abortFilters(w.hooks.filters, err)
+		w.hooks.filters = nil
+	}
 	if h := c.cancel.Load(); h != nil && h.stop != nil {
 		stop := h.stop
 		h.stop = nil

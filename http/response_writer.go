@@ -179,6 +179,7 @@ func (c *Context) WriteHeader(status int) {
 		w.hooks.beforeHeader(status, w.sent)
 		if w.hooks.filters != nil {
 			if c.Request.Method == stdhttp.MethodHead {
+				abortFilters(w.hooks.filters, errBodyUnended)
 				w.hooks.filters = nil
 			} else {
 				// The length declared is the body's before the filters.
