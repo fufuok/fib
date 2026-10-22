@@ -114,6 +114,11 @@ type Engine struct {
 	// noLoop says the engine has no event loop of its own, and its pollers
 	// listen, dial and serve everything; see Config.EngineLoop.
 	noLoop bool
+	// balancers are the eBPF reuseport selectors the engine attached to the
+	// listening groups its pollers share, by binding, when
+	// Config.BalanceReusePort asked and the platform allowed it; see
+	// newReusePortBalancer. Held on the root engine, guarded by listenMu.
+	balancers []bindingBalancer
 	// loopMu guards loopOwned, which says the loop's state is no longer
 	// anyone else's to change directly: Run has started the loop, which
 	// owns it from then on, or Close is releasing it. Until then, a change
@@ -341,6 +346,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 	for _, p := range e.pollers {
 		p.startUDPSweeper()
 	}
+	e.balanceInitialGroups()
 	return e, nil
 }
 
@@ -1391,6 +1397,19 @@ type Config struct {
 	// In a child of package prefork it is always set, since the children
 	// all listen on the same addresses.
 	ReusePort bool
+	// BalanceReusePort hands each new connection to the next of the sockets
+	// sharing a reuseport address in turn, round-robin, rather than by the
+	// kernel's hash of its addresses: the engine attaches an eBPF selector to
+	// the group of a listening address its pollers share. The hash spreads a
+	// large, changing set of connections evenly, but a few connections over a
+	// few sockets unevenly, which leaves some pollers idle; the selector keeps
+	// the count even whatever the addresses. It needs IOPollers without
+	// EngineLoop (so each poller listens), more than one poller, and CAP_BPF
+	// (CAP_SYS_ADMIN before Linux 5.8); without the capability, on an older
+	// kernel, or on an architecture the selector does not cover, the engine
+	// logs it and keeps the kernel's hash. Only Linux spreads a reuseport
+	// group between sockets at all.
+	BalanceReusePort bool
 	// UDPIdleTimeout closes a UDP peer's connection once the peer has neither
 	// sent nor been sent a datagram for this long, since UDP has no close of
 	// its own to end it. OnClose receives ErrUDPIdleTimeout. Zero means

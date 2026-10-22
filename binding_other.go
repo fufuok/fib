@@ -120,3 +120,7 @@ func (e *Engine) closeBindingConnections(i int) {
 		c.closeWithError(net.ErrClosed)
 	}
 }
+
+// balanceInitialGroups is a no-op: this backend has no pollers and no
+// reuseport groups to balance.
+func (e *Engine) balanceInitialGroups() {}

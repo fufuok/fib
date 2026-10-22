@@ -3,6 +3,8 @@
 package fib
 
 import (
+	"errors"
+	"log/slog"
 	"net"
 	"net/netip"
 	"syscall"
@@ -50,6 +52,10 @@ func (e *Engine) openBinding(b Binding, i int) error {
 	// on: those its pollers share, or that hold an address for them.
 	var held []streamListener
 	var placed []placement
+	// groups holds, for each spread TCP address, the pollers' listening
+	// sockets that share it, so a reuseport selector can round-robin them
+	// once the binding is up; see Config.BalanceReusePort.
+	var groups [][]int
 	fail := func(err error) error {
 		for _, l := range held {
 			syscall.Close(l.fd)
@@ -95,6 +101,7 @@ func (e *Engine) openBinding(b Binding, i int) error {
 			continue
 		}
 		held = append(held, l)
+		var group []int
 		for _, p := range e.pollers {
 			own := l
 			if spread {
@@ -103,8 +110,12 @@ func (e *Engine) openBinding(b Binding, i int) error {
 					return fail(err)
 				}
 				own.fd, own.spread = like, false
+				group = append(group, like)
 			}
 			placed = append(placed, placement{loop: p, stream: own})
+		}
+		if spread {
+			groups = append(groups, group)
 		}
 	}
 	if len(held) > 0 {
@@ -153,7 +164,109 @@ func (e *Engine) openBinding(b Binding, i int) error {
 		_, _ = e.closeBinding(i, false)
 		return err
 	}
+	e.balanceGroups(i, groups)
 	return nil
+}
+
+// balanceGroups attaches an eBPF round-robin selector to each listening group
+// of the i-th binding that more than one poller shares, when
+// Config.BalanceReusePort asked. A platform or kernel that cannot, or a
+// process without CAP_BPF, keeps the kernel's hash, logged once, rather than
+// failing to listen.
+func (e *Engine) balanceGroups(i int, groups [][]int) {
+	if !e.bindConfig.BalanceReusePort {
+		return
+	}
+	for _, group := range groups {
+		if len(group) < 2 {
+			continue
+		}
+		b, err := newReusePortBalancer(group)
+		if err != nil {
+			e.logBalanceFallback(err)
+			continue
+		}
+		e.listenMu.Lock()
+		e.balancers = append(e.balancers, bindingBalancer{binding: i, b: b})
+		e.listenMu.Unlock()
+	}
+}
+
+// balanceInitialGroups attaches a selector to the reuseport groups of the
+// listeners New was given, which open creates one per spread address in every
+// poller, in the same order, so the group of an address runs down a column:
+// the j-th per-poller socket of every poller shares it. AddBinding's groups
+// go through balanceGroups instead.
+func (e *Engine) balanceInitialGroups() {
+	if !e.bindConfig.BalanceReusePort || len(e.pollers) < 2 {
+		return
+	}
+	var groups [][]int
+	var bindings []int
+	for pi, p := range e.pollers {
+		col := 0
+		for _, l := range p.listeners {
+			if l.unix || l.shared {
+				// A Unix socket, or the one socket a loopless engine's pollers
+				// all share, is not a per-poller reuseport group.
+				continue
+			}
+			if pi == 0 {
+				groups = append(groups, []int{l.fd})
+				bindings = append(bindings, l.binding)
+			} else if col < len(groups) {
+				groups[col] = append(groups[col], l.fd)
+			}
+			col++
+		}
+	}
+	for i, g := range groups {
+		if len(g) < 2 {
+			continue
+		}
+		b, err := newReusePortBalancer(g)
+		if err != nil {
+			e.logBalanceFallback(err)
+			continue
+		}
+		e.listenMu.Lock()
+		e.balancers = append(e.balancers, bindingBalancer{binding: bindings[i], b: b})
+		e.listenMu.Unlock()
+	}
+}
+
+// logBalanceFallback says that an address kept the kernel's hash because its
+// selector could not be attached: at warning when the platform, kernel or
+// capabilities simply do not allow it, and at error for anything else.
+func (e *Engine) logBalanceFallback(err error) {
+	if errors.Is(err, errReusePortBalanceUnsupported) {
+		slog.Warn("fib: BalanceReusePort could not attach a reuseport selector; keeping the kernel's hash",
+			"engine", e.name, "error", err)
+	} else {
+		slog.Error("fib: BalanceReusePort failed to attach a reuseport selector; keeping the kernel's hash",
+			"engine", e.name, "error", err)
+	}
+}
+
+// closeBalancers closes the reuseport selectors of binding i, or of every
+// binding when i is negative, and drops them.
+func (e *Engine) closeBalancers(i int) {
+	e.listenMu.Lock()
+	kept := e.balancers[:0]
+	var closing []*reusePortBalancer
+	for _, bb := range e.balancers {
+		if i < 0 || bb.binding == i {
+			closing = append(closing, bb.b)
+			continue
+		}
+		kept = append(kept, bb)
+	}
+	clear(e.balancers[len(kept):])
+	e.balancers = kept
+	e.listenMu.Unlock()
+	for _, b := range closing {
+		_ = b.Close()
+	}
 }
 
 // attachSockets puts sockets AddBinding opened on the loop's lists, and has
@@ -200,6 +313,7 @@ func (e *Engine) attachSockets(sockets []placement) error {
 // and net.ErrClosed if the engine stopped before every loop let its sockets
 // go, which leaves those to Close.
 func (e *Engine) closeBinding(i int, keepUDP bool) (bool, error) {
+	e.closeBalancers(i)
 	found := false
 	var err error
 	for _, loop := range e.loops() {

@@ -182,3 +182,7 @@ func forget[T comparable](list []T, x T) []T {
 	}
 	return list
 }
+
+// balanceInitialGroups is a no-op: this backend listens through the net
+// package and has no reuseport groups to balance.
+func (e *Engine) balanceInitialGroups() {}
