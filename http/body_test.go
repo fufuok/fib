@@ -368,8 +368,8 @@ func TestStreamRequestBodyKeepsAliveAfterAShortDiscard(t *testing.T) {
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatal(err)
 	}
-	if _, body := conn.response(stdhttp.MethodPost); body != "/first" {
-		t.Fatalf("body = %q, want %q", body, "/first")
+	if resp, body := conn.response(stdhttp.MethodPost); body != "/first" || resp.Close {
+		t.Fatalf("body = %q, want %q; Connection: close %v", body, "/first", resp.Close)
 	}
 	// The unread body was discarded, so the connection still carries requests.
 	conn.send("GET /second HTTP/1.1\r\nHost: test\r\n\r\n")
@@ -391,8 +391,39 @@ func TestStreamRequestBodyClosesAfterALongDiscard(t *testing.T) {
 	if resp.StatusCode != stdhttp.StatusRequestEntityTooLarge || body != "too large" {
 		t.Fatalf("response = %d %q", resp.StatusCode, body)
 	}
+	// The response says the connection closes, so that a client does not
+	// send its next request on it.
+	if !resp.Close {
+		t.Fatal("the response did not say Connection: close")
+	}
 	if !conn.closed() {
 		t.Fatal("the connection stayed open with a 64MB body still to come")
+	}
+}
+
+// TestStreamRequestBodyChunkedAnsweredEarlySaysClose checks that a response
+// a handler gives, from another goroutine, while a chunked body is still
+// arriving, whose rest the server will not read, says Connection: close.
+func TestStreamRequestBodyChunkedAnsweredEarlySaysClose(t *testing.T) {
+	addr := serveStreamingServer(t, streamingConfig(), func(c *Context) {
+		c.Retain()
+		go func() {
+			defer c.Release()
+			_ = c.Respond(stdhttp.StatusUnauthorized, "text/plain", []byte("no"))
+		}()
+	})
+	conn := dialRaw(t, addr)
+	conn.send("POST /up HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")
+	chunk := bytes.Repeat([]byte("c"), 16<<10)
+	if _, err := fmt.Fprintf(conn, "%x\r\n%s\r\n", len(chunk), chunk); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := conn.response(stdhttp.MethodPost)
+	if resp.StatusCode != stdhttp.StatusUnauthorized || body != "no" || !resp.Close {
+		t.Fatalf("response = %d %q, Connection: close %v", resp.StatusCode, body, resp.Close)
+	}
+	if !conn.closed() {
+		t.Fatal("the connection stayed open with a chunked body unread")
 	}
 }
 

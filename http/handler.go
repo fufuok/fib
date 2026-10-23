@@ -435,6 +435,17 @@ func (c *Context) bodyFailed() bool {
 	return stream != nil && stream.failure() != nil
 }
 
+// bodyCutShort reports whether a whole response, sent while the request's
+// body is still arriving, ends the connection: more of the body is left than
+// the server will read and throw away once the request is done, or the client
+// waits for a 100 Continue it will not get, so the connection closes after
+// the response. Its head says so, so that the client does not send its next
+// request on a connection about to close.
+func (c *Context) bodyCutShort() bool {
+	stream := c.RequestBody()
+	return stream != nil && stream.abandonCloses()
+}
+
 // closeAfterResponse ends the HTTP/1 connection behind the response, with a
 // lingering close if the request's body is still arriving.
 func (c *Context) closeAfterResponse() {
@@ -576,7 +587,7 @@ func (c *Context) writeHTTP1(response Response, contentType string) error {
 		response.StatusCode = stdhttp.StatusOK
 	}
 	closeConnection := response.Close || c.Request.Close || headerHasToken(response.Header, "Connection", "close") ||
-		c.draining() || c.bodyFailed()
+		c.draining() || c.bodyFailed() || c.bodyCutShort()
 	if err := c.sendResponse(response, contentType, closeConnection); err != nil {
 		return err
 	}

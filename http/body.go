@@ -661,16 +661,29 @@ func (s *BodyStream) abandon() (closing, unread bool) {
 	s.releaseLocked()
 	defer s.credited(dropped)
 	unread = !s.ended && s.err == nil
-	switch {
-	case !unread:
-	case s.wantContinue && !s.continueSent:
-		closing = true
-	default:
-		closing = s.remaining < 0 || s.remaining > discardAfterHandler
-	}
+	closing = s.abandonClosesLocked()
 	// A sink still waiting for the rest hears that it is not coming.
 	s.deliverLocked(true)
 	return closing, unread
+}
+
+// abandonCloses reports whether abandoning the body now would close the
+// connection, as abandon decides.
+func (s *BodyStream) abandonCloses() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.abandonClosesLocked()
+}
+
+func (s *BodyStream) abandonClosesLocked() bool {
+	switch {
+	case s.ended || s.err != nil:
+		return false
+	case s.wantContinue && !s.continueSent:
+		return true
+	default:
+		return s.remaining < 0 || s.remaining > discardAfterHandler
+	}
 }
 
 // unfinished reports whether some of the body is still to come.
