@@ -148,6 +148,24 @@ type Layer interface {
 	CloseAfterSend()
 }
 
+// CorkHolder is a Layer that holds what is sent while the connection is
+// corked, rather than transforming each send as it is made, and sends it all
+// once the cork comes off: the tls package seals a round's replies into one
+// record, where a record each would cost a seal, its overhead and an item of
+// the write. The layer bounds what it holds, sending it at once past its
+// bound, and asks Corked as it takes each send, under the lock that orders
+// its sends.
+//
+// The connection calls ReleaseCorked, without its own lock, each time the
+// cork comes off, after it has and before it writes what is queued; the layer
+// then sends what it holds through SendRaw or SendRawPooled. A send made in
+// between finds the connection uncorked, and the layer sends it behind what
+// it held.
+type CorkHolder interface {
+	Layer
+	ReleaseCorked()
+}
+
 // CloseWithError closes the connection, as Close does, and hands err to
 // OnClose. A layer uses it to report why its protocol ended the connection,
 // such as a failed handshake. Only the first close's error is reported.

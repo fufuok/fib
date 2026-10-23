@@ -913,6 +913,9 @@ func (c *Connection) sendRaw(data []byte) error {
 // socket by the time they return.
 func (c *Connection) Flush() error { return nil }
 
+// Corked reports false: this backend writes every send as it is made.
+func (c *Connection) Corked() bool { return false }
+
 // SendOwned is equivalent to Send on the synchronous portable backend.
 func (c *Connection) SendOwned(data []byte) error { return c.Send(data) }
 

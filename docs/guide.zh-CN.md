@@ -561,6 +561,11 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
   `fib.Layer` 来加密发送，用 `SendRaw`、`CloseAfterSendRaw` 直接写 socket，用
   `CloseWithError` 把握手失败的原因交给 `OnClose`。其他加密或分帧协议也可以用同样
   的方式接入；本库不内置 DTLS，UDP 上需要加密时可以用这个接口接入自己选择的实现。
+- 连接 cork 期间（读轮次里，或 `Cork` 与 `Flush` 之间）发送的明文先由 layer 留着，
+  cork 解除时合成一个 record 加密发出，而不是每次发送一个 record：HTTP/2 一轮的
+  多个响应因此只有一次加密、一份 record 开销、一项写队列。留着的明文最多一个 record
+  （16 KiB），再多就立即加密发出。layer 实现 `fib.CorkHolder` 即可这样做：它在每次发送
+  时用 `Connection.Corked` 判断，连接在 cork 解除时调用它的 `ReleaseCorked`。
 
 ## HTTP 子 package
 

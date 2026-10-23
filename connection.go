@@ -288,6 +288,15 @@ func (c *Connection) Cork() {
 	c.mu.Unlock()
 }
 
+// Corked reports whether the connection is corked: whether what is sent now
+// is queued for a Flush, or for the end of the read round, rather than
+// written. A CorkHolder asks as it takes a send.
+func (c *Connection) Corked() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.corked
+}
+
 // SetCoalesceWrites sets whether the read rounds of this connection hold the
 // replies a handler sends from OnData and write them together when the round
 // ends, whatever Config.CoalesceWrites says for the engine. Call it from
@@ -1349,6 +1358,17 @@ func (c *Connection) uncork() error {
 	c.mu.Lock()
 	wasCorked := c.corked
 	c.corked = false
+	if wasCorked {
+		if h, ok := c.layer.(CorkHolder); ok {
+			// The cork comes off before the layer is asked, so that a send
+			// made meanwhile is the layer's to send at once, behind what it
+			// held. A cork put on meanwhile stays on, and what it holds waits
+			// for its own uncork.
+			c.mu.Unlock()
+			h.ReleaseCorked()
+			c.mu.Lock()
+		}
+	}
 	c.foldCorkedLocked()
 	c.traceLocked("uncork wasCorked=%v", wasCorked)
 	if !wasCorked || c.sendHead == len(c.sends) {
@@ -1554,6 +1574,15 @@ func (c *Connection) waitOutput(limit int64) error {
 		}
 		edges := w.edges
 		if c.corked || c.sendHead != len(c.sends) && !c.flushing && !c.writeBusyLocked() {
+			if h, ok := c.layer.(CorkHolder); ok && c.corked {
+				// What the layer holds is not queued yet: it is sent
+				// first, and the queue looked at again.
+				c.corked = false
+				c.mu.Unlock()
+				h.ReleaseCorked()
+				c.mu.Lock()
+				continue
+			}
 			c.corked = false
 			// flushLocked releases mu. A write edge that comes before it is
 			// taken again counts in edges, which says to flush once more

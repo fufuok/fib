@@ -103,7 +103,11 @@ Behaviour to be aware of when using it.
 - Responses are queued and written by a flush the first of them sends to the
   handler pool, behind the requests already handed to it, so a burst of
   responses leaves in one write rather than one each, and none waits for a
-  slow handler's.
+  slow handler's. Over TLS the burst is also sealed as one record, up to
+  16 KB, rather than a record a frame: the TLS layer holds what is sent while
+  the connection is corked and seals it when the flush uncorks it
+  (`fib.CorkHolder`). That took a fixed response over h2 on 7 CPUs from
+  1.64M to 3.52M requests a second, against 3.82M over h2c.
 - A stream, with the `*http.Request`, `Header`, `URL` and `*Context` it holds,
   is recycled once its response is finished and its handler has returned and
   released every `Retain`, under `Config.ReuseRequests` and its siblings, which

@@ -74,7 +74,10 @@
 - `Push` 仍然在调用它的协程上同步执行被推送请求的 handler，在它返回后才返回；被推送的
   handler 慢，父请求的响应也会随之推迟。
 - 响应先排队，由其中第一个发往 handler 协程池的 flush 统一写出，排在已经交给协程池的请求
-  之后，因此一批响应一次写出而不是各写一次，也没有响应要等慢的 handler。
+  之后，因此一批响应一次写出而不是各写一次，也没有响应要等慢的 handler。TLS 上这一批也
+  合成一个 record（最多 16 KB）加密，而不是每个 frame 一个 record：连接 cork 期间发送的
+  明文由 TLS layer 留着，flush 解除 cork 时一起加密（`fib.CorkHolder`）。7 个 CPU 上 h2 的
+  fixed 响应因此从每秒 164 万提高到 352 万请求，h2c 是 382 万。
 - stream 连同它持有的 `*http.Request`、`Header`、`URL`、`*Context`，在响应完成、handler
   返回并释放所有 `Retain` 之后被复用，受 `Config.ReuseRequests` 等选项控制（默认开启），规则与
   HTTP/1 请求对象相同：handler 不能在那之后继续持有它们（见 HTTP/1 文档）。body 流式交付的

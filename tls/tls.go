@@ -405,6 +405,9 @@ func (h *Handler) OnShutdown(c *fib.Connection) {
 
 func (h *Handler) OnClose(c *fib.Connection, err error) {
 	if t, ok := c.Layer().(*layer); ok {
+		// Once the layer has closed, which closing marks, no Send holds
+		// anything more.
+		defer t.dropHeld()
 		err = t.reason(err)
 		if t.abortNative() {
 			// A handshake without a worker that did not finish: there is
@@ -531,6 +534,9 @@ type layer struct {
 	failed         bool
 	pending        [][]byte
 	closeAfterSend bool
+	// held is the plaintext sent while the connection is corked, sealed
+	// into one record when the cork comes off; see holdLocked. It is wmu's.
+	held []byte
 }
 
 func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
@@ -809,6 +815,9 @@ func (t *layer) Send(first, second []byte) error {
 		}
 		t.pending = append(t.pending, bufferpool.Join(nil, first, second))
 		return nil
+	}
+	if t.tx != nil && t.c.Corked() {
+		return t.holdLocked(first, second)
 	}
 	return t.writeLocked(first, second)
 }

@@ -603,7 +603,70 @@ var errSequenceExhausted = errors.New("fib: tls sequence number exhausted")
 // sealSendLocked seals first followed by second into records of typ and sends
 // them. The caller holds wmu.
 func (t *layer) sealSendLocked(typ byte, first, second []byte) error {
+	if len(t.held) > 0 {
+		if err := t.releaseHeldLocked(); err != nil {
+			return err
+		}
+	}
 	return t.sealSendWith(t.tx, typ, first, second)
+}
+
+// heldSize is the capacity held starts with: about what a round of small
+// replies fills, so that it seldom moves up a class as they come.
+const heldSize = 4 << 10
+
+// holdLocked keeps what a send on a corked connection carries, to be sealed
+// with the rest of the round's sends into one record when the cork comes off:
+// sealed one by one, h2's responses to a burst of requests took a record
+// each, with its seal, its 22 bytes of overhead and an item of its own in the
+// connection's queue, where h2c's were copied into one buffer. What would
+// take held past a record is sealed at once instead, behind what was held,
+// so the layer holds at most a record's plaintext. The caller holds wmu.
+func (t *layer) holdLocked(first, second []byte) error {
+	if len(t.held)+len(first)+len(second) > maxPlaintext {
+		return t.sealSendLocked(recordTypeApplicationData, first, second)
+	}
+	if t.held == nil {
+		t.held = bufferpool.Get(heldSize)[:0]
+	}
+	t.held = bufferpool.Join(t.held, first, second)
+	return nil
+}
+
+// releaseHeldLocked seals what held keeps and sends it. The caller holds wmu.
+func (t *layer) releaseHeldLocked() error {
+	held := t.held
+	t.held = nil
+	err := t.sealSendWith(t.tx, recordTypeApplicationData, held, nil)
+	bufferpool.Put(held)
+	return err
+}
+
+// ReleaseCorked sends what the layer held while the connection was corked;
+// see fib.CorkHolder.
+func (t *layer) ReleaseCorked() {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	if len(t.held) == 0 {
+		return
+	}
+	if t.failed {
+		bufferpool.Put(t.held)
+		t.held = nil
+		return
+	}
+	if err := t.releaseHeldLocked(); err != nil {
+		t.c.CloseWithError(err)
+	}
+}
+
+// dropHeld gives back what the layer held for a connection that closed
+// before its cork came off.
+func (t *layer) dropHeld() {
+	t.wmu.Lock()
+	bufferpool.Put(t.held)
+	t.held = nil
+	t.wmu.Unlock()
 }
 
 // sealSendWith is sealSendLocked under the keys given.
@@ -631,3 +694,5 @@ func (t *layer) sealSendWith(keys *recordKeys, typ byte, first, second []byte) e
 	// them into its queue while it is corked.
 	return t.c.SendRawPooled(buf)
 }
+
+var _ fib.CorkHolder = (*layer)(nil)
