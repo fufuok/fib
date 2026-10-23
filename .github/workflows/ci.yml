@@ -365,6 +365,9 @@ jobs:
         working-directory: fib-examples
         run: |
           go mod edit -replace github.com/lesismal/fib=..
+          # The checkout's go.mod may need a newer go line, or requirements,
+          # than the examples' pin did; tidy takes them up.
+          go mod tidy
           go build -o "$RUNNER_TEMP/h2only-server" ./http2only/server
       - name: Run h2spec against h2c and h2, and report the result
         shell: bash
@@ -673,6 +676,9 @@ jobs:
         working-directory: fib-examples
         run: |
           go mod edit -replace github.com/lesismal/fib=..
+          # The checkout's go.mod may need a newer go line, or requirements,
+          # than the examples' pin did; tidy takes them up.
+          go mod tidy
           go build -o "$RUNNER_TEMP/websocket_server" ${{ matrix.server }}
       - name: Start echo server
         run: |
