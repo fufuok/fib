@@ -157,11 +157,17 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 			wg.Add(1)
 			go func(f func() error) {
 				defer wg.Done()
-				for !stop.Load() {
+				// Every caller makes at least one call, and the calls in
+				// flight at the end are counted once they finish, so a
+				// short run on a slow machine still counts each caller.
+				for {
 					if f() != nil {
 						fails.Add(1)
 					} else {
 						calls.Add(1)
+					}
+					if stop.Load() {
+						return
 					}
 				}
 			}(f)
@@ -169,9 +175,9 @@ func run(ctx context.Context, args []string, out io.Writer, ready func(addr stri
 	}
 	time.Sleep(*dur)
 	stop.Store(true)
+	wg.Wait()
 	n, f := calls.Load(), fails.Load()
 	el := time.Since(start)
-	wg.Wait()
 	fmt.Fprintf(out, "calls=%d fails=%d rate=%.0f/s\n", n, f, float64(n)/el.Seconds())
 	return nil
 }
