@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	stdhttp "net/http"
-	"runtime"
-	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -174,18 +172,20 @@ func TestBodyWriterHoldsNoGoroutine(t *testing.T) {
 				}
 				return ups
 			}
-			// A first batch grows the client's and the server's pools to what
-			// a burst of uploads takes; the second, measured, finds them
-			// grown, so what it adds is what open uploads hold themselves.
+			// A first batch opens uploads that stay open; the second, measured,
+			// adds what open uploads hold themselves. Parked pool workers are
+			// not counted (see busyStacks): h2c hands each upload's body to
+			// the engine's handler pool, which grows a worker for a task that
+			// finds none idle and retires idle ones every second, so how many
+			// it keeps follows the machine's pace, not the uploads.
 			const uploads = 40
 			first := open(uploads)
 			time.Sleep(300 * time.Millisecond)
-			before := runtime.NumGoroutine()
+			before := busyGoroutines()
 			second := open(uploads)
 			time.Sleep(300 * time.Millisecond)
-			during := runtime.NumGoroutine()
-			var stacks bytes.Buffer
-			_ = pprof.Lookup("goroutine").WriteTo(&stacks, 2)
+			busy := busyStacks()
+			during, stacks := len(busy), strings.Join(busy, "\n\n")
 			for _, up := range append(first, second...) {
 				_ = up.body.Close()
 			}
@@ -203,12 +203,12 @@ func TestBodyWriterHoldsNoGoroutine(t *testing.T) {
 			// one an upload. The count is of the whole process, where other
 			// tests' goroutines come and go, hence the margin.
 			for _, waiting := range []string{".sendBody(", "reqbody.(*Pusher).Read("} {
-				if n := strings.Count(stacks.String(), waiting); n > 0 {
+				if n := strings.Count(stacks, waiting); n > 0 {
 					t.Fatalf("%d goroutines wait in %s", n, waiting)
 				}
 			}
 			if grew := during - before; grew >= uploads {
-				t.Fatalf("%d more open uploads added %d goroutines (%d -> %d)", uploads, grew, before, during)
+				t.Fatalf("%d more open uploads added %d goroutines (%d -> %d):\n%s", uploads, grew, before, during, stacks)
 			}
 		})
 	}
