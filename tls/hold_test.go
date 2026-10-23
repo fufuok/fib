@@ -66,7 +66,7 @@ func holdMessages(cmd byte, n int) [][]byte {
 }
 
 // holdServer answers 'r' with sends from its read round, 'g' with sends a
-// goroutine makes between a Cork and a Flush, 'b' with a send larger than a
+// goroutine makes each after a Cork, and then a Flush, as h2 sends, 'b' with a send larger than a
 // record between two small ones, and 'c' with small sends and then
 // CloseAfterSend.
 func holdServer(t *testing.T) (addr string, client *stdtls.Config) {
@@ -82,8 +82,8 @@ func holdServer(t *testing.T) (addr string, client *stdtls.Config) {
 				}
 			case 'g':
 				go func() {
-					c.Cork()
 					for _, m := range holdMessages(cmd, 16) {
+						c.Cork()
 						_ = c.Send(m)
 					}
 					_ = c.Flush()
@@ -148,9 +148,12 @@ func TestCorkedRoundIsOneRecord(t *testing.T) {
 	}
 }
 
-// What a goroutine sends between Cork and Flush goes out at the Flush, in
-// order, in at most the two records a read round still corked when the
-// goroutine began may split it into.
+// What a goroutine sends corked goes out at the Flush, in order. The read
+// round that started the goroutine may end meanwhile, and its end takes the
+// cork off and sends what was held, as fib's Cork allows: a cork is a flag,
+// not a count. So the sends come in at most three records: what the round's
+// end sent, a send made between a Cork and the round's end taking it off,
+// and what the Flush sent.
 func TestCorkFlushReleasesHeld(t *testing.T) {
 	addr, config := holdServer(t)
 	conn, counter := dialCounted(t, addr, config)
@@ -160,8 +163,8 @@ func TestCorkFlushReleasesHeld(t *testing.T) {
 			t.Fatal(err)
 		}
 		expectRead(t, conn, bytes.Join(holdMessages('g', 16), nil))
-		if got := counter.count() - before; got > 2 {
-			t.Fatalf("16 corked sends came in %d records, want at most 2", got)
+		if got := counter.count() - before; got > 3 {
+			t.Fatalf("16 corked sends came in %d records, want at most 3", got)
 		}
 	}
 }
