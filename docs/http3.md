@@ -311,7 +311,8 @@ In order of priority.
   congestion.
 - **Batched I/O**: the engine reads with `recvmmsg` on Linux and `recvmsg_x`
   on macOS, and a round of sending with more than one datagram leaves with
-  `sendmmsg` or `sendmsg_x` (`fib.Connection.SendBatch`). On Linux a run of
+  `sendmmsg` or `sendmsg_x` (`fib.Connection.SendBatch`), on the server's
+  connections as on the client's. On Linux a run of
   datagrams of one size in a batch goes as one message segmented with GSO
   (`UDP_SEGMENT`), which took static-h3 on an 8-CPU server from 40k to 77k
   requests a second. GRO, the receiving side, is still to do.

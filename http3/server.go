@@ -666,6 +666,12 @@ type peerPath struct {
 
 func (p *peerPath) Send(datagram []byte) error { return p.peer.c.Send(datagram) }
 
+// SendBatch makes the path a quic.BatchSender, so that a round of datagrams
+// goes out with one system call where the address's fib.Connection can.
+func (p *peerPath) SendBatch(datagrams [][]byte) error {
+	return p.peer.c.SendBatch(datagrams)
+}
+
 // Close lets the connection's use of the address go; the address's
 // fib.Connection stays for the client's next connection, until it is idle
 // (see udpPeer).
@@ -679,6 +685,7 @@ var (
 	_ fib.ShutdownHandler   = (*ServerHandler)(nil)
 	_ quic.CallsDoneHandler = (*serverConn)(nil)
 	_ quic.PathHandler      = (*serverConn)(nil)
+	_ quic.BatchSender      = (*peerPath)(nil)
 )
 
 // serverConn is one client's HTTP/3 connection.

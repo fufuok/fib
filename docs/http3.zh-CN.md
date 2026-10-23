@@ -229,7 +229,8 @@
   包的头部和 AEAD 标签开销会降低。在此之前可以用 `Config.MaxDatagramSize` 手动调大。
 - **拥塞控制**：增加 CUBIC 或 BBR，判断应用受限，实现持续拥塞判定。
 - **批量收发**：Engine 在 Linux 上用 `recvmmsg`、macOS 上用 `recvmsg_x` 批量读取；一轮
-  发送多于一个数据报时用 `sendmmsg` 或 `sendmsg_x` 一次发出（`fib.Connection.SendBatch`）。
+  发送多于一个数据报时用 `sendmmsg` 或 `sendmsg_x` 一次发出（`fib.Connection.SendBatch`），服务端
+  和客户端的连接都是如此。
   Linux 上一批里大小相同的连续数据报用 GSO（`UDP_SEGMENT`）作为一条消息交给内核分段，8 个 CPU
   的服务端上 static-h3 从每秒 4 万请求提高到 7.7 万。接收方向的 GRO 尚未实现。
 - **减少复制与分配**：发送时 `Write` 复制一次（复制进缓冲池里的缓冲区）、组包时再复制
