@@ -2,6 +2,7 @@ package tls
 
 import (
 	"container/list"
+	"crypto/x509"
 	"sync"
 	"time"
 )
@@ -31,6 +32,10 @@ type QUICSession struct {
 	// certs are the DER certificates the server sent, for the connection
 	// state of a connection that resumes the session.
 	certs [][]byte
+	// chains are the server's verified chains, nil if they were not
+	// verified, for whether the session may be offered (see sessionTrusted)
+	// and the connection state of one that resumes it.
+	chains [][]*x509.Certificate
 }
 
 // usable says whether the session can still be offered at now.

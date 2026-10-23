@@ -425,29 +425,30 @@ func (h *serverHS) acceptClientCertificates(ders [][]byte) *hsError {
 }
 
 // sessionPeer reads back the client certificates a ticket carries, and
-// reports whether the session can be resumed with them under the Config, as
-// crypto/tls decides: not without one if one is required, not once it has
-// expired, and not unverified if the Config verifies them.
+// reports whether the session can be resumed with them under the Config: not
+// without one if one is required, not with one if none is asked for, not once
+// it has expired, and not unverified if the Config verifies them.
+//
+// If the Config verifies them they are verified again, as in a full
+// handshake, rather than taken on the chains the ticket keeps. A ticket can
+// outlive the trust it was issued under: the ClientCAs may have changed since,
+// an intermediate expired, or the ticket been sealed, under a SessionTicketKey
+// shared between servers or kept across restarts, by a build whose
+// crypto/x509 still trusted what a later one distrusts (CVE-2026-111943).
+// crypto/tls checks only that a kept chain's certificates are current and its
+// root still among the ClientCAs; the cost of more is one verification, what a
+// full handshake with a client certificate pays.
 func (h *serverHS) sessionPeer(raw [][]byte, rawChains [][][]byte) (certs []*x509.Certificate, chains [][]*x509.Certificate, ok bool) {
 	auth := h.config.ClientAuth
 	if len(raw) == 0 {
 		return nil, nil, !requiresClientCert(auth)
 	}
-	parsed := make(map[string]*x509.Certificate, len(raw))
-	parse := func(der []byte) *x509.Certificate {
-		if c, found := parsed[string(der)]; found {
-			return c
-		}
-		c, err := x509.ParseCertificate(der)
-		if err != nil {
-			return nil
-		}
-		parsed[string(der)] = c
-		return c
+	if auth == stdtls.NoClientCert {
+		return nil, nil, false
 	}
 	for _, der := range raw {
-		c := parse(der)
-		if c == nil {
+		c, err := x509.ParseCertificate(der)
+		if err != nil {
 			return nil, nil, false
 		}
 		certs = append(certs, c)
@@ -455,19 +456,26 @@ func (h *serverHS) sessionPeer(raw [][]byte, rawChains [][][]byte) (certs []*x50
 	if h.now().After(certs[0].NotAfter) {
 		return nil, nil, false
 	}
-	if auth >= stdtls.VerifyClientCertIfGiven && len(rawChains) == 0 {
+	if auth < stdtls.VerifyClientCertIfGiven {
+		// Chains the ticket keeps were verified under a Config that has
+		// changed since; a full handshake under this one would have none.
+		return certs, nil, true
+	}
+	if len(rawChains) == 0 {
 		return nil, nil, false
 	}
-	for _, rawChain := range rawChains {
-		var chain []*x509.Certificate
-		for _, der := range rawChain {
-			c := parse(der)
-			if c == nil {
-				return nil, nil, false
-			}
-			chain = append(chain, c)
-		}
-		chains = append(chains, chain)
+	opts := x509.VerifyOptions{
+		Roots:         h.config.ClientCAs,
+		CurrentTime:   h.now(),
+		Intermediates: x509.NewCertPool(),
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	for _, c := range certs[1:] {
+		opts.Intermediates.AddCert(c)
+	}
+	chains, err := certs[0].Verify(opts)
+	if err != nil {
+		return nil, nil, false
 	}
 	return certs, chains, true
 }

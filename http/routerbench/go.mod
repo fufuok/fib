@@ -1,6 +1,6 @@
 module github.com/lesismal/fib/http/routerbench
 
-go 1.27
+go 1.27.3
 
 replace github.com/lesismal/fib => ../..
 

@@ -74,7 +74,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 - **Prefork**: on Linux, package `prefork` serves a program from one process per CPU, each with its
   own heap and collector, sharing the program's ports through `SO_REUSEPORT`.
 - **Platforms**: Linux, macOS, the BSDs and Windows, on amd64, arm64, 386, arm, riscv64 and
-  loong64. Needs Go 1.27 or later.
+  loong64. Needs Go 1.27.3 or later.
 
 ## Quick start
 

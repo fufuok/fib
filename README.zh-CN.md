@@ -69,7 +69,7 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
   responsetime。
 - **Prefork**：Linux 上 `prefork` 包把一个程序拆到每 CPU 一个进程上运行，各自有自己的堆和 GC，
   通过 `SO_REUSEPORT` 共享程序的端口。
-- **平台**：Linux、macOS、BSD、Windows，支持 amd64、arm64、386、arm、riscv64、loong64，需要 Go 1.27
+- **平台**：Linux、macOS、BSD、Windows，支持 amd64、arm64、386、arm、riscv64、loong64，需要 Go 1.27.3
   或更新版本。
 
 ## 快速开始

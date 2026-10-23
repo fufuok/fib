@@ -2,7 +2,7 @@
 // quic-go is not a dependency of github.com/lesismal/fib.
 module github.com/lesismal/fib/http3/interop
 
-go 1.27
+go 1.27.3
 
 require github.com/quic-go/quic-go v0.62.0
 

@@ -468,12 +468,18 @@ func TestCovS12AcceptClientCertificates(t *testing.T) {
 }
 
 // sessionPeer resumes no session whose certificates do not parse, have
-// expired, or were not verified when the Config verifies them.
+// expired, were not verified when the Config verifies them, or are not asked
+// for; one the Config verifies is verified again, so a root taken out of the
+// ClientCAs since the ticket was sealed ends it, and the chains are this
+// verification's, whatever the ticket kept; one the Config does not verify
+// has none.
 func TestCovS12SessionPeer(t *testing.T) {
 	ca := newTestCA(t, "covS12 CA")
+	other := newTestCA(t, "covS12 other CA")
 	leaf := ca.issue(t, "ecdsa-p256", "client", true).Certificate[0]
 	chain := [][][]byte{{leaf, ca.cert.Raw}}
 	later := func(c *stdtls.Config) { c.Time = func() time.Time { return time.Now().Add(48 * time.Hour) } }
+	untrusted := func(c *stdtls.Config) { c.ClientCAs = other.pool }
 	for _, tc := range []struct {
 		name   string
 		auth   stdtls.ClientAuthType
@@ -481,12 +487,16 @@ func TestCovS12SessionPeer(t *testing.T) {
 		chains [][][]byte
 		config func(*stdtls.Config)
 		ok     bool
+		chain  bool
 	}{
-		{"verified", stdtls.RequireAndVerifyClientCert, [][]byte{leaf}, chain, nil, true},
-		{"a certificate that does not parse", stdtls.RequestClientCert, [][]byte{leaf, {1, 2}}, nil, nil, false},
-		{"expired", stdtls.RequestClientCert, [][]byte{leaf}, nil, later, false},
-		{"not verified", stdtls.VerifyClientCertIfGiven, [][]byte{leaf}, nil, nil, false},
-		{"a chain that does not parse", stdtls.RequireAndVerifyClientCert, [][]byte{leaf}, [][][]byte{{leaf, {3}}}, nil, false},
+		{"verified", stdtls.RequireAndVerifyClientCert, [][]byte{leaf}, chain, nil, true, true},
+		{"a certificate that does not parse", stdtls.RequestClientCert, [][]byte{leaf, {1, 2}}, nil, nil, false, false},
+		{"expired", stdtls.RequestClientCert, [][]byte{leaf}, nil, later, false, false},
+		{"not verified", stdtls.VerifyClientCertIfGiven, [][]byte{leaf}, nil, nil, false, false},
+		{"not asked for", stdtls.NoClientCert, [][]byte{leaf}, chain, nil, false, false},
+		{"a root no longer trusted", stdtls.RequireAndVerifyClientCert, [][]byte{leaf}, chain, untrusted, false, false},
+		{"a chain the ticket kept that does not parse", stdtls.RequireAndVerifyClientCert, [][]byte{leaf}, [][][]byte{{leaf, {3}}}, nil, true, true},
+		{"no longer verified", stdtls.RequestClientCert, [][]byte{leaf}, chain, nil, true, false},
 	} {
 		config := &stdtls.Config{ClientAuth: tc.auth, ClientCAs: ca.pool}
 		if tc.config != nil {
@@ -497,11 +507,20 @@ func TestCovS12SessionPeer(t *testing.T) {
 			t.Errorf("%s: ok %v", tc.name, ok)
 			continue
 		}
-		if ok && (len(certs) != 1 || len(chains) != 1 || len(chains[0]) != 2 || chains[0][0] != certs[0]) {
-			t.Errorf("%s: %d certificates, chains %v", tc.name, len(certs), chains)
-		}
 		if !ok && (certs != nil || chains != nil) {
 			t.Errorf("%s: certificates returned", tc.name)
+		}
+		if !ok {
+			continue
+		}
+		if len(certs) != 1 {
+			t.Errorf("%s: %d certificates", tc.name, len(certs))
+		}
+		if !tc.chain && chains != nil {
+			t.Errorf("%s: chains %v", tc.name, chains)
+		}
+		if tc.chain && (len(chains) != 1 || len(chains[0]) != 2 || chains[0][0] != certs[0] || !chains[0][1].Equal(ca.cert)) {
+			t.Errorf("%s: chains %v", tc.name, chains)
 		}
 	}
 }

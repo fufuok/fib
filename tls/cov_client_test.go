@@ -106,7 +106,7 @@ func TestCovCliNowIsConfigTime(t *testing.T) {
 		{"past the lifetime", 2 * time.Hour, false},
 	} {
 		now := received.Add(tc.later)
-		h, err := newClientHS(&stdtls.Config{ServerName: "localhost", Time: func() time.Time { return now }})
+		h, err := newClientHS(&stdtls.Config{ServerName: "localhost", InsecureSkipVerify: true, Time: func() time.Time { return now }})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -132,7 +132,7 @@ func TestCovCliNowIsTheClock(t *testing.T) {
 		{"fresh", time.Now(), true},
 		{"expired", time.Now().Add(-2 * time.Hour), false},
 	} {
-		h, err := newClientHS(&stdtls.Config{ServerName: "localhost"})
+		h, err := newClientHS(&stdtls.Config{ServerName: "localhost", InsecureSkipVerify: true})
 		if err != nil {
 			t.Fatal(err)
 		}

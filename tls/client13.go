@@ -1100,6 +1100,7 @@ func (h *clientHS) serverHello13(msg []byte, version uint16, random, sessionID [
 			}
 			h.rawCerts = append(h.rawCerts, der)
 		}
+		h.chains = h.session.chains
 	} else if h.session != nil {
 		// The server would rather start over, and takes no early data.
 		h.session = nil

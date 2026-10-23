@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	stdtls "crypto/tls"
+	"crypto/x509"
 	"errors"
 	"hash"
 	"slices"
@@ -141,6 +142,7 @@ type ticketSink struct {
 	suite      uint16
 	alpn       string
 	certs      [][]byte
+	chains     [][]*x509.Certificate
 	// quicParams are the server's transport parameters, which a QUIC client
 	// keeps with the session; nil over TCP.
 	quicParams []byte
@@ -154,7 +156,7 @@ func (h *clientHS) sink() *ticketSink {
 		return nil
 	}
 	return &ticketSink{cache: h.sessions, key: h.config.ServerName, hash: h.suite.hash, resumption: h.resumption,
-		suite: h.suiteID, alpn: h.protocol, certs: h.rawCerts, quicParams: h.peerParams, quic: h.quic != nil, now: h.now}
+		suite: h.suiteID, alpn: h.protocol, certs: h.rawCerts, chains: h.chains, quicParams: h.peerParams, quic: h.quic != nil, now: h.now}
 }
 
 // newSessionTicket takes a ticket the server sends after the handshake into the
@@ -201,6 +203,7 @@ func (k *ticketSink) store(msg []byte) *hsError {
 		ticket: bytes.Clone(ticket), psk: psk, suite: k.suite, received: k.now(),
 		lifetime: min(time.Duration(lifetime)*time.Second, ticketLifetime),
 		ageAdd:   ageAdd, alpn: k.alpn, earlyData: maxEarly != 0, maxEarly: maxEarly, certs: k.certs,
+		chains: k.chains,
 	}
 	if k.quic && maxEarly != 0 {
 		// What the layer works to when it sends early data on this session.
@@ -400,11 +403,53 @@ func (h *clientHS) pickSession() bool {
 	// A session is used once, whether or not the server takes it.
 	h.sessions.Put(key, nil)
 	if _, ok := quicSuite(s.suite); !ok || !s.usable(h.now()) || !slices.Contains(h.suites, s.suite) ||
-		len(h.config.NextProtos) > 0 && !slices.Contains(h.config.NextProtos, s.alpn) {
+		len(h.config.NextProtos) > 0 && !slices.Contains(h.config.NextProtos, s.alpn) || !h.sessionTrusted(s) {
 		return false
 	}
 	h.session = s
 	return true
+}
+
+// sessionTrusted reports whether the server a session was made with is still
+// one the Config trusts, as crypto/tls decides before it offers a session: a
+// session may come from a connection that did not verify the server, with
+// InsecureSkipVerify, or with other RootCAs, since sessions are kept by server
+// name alone, in a cache that may be shared between Configs. It is not unless
+// the server's chain was verified, its certificates are all still current, the
+// leaf is the ServerName's, and the root is among the RootCAs if the Config
+// names them; the system's roots do not change under a running process, and
+// what this build's crypto/x509 distrusts it did not verify in the first
+// place. Nothing here verifies a signature, so it is cheap enough for the
+// goroutine that drives the handshake, which a verification is not (see
+// checkThen).
+func (h *clientHS) sessionTrusted(s *QUICSession) bool {
+	if h.config.InsecureSkipVerify {
+		return true
+	}
+	if len(s.chains) == 0 {
+		return false
+	}
+	now := h.now()
+	if s.chains[0][0].VerifyHostname(h.config.ServerName) != nil {
+		return false
+	}
+	for _, chain := range s.chains {
+		if slices.ContainsFunc(chain, func(c *x509.Certificate) bool {
+			return now.Before(c.NotBefore) || now.After(c.NotAfter)
+		}) {
+			continue
+		}
+		if h.config.RootCAs == nil {
+			return true
+		}
+		// A root among the Roots verifies as its own chain without a
+		// signature checked, which is how a pool is asked what it holds.
+		root := chain[len(chain)-1]
+		if _, err := root.Verify(x509.VerifyOptions{Roots: h.config.RootCAs, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // sendHello writes the ClientHello, and the keys early data goes under if it is

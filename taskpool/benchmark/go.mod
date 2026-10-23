@@ -1,6 +1,6 @@
 module github.com/lesismal/fib/taskpool/benchmark
 
-go 1.27
+go 1.27.3
 
 require (
 	github.com/bytedance/gopkg v0.1.4
