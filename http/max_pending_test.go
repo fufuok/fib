@@ -4,10 +4,12 @@ package http
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"net"
 	stdhttp "net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -138,5 +140,65 @@ func TestMaxPendingPerHostMaybeHTTP2(t *testing.T) {
 	case err := <-results:
 		t.Fatalf("a second request ended with %v while the dial hangs", err)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// hostQueue reports how many requests wait in the client's queue for the
+// host of u, and how many of them ended while they waited.
+func hostQueue(c *Client, u string) (waiting, ended int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for target, h := range c.hosts {
+		if strings.HasSuffix(u, target.addr) {
+			return len(h.waiting), int(h.ended.Load())
+		}
+	}
+	return 0, 0
+}
+
+// Requests that ended while they waited are counted as they end, not found
+// by walking the queue, and make room for as many more: with three of four
+// cancelled, three more are let in and the next is turned away. Once every
+// request is over, the count is back to none.
+func TestMaxPendingPerHostEndedWhileWaiting(t *testing.T) {
+	release := make(chan struct{})
+	u, _ := holdingServer(t, release)
+	config := DefaultClientConfig()
+	config.MaxConnsPerHost = 1
+	config.MaxPendingPerHost = 4
+	client := newTestClient(t, config)
+	results := make(chan error, 16)
+	send := func(ctx context.Context) {
+		client.Do(mustRequest(t, "GET", u, nil).WithContext(ctx), func(_ *ClientResponse, err error) { results <- err })
+	}
+	send(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	for i := 0; i < 3; i++ {
+		send(ctx)
+	}
+	send(context.Background())
+	cancel()
+	for i := 0; i < 3; i++ {
+		if err := cvCliWait(t, results, "a cancelled request"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("a cancelled request got %v", err)
+		}
+	}
+	if _, ended := hostQueue(client, u); ended != 3 {
+		t.Fatalf("%d requests counted as ended while they waited, want 3", ended)
+	}
+	for i := 0; i < 4; i++ {
+		send(context.Background())
+	}
+	if err := cvCliWait(t, results, "the request over the cap"); !errors.Is(err, ErrTooManyPending) {
+		t.Fatalf("the first outcome after the cancels is %v, want %v", err, ErrTooManyPending)
+	}
+	close(release)
+	for i := 0; i < 5; i++ {
+		if err := cvCliWait(t, results, "the requests let in"); err != nil {
+			t.Fatalf("a request let in got %v", err)
+		}
+	}
+	if waiting, ended := hostQueue(client, u); waiting != 0 || ended != 0 {
+		t.Fatalf("%d requests waiting and %d counted as ended once all are over, want none", waiting, ended)
 	}
 }

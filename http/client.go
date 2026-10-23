@@ -585,6 +585,11 @@ type hostPool struct {
 	dialing int
 	idle    []*clientConn
 	waiting []*clientRequest
+	// ended counts the requests in waiting that ended while they waited,
+	// which stay there until they reach its head or are swept out, so that
+	// the requests still waiting are counted without walking the queue.
+	// Requests end without the client's lock, so it is atomic.
+	ended atomic.Int64
 	// h2 holds the HTTP/2 connections that take new streams, busy or not.
 	// multiplexed records that the host has spoken HTTP/2, and probed that a
 	// connection to it has told which protocol it speaks. Until then, and
@@ -625,6 +630,7 @@ func (c *Client) enqueue(target hostTarget, r *clientRequest, retry bool) {
 	} else {
 		h.waiting = append(h.waiting, r)
 	}
+	r.queued(h)
 	work, dials := c.dispatchLocked(h)
 	refused := !retry && c.overPendingLocked(h, r)
 	c.mu.Unlock()
@@ -641,13 +647,25 @@ func (c *Client) enqueue(target hostTarget, r *clientRequest, retry bool) {
 // connections into dials already, except for a host that may speak HTTP/2,
 // which it dials once for, and whose room is counted here as the dials it
 // would be were the host to answer in HTTP/1.
+//
+// It costs the same however long the queue: past the cap, every request a
+// host sends is turned away here, under the client's lock, which the
+// connections' responses need too.
 func (c *Client) overPendingLocked(h *hostPool, r *clientRequest) bool {
 	limit, conns := c.config.MaxPendingPerHost, c.config.MaxConnsPerHost
 	if limit <= 0 || conns <= 0 {
 		return false
 	}
 	covered := h.dialing + max(conns-h.open, 0)
-	if len(h.waiting)-covered <= limit || pendingLocked(h)-covered <= limit {
+	if len(h.waiting)-covered <= limit {
+		return false
+	}
+	if ended := int(h.ended.Load()); 2*ended > len(h.waiting) {
+		// Most of the queue has ended: sweep it, which takes as long as
+		// the requests it drops, so that it does not hold them for long.
+		sweepLocked(h)
+	}
+	if len(h.waiting)-int(h.ended.Load())-covered <= limit {
 		return false
 	}
 	// r is the last of the queue, unless dispatchLocked handed it a
@@ -655,24 +673,42 @@ func (c *Client) overPendingLocked(h *hostPool, r *clientRequest) bool {
 	if n := len(h.waiting); n > 0 && h.waiting[n-1] == r {
 		h.waiting[n-1] = nil
 		h.waiting = h.waiting[:n-1]
+		h.dequeued(r)
 		return true
 	}
 	return false
 }
 
-// pendingLocked drops the requests that ended while they waited, which the
-// queue otherwise keeps until they reach its head, and reports how many are
-// left.
-func pendingLocked(h *hostPool) int {
+// sweepLocked drops the requests that ended while they waited, which the
+// queue otherwise keeps until they reach its head.
+func sweepLocked(h *hostPool) {
 	kept := h.waiting[:0]
 	for _, r := range h.waiting {
-		if !r.done.Load() {
+		if r.done.Load() {
+			h.dequeued(r)
+		} else {
 			kept = append(kept, r)
 		}
 	}
 	clear(h.waiting[len(kept):])
 	h.waiting = kept
-	return len(kept)
+}
+
+// dequeued settles the count of ended requests for r, just taken out of
+// h's queue. The client's lock is held.
+func (h *hostPool) dequeued(r *clientRequest) {
+	if r.waitingIn.Swap(nil) == nil {
+		// It ended while it waited, and markDone counted it.
+		h.ended.Add(-1)
+	}
+}
+
+// popLocked takes the request at the head of h's queue out.
+func (h *hostPool) popLocked() *clientRequest {
+	r := h.waiting[0]
+	h.waiting = h.waiting[1:]
+	h.dequeued(r)
+	return r
 }
 
 // dispatchLocked matches waiting requests with idle connections, and reports
@@ -681,7 +717,7 @@ func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
 	for len(h.waiting) > 0 {
 		r := h.waiting[0]
 		if r.done.Load() {
-			h.waiting = h.waiting[1:]
+			h.popLocked()
 			continue
 		}
 		var cc *clientConn
@@ -700,7 +736,7 @@ func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
 			break
 		}
 		cc.takeIdleLocked()
-		h.waiting = h.waiting[1:]
+		h.popLocked()
 		work = append(work, assignment{conn: cc, req: r})
 	}
 	need := len(h.waiting) - h.dialing
@@ -816,10 +852,9 @@ func (c *Client) dialed(cc *clientConn, err error) {
 	h.open--
 	var failed *clientRequest
 	for len(h.waiting) > 0 && failed == nil {
-		if r := h.waiting[0]; !r.done.Load() {
+		if r := h.popLocked(); !r.done.Load() {
 			failed = r
 		}
-		h.waiting = h.waiting[1:]
 	}
 	work, dials := c.dispatchLocked(h)
 	c.mu.Unlock()
@@ -841,8 +876,7 @@ func (c *Client) release(cc *clientConn) {
 		return
 	}
 	for len(h.waiting) > 0 {
-		r := h.waiting[0]
-		h.waiting = h.waiting[1:]
+		r := h.popLocked()
 		if !r.done.Load() {
 			c.mu.Unlock()
 			cc.send(r)
@@ -1019,6 +1053,10 @@ type clientRequest struct {
 	whole  bool
 	tunnel TunnelHandler
 	done   atomic.Bool
+	// waitingIn is the host whose queue the request waits in, or nil: set
+	// as it is queued, and cleared by whichever comes first of its leaving
+	// the queue and its ending, which then counts it in the host's ended.
+	waitingIn atomic.Pointer[hostPool]
 	// retried records that the request has already been sent again once, after
 	// a reused connection turned out to be closed.
 	retried bool
@@ -1079,6 +1117,10 @@ func (r *clientRequest) markDone() bool {
 	if !r.done.CompareAndSwap(false, true) {
 		return false
 	}
+	if h := r.waitingIn.Swap(nil); h != nil {
+		// It ends in the queue, where it stays until taken out.
+		h.ended.Add(1)
+	}
 	r.mu.Lock()
 	timer, stopContext := r.timer, r.stopContext
 	r.mu.Unlock()
@@ -1116,6 +1158,16 @@ func (r *clientRequest) requestSent() {
 		r.timer = time.AfterFunc(r.headerWait, r.expire)
 	default:
 		r.timer.Reset(r.headerWait)
+	}
+}
+
+// queued records that r waits in h's queue, where enqueue has just put it.
+// One that ended before it got there is counted as ended at once, by this
+// or by markDone, whichever sees the other.
+func (r *clientRequest) queued(h *hostPool) {
+	r.waitingIn.Store(h)
+	if r.done.Load() && r.waitingIn.CompareAndSwap(h, nil) {
+		h.ended.Add(1)
 	}
 }
 
