@@ -23,14 +23,24 @@ type responseHooks struct {
 	// filters are what the OnBodyFilter hooks returned for this response,
 	// in the order they run, while its body streams through them.
 	filters []BodyFilter
+	// async holds the response while an OnHeaderAsync hook decides its
+	// header, or is nil when none is registered; see asyncHeader.
+	async *asyncHeader
 }
 
-// responseHook is one registered callback; exactly one of its fields is set.
+// responseHook is one registered callback; exactly one of its fields is set,
+// or none for an OnHeaderAsync hook, whose function its responseHooks'
+// async keeps, so that a hook stays at four words.
 type responseHook struct {
 	header   func(status int, header stdhttp.Header)
 	response func(*Response)
 	finish   func(status int, header stdhttp.Header, size int64)
 	filter   func(status int, header stdhttp.Header) BodyFilter
+}
+
+// isAsync reports whether the hook is an OnHeaderAsync one.
+func (hook *responseHook) isAsync() bool {
+	return hook.header == nil && hook.response == nil && hook.finish == nil && hook.filter == nil
 }
 
 // BodyFilter transforms a response body as it is written, as a compressor
@@ -150,6 +160,40 @@ func (c *Context) OnBodyFilter(fn func(status int, header stdhttp.Header) BodyFi
 	}
 }
 
+// OnHeaderAsync registers fn to run once, where an OnHeader hook would run,
+// with the response's final status and its header, which fn may change, and
+// holds the header until resume is called, which may be from any goroutine
+// and from inside fn: it is how a middleware decides a header with work that
+// may not run on the goroutine writing the response, such as a call handed
+// to a pool of its own. resume(nil) sends the header as fn's caller left it,
+// and runs the hooks after it; resume with an error fails the response,
+// which closes an HTTP/1 connection and resets an HTTP/2 or HTTP/3 stream.
+// Only the first call counts.
+//
+// The response is retained while it is held, so a handler that returns
+// meanwhile leaves it to resume. A response sent whole, with WriteResponse,
+// Respond or as the handler finishes, is held as it is, its body copied. A
+// response that streams through the ResponseWriter methods holds what is
+// written, up to 64 kilobytes: past that Write waits for resume, as it
+// waits for a slow client, WriteNoWait reports above, and OnWritable runs
+// once the held body has gone after resume. Flush does nothing while the
+// header is held. A request whose client goes meanwhile ends as any other
+// does, and its resume sends nothing. fn is not run for the response of
+// Upgrade or Connect, which go at once. Registering it once the response has
+// been begun does nothing.
+func (c *Context) OnHeaderAsync(fn func(status int, header stdhttp.Header, resume func(error))) {
+	if fn != nil && !c.begun() {
+		c.addHook(responseHook{})
+		h := c.w.hooks
+		h.changes = true
+		if h.async == nil {
+			h.async = &asyncHeader{}
+			h.async.room.L = &h.async.mu
+		}
+		h.async.fns = append(h.async.fns, asyncHook{at: len(h.list) - 1, fn: fn})
+	}
+}
+
 // OnFinish registers fn to run once the response has been handed to the
 // connection, with the status and header it was sent with and the length of
 // the body it carried: none for a response to HEAD, or one whose status has
@@ -189,13 +233,13 @@ func (c *Context) addHook(hook responseHook) {
 	w.hooks.list = append(w.hooks.list, hook)
 }
 
-// before runs the hooks that change a response about to be sent whole.
-func (h *responseHooks) before(response *Response) {
-	if h.ran {
-		return
-	}
-	h.ran = true
-	for i := len(h.list) - 1; i >= 0; i-- {
+// beforeFrom runs the hooks that change a response about to be sent whole,
+// from the one at index from down; the first call, which writeResponse
+// makes once, starts from the last. It stops at an OnHeaderAsync hook, which
+// it leaves to its caller, and reports its index, or -1 once every hook has
+// run.
+func (h *responseHooks) beforeFrom(response *Response, from int) int {
+	for i := from; i >= 0; i-- {
 		switch hook := h.list[i]; {
 		case hook.response != nil:
 			hook.response(response)
@@ -219,20 +263,36 @@ func (h *responseHooks) before(response *Response) {
 				// whose length is not known.
 				delete(response.Header, "Content-Length")
 			}
+		case hook.isAsync():
+			if response.StatusCode == 0 {
+				response.StatusCode = stdhttp.StatusOK
+			}
+			if response.Header == nil {
+				response.Header = make(stdhttp.Header)
+			}
+			return i
 		}
 		if response.StatusCode == 0 {
 			response.StatusCode = stdhttp.StatusOK
 		}
 	}
+	return -1
 }
 
 // beforeHeader runs the OnHeader hooks for a response whose header is
 // settled before its body is written; it has no OnResponse hooks. It runs at
 // most once a response: its callers return before it once the header is
-// settled, and a response that failed to go resets ran.
-func (h *responseHooks) beforeHeader(status int, header stdhttp.Header) {
+// settled, and a response that failed to go resets ran. It stops at an
+// OnHeaderAsync hook, unless skipAsync says to pass over them, and reports
+// its index, or -1 once every hook has run.
+func (h *responseHooks) beforeHeader(status int, header stdhttp.Header, skipAsync bool) int {
 	h.ran = true
-	for i := len(h.list) - 1; i >= 0; i-- {
+	return h.beforeHeaderFrom(status, header, len(h.list)-1, skipAsync)
+}
+
+// beforeHeaderFrom is beforeHeader from the hook at index from down.
+func (h *responseHooks) beforeHeaderFrom(status int, header stdhttp.Header, from int, skipAsync bool) int {
+	for i := from; i >= 0; i-- {
 		switch hook := h.list[i]; {
 		case hook.header != nil:
 			hook.header(status, header)
@@ -241,8 +301,11 @@ func (h *responseHooks) beforeHeader(status int, header stdhttp.Header) {
 				h.filters = append(h.filters, f)
 				delete(header, "Content-Length")
 			}
+		case !skipAsync && hook.isAsync():
+			return i
 		}
 	}
+	return -1
 }
 
 // filter runs p through the filters, and returns what is sent in its place.

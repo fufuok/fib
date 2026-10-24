@@ -302,7 +302,8 @@ never blocks: the connect, the negotiation and any DNS lookup run on the engine 
 
 An HTTP handler accepts a CONNECT with `Context.Connect`, over HTTP/1.x, HTTP/2 (RFC 9113 section
 8.5) and HTTP/3 (RFC 9114 section 4.4), and gets a `Tunnel`, as `Upgrade` gives one for a protocol.
-`Tunnel.HoldReads`, `Unsent` and `WaitSendable` pace it with the stream's own flow control.
+`Tunnel.HoldReads`, `Unsent` and `WaitSendable` pace it with the stream's own flow control, and
+`NotifySendable` calls back once what it holds back has drained, for a relay that may not wait.
 `fibhttp.ConnectProxy` is a whole HTTPS proxy built on them, with Basic proxy authentication; behind
 `mux`, one port serves it and SOCKS:
 

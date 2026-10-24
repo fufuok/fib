@@ -464,7 +464,7 @@ func (c *Context) switchTunnel(protocol string, header stdhttp.Header, handler T
 		if header == nil {
 			header = make(stdhttp.Header)
 		}
-		hooks.beforeHeader(status, header)
+		hooks.beforeHeader(status, header, true)
 	}
 	var t *Tunnel
 	var err error

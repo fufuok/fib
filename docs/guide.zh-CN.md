@@ -1138,7 +1138,7 @@ handler := middleware.Chain(app,
 server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(handler)})
 ```
 
-每个 Config 都有 `Next`，返回 true 时跳过该中间件。中间件通过 `Context` 的四个钩子改写
+每个 Config 都有 `Next`，返回 true 时跳过该中间件。中间件通过 `Context` 的这些钩子改写
 响应，所以 handler 无论用 `Respond`、`WriteResponse` 还是 ResponseWriter 方法写响应都适用：
 
 - `OnHeader(fn)`：响应头定下来之前调用，拿到最终状态码，可以修改 header，不影响流式发送。
@@ -1151,6 +1151,11 @@ server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHa
   过滤器交出已缓冲的部分。流式响应仍然流式发送，`Flush` 照常生效；整体发送的响应一次过滤，
   钩子看到的 header 里有 body 的 `Content-Length`。有过滤器的响应不带 `Content-Length`、不走
   sendfile。用它压缩响应不需要整体缓存。
+- `OnHeaderAsync(fn)`：在 `OnHeader` 的位置调用，但响应头要等 fn 拿到的 `resume` 被调用（可以来自任何
+  goroutine，也可以在 fn 里）才发出，供必须在别的池上决定响应头的中间件使用。期间响应被持有，handler
+  可以先返回；整体发送的响应连同 body 的副本原样暂存，流式响应最多暂存 64 KB，超过时 `Write` 等待、
+  `WriteNoWait` 报告超限、`OnWritable` 在恢复并排空后回调。`resume(nil)` 按 fn 留下的样子发出响应头，
+  `resume(err)` 让响应失败（HTTP/1 关闭连接，HTTP/2、HTTP/3 重置流）。`Upgrade`、`Connect` 的响应不经过它。
 - `OnFinish(fn)`：响应交给连接之后调用，带状态码、header 和 body 长度。
 
 只关心状态码的统计不必每个请求都注册 `OnFinish`：handler 返回后，`Status()` 不为 0 且

@@ -537,7 +537,13 @@ func (c *Context) writeResponse(response Response) error {
 		// The copy lives with the hooks, which are recycled with the
 		// Context.
 		hooks.response = response
-		hooks.before(&hooks.response)
+		if !hooks.ran {
+			hooks.ran = true
+			if at := hooks.beforeFrom(&hooks.response, len(hooks.list)-1); at >= 0 && c.holdWhole(hooks, at) {
+				// An OnHeaderAsync hook holds it; its resume sends it.
+				return nil
+			}
+		}
 		err := hooks.filterWhole(&hooks.response, c.Request.Method == stdhttp.MethodHead)
 		response = hooks.response
 		hooks.response = Response{}
@@ -567,11 +573,35 @@ func (c *Context) writeResponse(response Response) error {
 		hooks.ran = false
 	}
 	if err == nil && hooks != nil {
-		size := int64(len(response.Body))
-		if c.Request.Method == stdhttp.MethodHead || !statusHasBody(response.StatusCode) {
-			size = 0
-		}
-		hooks.finished(response.StatusCode, response.Header, size)
+		hooks.finished(response.StatusCode, response.Header, wholeSize(c.Request, &response))
+	}
+	return err
+}
+
+// wholeSize is the length of the body a response sent whole carries.
+func wholeSize(req *stdhttp.Request, response *Response) int64 {
+	if req.Method == stdhttp.MethodHead || !statusHasBody(response.StatusCode) {
+		return 0
+	}
+	return int64(len(response.Body))
+}
+
+// sendHeld is writeResponse's sending for a response an OnHeaderAsync hook
+// held, once its hooks have run: it reads as written already, since the hold
+// began, so writeResponse would refuse it. It is kept apart from
+// writeResponse so that a response no hook holds goes no further than it.
+func (c *Context) sendHeld(response *Response, hooks *responseHooks) error {
+	var err error
+	switch {
+	case c.external != nil:
+		err = c.external.WriteResponse(c.Request, *response)
+	case c.stream != nil:
+		err = c.stream.respond(c.Request, *response)
+	default:
+		err = c.sendHTTP1(*response, "")
+	}
+	if err == nil {
+		hooks.finished(response.StatusCode, response.Header, wholeSize(c.Request, response))
 	}
 	return err
 }
@@ -583,6 +613,12 @@ func (c *Context) writeHTTP1(response Response, contentType string) error {
 	if c.wrote {
 		return ErrResponseWritten
 	}
+	return c.sendHTTP1(response, contentType)
+}
+
+// sendHTTP1 is writeHTTP1 for a response that may read as written already,
+// having been held by an OnHeaderAsync hook.
+func (c *Context) sendHTTP1(response Response, contentType string) error {
 	if response.StatusCode == 0 {
 		response.StatusCode = stdhttp.StatusOK
 	}
@@ -591,7 +627,9 @@ func (c *Context) writeHTTP1(response Response, contentType string) error {
 	if err := c.sendResponse(response, contentType, closeConnection); err != nil {
 		return err
 	}
-	c.wrote, c.status = true, uint16(response.StatusCode)
+	if !c.wrote {
+		c.wrote, c.status = true, uint16(response.StatusCode)
+	}
 	if closeConnection {
 		c.ends |= endClosing
 		c.closeAfterResponse()

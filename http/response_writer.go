@@ -175,8 +175,21 @@ func (c *Context) WriteHeader(status int) {
 	if w.hooks != nil && !w.hooks.whole {
 		// The header is settled from here on, so this is the last moment the
 		// hooks can change it. A response held whole runs them when it is
-		// sent instead, with its body.
-		w.hooks.beforeHeader(status, w.sent)
+		// sent instead, with its body. An OnHeaderAsync hook holds it, and
+		// its resume settles it.
+		if at := w.hooks.beforeHeader(status, w.sent, false); at >= 0 && c.holdHeader(at) {
+			return
+		}
+	}
+	c.settleHeader()
+}
+
+// settleHeader is the header of a response written through the
+// ResponseWriter methods settled, once its hooks have run: the length it
+// declares, and what filtering its body changes.
+func (c *Context) settleHeader() {
+	w := c.w
+	if w.hooks != nil && !w.hooks.whole {
 		if w.hooks.filters != nil {
 			if c.Request.Method == stdhttp.MethodHead {
 				abortFilters(w.hooks.filters, errBodyUnended)
@@ -222,6 +235,21 @@ func (c *Context) Write(p []byte) (int, error) {
 	if w.status == 0 {
 		c.WriteHeader(stdhttp.StatusOK)
 	}
+	if a := w.asyncHeader(); a != nil {
+		if held, _ := a.hold(p, true); held {
+			return len(p), nil
+		}
+		if w.err != nil {
+			// The hook's resume failed the response.
+			return 0, w.err
+		}
+	}
+	return c.writeBody(p)
+}
+
+// writeBody is Write once the header is settled.
+func (c *Context) writeBody(p []byte) (int, error) {
+	w := c.w
 	if w.filtered() && !w.finished && len(p) > 0 {
 		out, err := w.hooks.filter(p)
 		if err != nil {
@@ -310,14 +338,28 @@ func (c *Context) WriteNoWait(p []byte) (above bool, err error) {
 	if w.err != nil {
 		return false, w.err
 	}
-	if c.external != nil && !c.holdsWhole() {
-		if _, ok := c.external.(ResponseNotifier); !ok {
-			_, err := c.Write(p)
-			return false, err
-		}
-	}
 	if w.status == 0 {
 		c.WriteHeader(stdhttp.StatusOK)
+	}
+	if a := w.asyncHeader(); a != nil {
+		if held, above := a.hold(p, false); held {
+			return above, nil
+		}
+		if w.err != nil {
+			return false, w.err
+		}
+	}
+	return c.writeNoWait(p)
+}
+
+// writeNoWait is WriteNoWait once the header is settled.
+func (c *Context) writeNoWait(p []byte) (above bool, err error) {
+	w := c.w
+	if c.external != nil && !c.holdsWhole() {
+		if _, ok := c.external.(ResponseNotifier); !ok {
+			_, err := c.writeBody(p)
+			return false, err
+		}
 	}
 	if w.finished {
 		return false, ErrResponseWritten
@@ -381,7 +423,18 @@ func (c *Context) WriteNoWait(p []byte) (above bool, err error) {
 // response has room for one fn at a time: register the next once the last
 // has run.
 func (c *Context) OnWritable(fn func(error)) bool {
-	if fn == nil || c.wrote || c.w == nil || !c.w.committed || c.w.finished || c.holdsWhole() {
+	if fn == nil || c.wrote || c.w == nil {
+		return false
+	}
+	if a := c.w.asyncHeader(); a != nil && a.deferWritable(fn) {
+		return true
+	}
+	return c.onWritable(fn)
+}
+
+// onWritable is OnWritable once the header is settled.
+func (c *Context) onWritable(fn func(error)) bool {
+	if c.wrote || !c.w.committed || c.w.finished || c.holdsWhole() {
 		return false
 	}
 	switch {
@@ -436,6 +489,14 @@ func (c *Context) FlushError() error {
 	}
 	if w.finished || c.holdsWhole() {
 		return nil
+	}
+	if a := w.asyncHeader(); a != nil {
+		if a.held() {
+			return nil
+		}
+		if w.err != nil {
+			return w.err
+		}
 	}
 	if w.filtered() {
 		held, err := w.hooks.endFilters(true)
@@ -545,7 +606,7 @@ func (c *Context) ReadFrom(src io.Reader) (int64, error) {
 	}
 	w := c.writer()
 	file, ok := sendableFileOf(src)
-	if !ok || c.holdsWhole() || !c.isHTTP1() || c.Request.Method == stdhttp.MethodHead || w.finished ||
+	if !ok || c.holdsWhole() || w.asyncHeader() != nil || !c.isHTTP1() || c.Request.Method == stdhttp.MethodHead || w.finished ||
 		w.status != 0 && !statusHasBody(w.status) || file.size < minSendFileSize ||
 		w.declared >= 0 && w.written+file.size > w.declared {
 		if w.status == 0 {
@@ -861,6 +922,18 @@ func (c *Context) Finish() error {
 	if w == nil || w.status == 0 || w.finished || c.wrote {
 		return nil
 	}
+	if a := w.asyncHeader(); a != nil && a.deferFinish() {
+		return nil
+	}
+	return c.finishResponse()
+}
+
+// finishResponse is Finish once the header is settled.
+func (c *Context) finishResponse() error {
+	w := c.w
+	if w.status == 0 || w.finished || c.wrote {
+		return nil
+	}
 	var err error
 	if w.filtered() && w.err == nil {
 		// What the filters hold back goes before the end of the body.
@@ -878,22 +951,26 @@ func (c *Context) Finish() error {
 		err = c.finish(w)
 	}
 	if err != nil && !c.wrote {
-		// Nothing can answer the request now. A connection kept open would
-		// leave its client waiting, or reading the response to the next
-		// request it pipelined as this one's, and so would a stream.
-		switch {
-		case c.isHTTP1():
-			c.ends |= endClosing
-			c.closeAfterResponse()
-		case c.stream != nil:
-			c.stream.abandon()
-		default:
-			if a, ok := c.external.(StreamAbandoner); ok {
-				a.Abandon()
-			}
-		}
+		c.abandon()
 	}
 	return err
+}
+
+// abandon ends a request nothing can answer now. A connection kept open
+// would leave its client waiting, or reading the response to the next
+// request it pipelined as this one's, and so would a stream.
+func (c *Context) abandon() {
+	switch {
+	case c.isHTTP1():
+		c.ends |= endClosing
+		c.closeAfterResponse()
+	case c.stream != nil:
+		c.stream.abandon()
+	default:
+		if a, ok := c.external.(StreamAbandoner); ok {
+			a.Abandon()
+		}
+	}
 }
 
 // finish is Finish once the response is marked finished.

@@ -289,7 +289,8 @@ err = proxy.Dial(clientEngine, "tcp", "example.com:443", 5*time.Second, handler,
 
 HTTP handler 用 `Context.Connect` 接受 CONNECT 请求，支持 HTTP/1.x、HTTP/2（RFC 9113 第 8.5 节）和
 HTTP/3（RFC 9114 第 4.4 节），得到一个 `Tunnel`，与 `Upgrade` 为某个协议返回的隧道相同。
-`Tunnel.HoldReads`、`Unsent` 与 `WaitSendable` 借助流本身的流控为隧道限速。`fibhttp.ConnectProxy`
+`Tunnel.HoldReads`、`Unsent` 与 `WaitSendable` 借助流本身的流控为隧道限速，不能等待的中继用
+`NotifySendable` 在积压的数据排空后得到回调。`fibhttp.ConnectProxy`
 是在此之上实现的完整 HTTPS 代理，支持 Basic 代理认证；放在 `mux` 后面，一个端口可同时提供它和 SOCKS：
 
 ```go

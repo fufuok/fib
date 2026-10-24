@@ -952,10 +952,23 @@ func (c *Context) giveBack(returning bool) {
 			}
 			continue
 		}
-		// The last hold on the response. A release from inside a body callback
-		// cannot carry the connection on: the worker delivering that callback
-		// holds the parser, and it picks the duty up itself once the callback
-		// returns.
+		// The last hold on the response. One an OnHeaderAsync hook has still
+		// to hold is handed to the hook, which it keeps the response open
+		// for until its resume; see Context.OnHeaderAsync.
+		var a *asyncHeader
+		if !c.wrote && c.w != nil && c.w.hooks != nil && c.w.hooks.async != nil {
+			a = c.pendingAsync()
+		}
+		if a != nil {
+			if !c.word.CompareAndSwap(w, next+1) {
+				continue
+			}
+			c.answerHeld(a, returning)
+			return
+		}
+		// A release from inside a body callback cannot carry the connection
+		// on: the worker delivering that callback holds the parser, and it
+		// picks the duty up itself once the callback returns.
 		resume := w&ctxResume != 0 && w&ctxDelivering == 0
 		next = withState(next, ctxDone) | ctxFinishing
 		if resume {
@@ -971,15 +984,7 @@ func (c *Context) giveBack(returning bool) {
 			c.forget()
 		}
 		if !c.wrote && (c.w == nil || c.w.status == 0) {
-			// The last hold went without the request being answered, at the
-			// handler's return or at a Release, and there is no one left to
-			// answer it: as net/http does, that is an empty 200, or a 413
-			// for a body ended for growing past its limit; see LimitBody.
-			status := stdhttp.StatusOK
-			if c.bodyTooLarge() {
-				status = stdhttp.StatusRequestEntityTooLarge
-			}
-			c.WriteHeader(status)
+			c.answerUnanswered()
 		}
 		_ = c.Finish()
 		if !returning && c.Conn != nil {
@@ -997,6 +1002,48 @@ func (c *Context) giveBack(returning bool) {
 			c.server.finishRequest(c)
 		}
 		return
+	}
+}
+
+// answerUnanswered begins the response to a request the last hold went
+// without answering, at the handler's return or at a Release, which there is
+// no one left to answer: as net/http does, that is an empty 200, or a 413
+// for a body ended for growing past its limit; see LimitBody.
+func (c *Context) answerUnanswered() {
+	if !c.wrote && (c.w == nil || c.w.status == 0) {
+		status := stdhttp.StatusOK
+		if c.bodyTooLarge() {
+			status = stdhttp.StatusRequestEntityTooLarge
+		}
+		c.WriteHeader(status)
+	}
+}
+
+// answerHeld is the last hold going on a response an OnHeaderAsync hook has
+// still to hold, which giveBack handed that hold to: the response is
+// finished as it would have been, which reaches the hook, and the hook's
+// resume gives the hold back. A response that does not reach it gives the
+// hold back at once.
+func (c *Context) answerHeld(a *asyncHeader, returning bool) {
+	a.mu.Lock()
+	a.owned = true
+	a.mu.Unlock()
+	c.answerUnanswered()
+	_ = c.Finish()
+	a.mu.Lock()
+	reached := a.started
+	if !reached {
+		a.passed, a.owned = true, false
+	}
+	a.mu.Unlock()
+	if !reached {
+		c.giveBack(false)
+		return
+	}
+	if !returning && c.Conn != nil {
+		// As giveBack does for what a release away from the connection's
+		// round writes.
+		_ = c.Conn.Flush()
 	}
 }
 
