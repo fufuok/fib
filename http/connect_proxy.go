@@ -282,11 +282,14 @@ func (h *relayTarget) OnData(c *fib.Connection, data []byte) {
 		return
 	}
 	c.HoldReads(true)
-	go func() {
-		_ = t.WaitSendable(h.limit / 2)
+	release := func(error) {
 		c.HoldReads(false)
 		h.holdingTarget.Store(false)
-	}()
+	}
+	if !t.NotifySendable(h.limit, release) {
+		// It drained since Unsent looked.
+		release(nil)
+	}
 }
 
 func (h *relayTarget) OnPriorityData(*fib.Connection, []byte) {}

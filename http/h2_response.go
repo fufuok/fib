@@ -263,7 +263,12 @@ func (st *h2ServerStream) wakeWritersLocked() {
 	}
 	// A tunnel's waiters each wait for a limit of their own, which they
 	// check again.
-	if t := st.tunnel; t != nil && t.waiting > 0 {
-		t.room.Broadcast()
+	if t := st.tunnel; t != nil {
+		if t.waiting > 0 {
+			t.room.Broadcast()
+		}
+		if len(t.notices) > 0 {
+			t.runNoticesLocked(len(st.pending), nil)
+		}
 	}
 }

@@ -311,6 +311,13 @@ type TunnelPacer interface {
 	WaitSendable(limit int) error
 }
 
+// TunnelNotifier is implemented by a TunnelWriter that can tell when what
+// its tunnel holds back has drained, as those of HTTP/2 and HTTP/3 do; see
+// Tunnel.NotifySendable, which calls it.
+type TunnelNotifier interface {
+	NotifySendable(limit int, fn func(error)) bool
+}
+
 // HoldReads stops or resumes taking what the peer sends through the tunnel,
 // so that a handler that passes it on to something slower paces the peer by
 // flow control rather than by memory here: over HTTP/1.1 the connection
@@ -360,6 +367,25 @@ func (t *Tunnel) WaitSendable(limit int) error {
 		return w.WaitSendable(limit)
 	}
 	return nil
+}
+
+// NotifySendable is WaitSendable for a caller that may not wait, such as a
+// relay that holds the other side's reads while this one drains: when more
+// than limit bytes sent through the tunnel are still waiting to go it
+// arranges for fn to run, on another goroutine, once no more than half of
+// limit are, or with an error once the tunnel has ended, and reports true;
+// when no more than limit are, it reports false and fn never runs. It may be
+// called from any goroutine, OnTunnelData included, and reports false on a
+// tunnel whose writer cannot tell. Over HTTP/1.1 it is
+// Connection.NotifyOutput.
+func (t *Tunnel) NotifySendable(limit int, fn func(error)) bool {
+	switch w := t.w.(type) {
+	case *fib.Connection:
+		return w.NotifyOutput(int64(limit), fn)
+	case TunnelNotifier:
+		return w.NotifySendable(limit, fn)
+	}
+	return false
 }
 
 // Upgrade switches the request to protocol, whose data handler then takes,

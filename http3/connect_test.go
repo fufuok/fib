@@ -86,6 +86,17 @@ func TestConnectOverHTTP3(t *testing.T) {
 	if tunnel.Unsent() < 0 {
 		t.Fatal("negative unsent")
 	}
+	notified := make(chan error, 1)
+	if tunnel.NotifySendable(0, func(err error) { notified <- err }) {
+		select {
+		case err := <-notified:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("NotifySendable never ran")
+		}
+	}
 	if err := tunnel.WaitSendable(0); err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +128,17 @@ func TestConnectOverHTTP3(t *testing.T) {
 	_ = tunnel.Send(make([]byte, 1<<20))
 	if err := tunnel.WaitSendable(0); err == nil {
 		t.Fatal("WaitSendable on a reset stream returned nil")
+	}
+	if !tunnel.NotifySendable(0, func(err error) { notified <- err }) {
+		t.Fatal("NotifySendable on a reset stream reported false")
+	}
+	select {
+	case err := <-notified:
+		if err == nil {
+			t.Fatal("NotifySendable on a reset stream ran with nil")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("NotifySendable on a reset stream never ran")
 	}
 }
 

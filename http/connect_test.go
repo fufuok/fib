@@ -222,8 +222,23 @@ func TestConnectOverHTTP2(t *testing.T) {
 		t.Fatalf("WaitSendable returned %v with 900 bytes unsent", err)
 	case <-time.After(50 * time.Millisecond):
 	}
+	if tunnel.NotifySendable(900, func(error) { t.Error("NotifySendable ran within its limit") }) {
+		t.Fatal("NotifySendable reported 900 bytes unsent past a limit of 900")
+	}
+	notified := make(chan error, 1)
+	if !tunnel.NotifySendable(100, func(err error) { notified <- err }) {
+		t.Fatal("NotifySendable reported 900 bytes unsent within a limit of 100")
+	}
+	select {
+	case err := <-notified:
+		t.Fatalf("NotifySendable ran with %v with 900 bytes unsent", err)
+	case <-time.After(50 * time.Millisecond):
+	}
 	tc.write(h2AppendWindowUpdate(nil, 3, 1000))
 	if err := waitFor(t, sendable); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitFor(t, notified); err != nil {
 		t.Fatal(err)
 	}
 
@@ -257,9 +272,21 @@ func TestConnectOverHTTP2(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() { sendable <- tunnel.WaitSendable(0) }()
+	if !tunnel.NotifySendable(0, func(err error) { notified <- err }) {
+		t.Fatal("NotifySendable reported nothing unsent")
+	}
 	tc.write(h2AppendRSTStream(nil, 3, H2Cancel))
 	if err := waitFor(t, sendable); err == nil {
 		t.Fatal("WaitSendable on a reset stream returned nil")
+	}
+	if err := waitFor(t, notified); err == nil {
+		t.Fatal("NotifySendable on a reset stream ran with nil")
+	}
+	if !tunnel.NotifySendable(0, func(err error) { notified <- err }) {
+		t.Fatal("NotifySendable on a reset stream reported false")
+	}
+	if err := waitFor(t, notified); err == nil {
+		t.Fatal("NotifySendable called on a reset stream ran with nil")
 	}
 	waitFor(t, probe.closed)
 }

@@ -13,6 +13,7 @@ import (
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/http3/quic"
+	"github.com/lesismal/fib/sidepool"
 )
 
 // CONNECT over HTTP/3: an extended CONNECT (RFC 9220), whose :protocol names
@@ -200,7 +201,32 @@ func (w *tunnelWriter) WaitSendable(limit int) error {
 	return nil
 }
 
+// NotifySendable runs fn once no more than half of limit bytes are still to
+// be sent, when more than limit are, or with an error once the stream's
+// sending side has ended; see fibhttp.Tunnel.NotifySendable. The stream has
+// room for one such callback, so a second call before the first has run
+// replaces it, as Stream.NotifySendable does.
+func (w *tunnelWriter) NotifySendable(limit int, fn func(error)) bool {
+	wrapped := func(err error) {
+		if err != nil {
+			err = errStreamClosed
+		}
+		fn(err)
+	}
+	if w.s.Unsent() <= limit {
+		// A stream whose sending side has ended still takes the callback,
+		// which runs with its error.
+		return w.s.NotifySendable(limit, wrapped)
+	}
+	if !w.s.NotifySendable(limit/2, wrapped) {
+		// It drained between the two looks.
+		sidepool.Post(func() { fn(nil) })
+	}
+	return true
+}
+
 var (
 	_ fibhttp.StreamUpgrader = (*requestStream)(nil)
 	_ fibhttp.TunnelPacer    = (*tunnelWriter)(nil)
+	_ fibhttp.TunnelNotifier = (*tunnelWriter)(nil)
 )

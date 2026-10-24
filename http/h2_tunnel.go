@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/sidepool"
 )
 
 // CONNECT over HTTP/2: an extended CONNECT (RFC 8441), whose :protocol names
@@ -30,7 +31,9 @@ import (
 //
 // held says the handler holds the tunnel's reads, which keeps the stream's
 // window from being given back, and room is where WaitSendable waits for
-// what is pending to drain, waiting how many do.
+// what is pending to drain, waiting how many do. notices are the callbacks
+// NotifySendable registered, each run once what is pending is down to its
+// limit or the tunnel has ended.
 type h2Tunnel struct {
 	feed     TunnelFeed
 	upgraded bool
@@ -40,6 +43,31 @@ type h2Tunnel struct {
 	sendBuf  []byte
 	room     sync.Cond
 	waiting  int
+	notices  []h2TunnelNotice
+}
+
+// h2TunnelNotice is a callback NotifySendable registered, to run once no
+// more than limit bytes are pending.
+type h2TunnelNotice struct {
+	limit int
+	fn    func(error)
+}
+
+// runNoticesLocked runs, on other goroutines, the callbacks registered
+// with NotifySendable whose limit pending is within, or every one of them
+// with err when it is not nil. Callers hold the connection's mu.
+func (t *h2Tunnel) runNoticesLocked(pending int, err error) {
+	kept := t.notices[:0]
+	for _, n := range t.notices {
+		if err == nil && pending > n.limit {
+			kept = append(kept, n)
+			continue
+		}
+		fn := n.fn
+		sidepool.Post(func() { fn(err) })
+	}
+	clear(t.notices[len(kept):])
+	t.notices = kept
 }
 
 // upgraded reports whether the stream carries an accepted tunnel. Callers hold
@@ -136,6 +164,7 @@ func (sc *h2ServerConn) endTunnelLocked(st *h2ServerStream, err error) {
 	// A writer waiting for room finds the stream gone, even one whose peer
 	// ended the tunnel before.
 	st.tunnel.room.Broadcast()
+	st.tunnel.runNoticesLocked(0, errH2StreamClosed)
 	if st.tunnel.ended {
 		return
 	}
@@ -279,6 +308,25 @@ func (w *h2TunnelWriter) Unsent() int {
 	st.sc.mu.Lock()
 	defer st.sc.mu.Unlock()
 	return len(st.pending)
+}
+
+// NotifySendable runs fn once no more than half of limit bytes are pending,
+// when more than limit are, or with an error once the stream has ended; see
+// Tunnel.NotifySendable.
+func (w *h2TunnelWriter) NotifySendable(limit int, fn func(error)) bool {
+	st := (*h2ServerStream)(w)
+	sc := st.sc
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.closed || st.reset || st.tunnel.ending || st.localDone || st.tunnel.ended {
+		sidepool.Post(func() { fn(errH2StreamClosed) })
+		return true
+	}
+	if len(st.pending) <= limit {
+		return false
+	}
+	st.tunnel.notices = append(st.tunnel.notices, h2TunnelNotice{limit: limit / 2, fn: fn})
+	return true
 }
 
 // WaitSendable waits until no more than limit bytes are pending, or the
