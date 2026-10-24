@@ -83,7 +83,10 @@ type h2ServerConn struct {
 	in          []byte
 	gotPreface  bool
 	gotSettings bool
-	dec         *hpack.Decoder
+	// settingsSeen says the client's first SETTINGS, which its preface
+	// requires and so is no glitch, has been handled.
+	settingsSeen bool
+	dec          *hpack.Decoder
 	// fields is where each header block is decoded, kept for the next one.
 	fields []hpack.HeaderField
 	// contStream is the stream whose header block is still arriving in
@@ -91,6 +94,17 @@ type h2ServerConn struct {
 	contStream    uint32
 	contEndStream bool
 	contBlock     []byte
+	// contFrames counts the CONTINUATION frames of the block, and contTimer
+	// ends the connection when the block takes longer than the header
+	// timeout, unless contGen has moved on since it was set; see
+	// armHeaderTimer.
+	contFrames int
+	contTimer  *time.Timer
+	contGen    atomic.Uint32
+	// resets and glitches bound what the client may have the server do
+	// without asking for anything; see h2ResetBurst.
+	resets   h2Budget
+	glitches h2Budget
 	// maxClientID is the highest stream the client has opened.
 	maxClientID uint32
 	// recvWindow is what the client may still send before the next
@@ -437,6 +451,9 @@ func (sc *h2ServerConn) handleError(err error) {
 	var streamErr *H2StreamError
 	if errors.As(err, &streamErr) {
 		sc.resetStream(streamErr.StreamID, streamErr.Code)
+		if err := sc.resetCounted(); err != nil {
+			sc.handleError(err)
+		}
 		return
 	}
 	var connErr *H2ConnError
@@ -546,6 +563,9 @@ func (sc *h2ServerConn) handleFrame(f *h2Frame) error {
 			return h2ConnErr(H2FrameSizeError, "PING length %d", len(f.payload))
 		}
 		if !f.has(h2FlagAck) {
+			if err := sc.glitch(); err != nil {
+				return err
+			}
 			out := h2AppendFrameHeader(nil, h2FramePing, h2FlagAck, 0, 8)
 			out = append(out, f.payload...)
 			sc.mu.Lock()
@@ -583,6 +603,12 @@ func (sc *h2ServerConn) handleSettings(f *h2Frame) error {
 		}
 		return nil
 	}
+	if sc.settingsSeen {
+		if err := sc.glitch(); err != nil {
+			return err
+		}
+	}
+	sc.settingsSeen = true
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	if err := sc.applySettingsLocked(f.payload); err != nil {
@@ -689,18 +715,27 @@ func (sc *h2ServerConn) handleRSTStream(f *h2Frame) error {
 		sc.mu.Unlock()
 		return h2ConnErr(H2ProtocolError, "RST_STREAM on idle stream %d", f.streamID)
 	}
-	if st := sc.streams[f.streamID]; st != nil {
+	st := sc.streams[f.streamID]
+	if st != nil {
 		sc.failBodyLocked(st, errH2RequestReset)
 		sc.forgetLocked(st)
 	}
 	sc.mu.Unlock()
 	sc.closeIfDone()
+	if st != nil {
+		return sc.resetCounted()
+	}
 	return nil
 }
 
 func (sc *h2ServerConn) handleData(f *h2Frame) error {
 	if f.streamID == 0 {
 		return h2ConnErr(H2ProtocolError, "DATA on stream 0")
+	}
+	if len(f.payload) == 0 && !f.has(h2FlagEndStream) {
+		if err := sc.glitch(); err != nil {
+			return err
+		}
 	}
 	length := int64(f.length)
 	if length > sc.recvWindow {
@@ -793,9 +828,16 @@ func (sc *h2ServerConn) handleHeaders(f *h2Frame) error {
 		if len(block) > sc.handler.config.MaxHeaderBytes {
 			return h2ConnErr(H2EnhanceYourCalm, "header block too large")
 		}
+		if len(block) == 0 {
+			if err := sc.glitch(); err != nil {
+				return err
+			}
+		}
 		sc.contStream = f.streamID
 		sc.contEndStream = f.has(h2FlagEndStream)
 		sc.contBlock = bufferpool.Append(sc.contBlock[:0], block)
+		sc.contFrames = 0
+		sc.armHeaderTimer()
 		return nil
 	}
 	return sc.handleHeaderBlock(f.streamID, block, f.has(h2FlagEndStream))
@@ -809,9 +851,17 @@ func (sc *h2ServerConn) handleContinuation(f *h2Frame) error {
 	if len(sc.contBlock) > sc.handler.config.MaxHeaderBytes {
 		return h2ConnErr(H2EnhanceYourCalm, "header block too large")
 	}
+	sc.contFrames++
+	if sc.contFrames > h2MaxContinuations {
+		return h2ConnErr(H2EnhanceYourCalm, "header block in too many frames")
+	}
 	if !f.has(h2FlagEndHeaders) {
+		if len(f.payload) == 0 {
+			return sc.glitch()
+		}
 		return nil
 	}
+	sc.stopHeaderTimer()
 	id, block := sc.contStream, sc.contBlock
 	sc.contStream = 0
 	err := sc.handleHeaderBlock(id, block, sc.contEndStream)
