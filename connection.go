@@ -121,6 +121,12 @@ type Connection struct {
 	// OnClose, and the release of the descriptor, to its last round; see
 	// Engine.closeConnection. Guarded by mu.
 	closePending bool
+	// closeDue records that the connection's OnClose is still to run: set
+	// with closePending, and cleared only once OnClose has returned, where
+	// closePending is cleared as the last round takes the close on. A
+	// connection whose OnClose is due is not yet finished, for Shutdown and
+	// ShutdownBinding. Guarded by mu.
+	closeDue bool
 	// hangupNoted records that a hangup has been reported while a round was
 	// running, which happens once; see noteEvent. Guarded by mu.
 	hangupNoted    bool
@@ -1296,6 +1302,9 @@ func (c *Connection) finishClose() {
 	err := c.closeReasonLocked()
 	c.mu.Unlock()
 	c.handler.OnClose(c, err)
+	c.mu.Lock()
+	c.closeDue = false
+	c.mu.Unlock()
 }
 
 // hasQueuedOutput reports whether bytes accepted by Send are still waiting for

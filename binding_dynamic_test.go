@@ -588,6 +588,38 @@ func TestShutdownBindingDrains(t *testing.T) {
 	}
 }
 
+// ShutdownBinding returns only once its connections' OnClose has run, a
+// slow one included: the last round of a close takes it on before it calls
+// OnClose, and the connection is not finished until OnClose returns.
+func TestShutdownBindingWaitsForOnClose(t *testing.T) {
+	for name, config := range dynamicConfigs() {
+		t.Run(name, func(t *testing.T) {
+			log := newCloseLog()
+			server := startDynamic(t, "shutdown-onclose-"+name, config, Binding{Addr: "127.0.0.1:0", Handler: taggedEcho("a:", log)})
+			slow := taggedEcho("s:", log)
+			logClose := slow.Close
+			slow.Close = func(c *Connection, err error) {
+				time.Sleep(200 * time.Millisecond)
+				logClose(c, err)
+			}
+			i, err := server.AddBinding(Binding{Addr: "127.0.0.1:0", Handler: &drainHandler{HandlerFuncs: slow}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, _ := dialMessage(t, bindingAddrs(t, server, i, 1)[0], "hi")
+			defer conn.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := server.ShutdownBinding(ctx, i); err != nil {
+				t.Fatalf("ShutdownBinding: %v", err)
+			}
+			if got := len(log.of("s:")); got != 1 {
+				t.Fatalf("ShutdownBinding returned with %d of 1 OnClose run", got)
+			}
+		})
+	}
+}
+
 // Connections that do not finish by the time ShutdownBinding's ctx is done
 // are closed, with net.ErrClosed, and ShutdownBinding reports ctx's error.
 func TestShutdownBindingDeadline(t *testing.T) {

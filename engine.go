@@ -698,7 +698,10 @@ func shutdownConnection(c *Connection) bool {
 	c.mu.Lock()
 	// The handler is read under the lock, which SetHandler takes, since a
 	// round on a worker may be handing the connection to another one.
-	closing, open, handler := c.closing, !c.closed || c.closePending, c.handler
+	// A closed connection is still open until its OnClose has run: the
+	// last round clears closePending as it takes the close on, before it
+	// calls OnClose.
+	closing, open, handler := c.closing, !c.closed || c.closeDue, c.handler
 	c.mu.Unlock()
 	if !closing {
 		if h, ok := handler.(ShutdownHandler); ok {
@@ -1031,7 +1034,7 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 		e.detach(c)
 		return
 	}
-	c.closePending = true
+	c.closePending, c.closeDue = true, true
 	schedule := !c.scheduled
 	c.scheduled = true
 	c.mu.Unlock()

@@ -467,10 +467,12 @@ func (e *Engine) finishConnection(c *Connection, err error) {
 	if c.bindingID != 0 && !c.udp {
 		e.accepted.leave()
 	}
+	c.handler.OnClose(c, err)
+	// Listed until OnClose has run, so that Shutdown and ShutdownBinding,
+	// which count what is listed, return only after it.
 	e.mu.Lock()
 	delete(e.connections, c)
 	e.mu.Unlock()
-	c.handler.OnClose(c, err)
 }
 
 // beginShutdown starts Shutdown: the listeners are closed, which stops them
