@@ -333,8 +333,6 @@ HTTP/1 客户端像 server 读请求、写响应那样，自己写请求头、�
 
 ## 待优化
 
-- HTTP/2 和 HTTP/3 的流式请求 body（目前仍然整体缓存），客户端流式读取响应 body。
-- 让 handler 能等待已排队的输出排空，使流式生成大 body 时内存不再增长。
 - TLS 上按 socket 排空进度读取并加密文件；Linux 上用 kTLS 实现真正的 HTTPS 零拷贝。
 - Windows 上使用 `TransmitFile`。
 

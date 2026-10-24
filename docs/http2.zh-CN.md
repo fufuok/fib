@@ -162,19 +162,20 @@ h2spec 只会说 HTTP/2，所以跑它时服务端要设置 `Config.HTTP2Only`�
 
 按优先级排列。
 
-### 1. 安全加固（高）
+### 1. 安全加固
 
-目前只靠 `MaxConcurrentStreams`、`MaxHeaderBytes`、`MaxBodyBytes` 和流控窗口限制资源，
-面对恶意客户端还缺少以下防护：
+已完成。除了 `MaxConcurrentStreams`、`MaxHeaderBytes`、`MaxBodyBytes` 和流控窗口，客户端有下列行为时
+服务端以 GOAWAY(ENHANCE_YOUR_CALM) 结束连接：
 
-- **Rapid Reset（CVE-2023-44487）**：客户端可以不断打开 stream 后立即 RST_STREAM。
-  需要统计单位时间内被重置的 stream 数，超过阈值时以 ENHANCE_YOUR_CALM 发送 GOAWAY。
-- **控制帧洪泛**：PING、SETTINGS、空 DATA、WINDOW_UPDATE 等帧没有速率限制；
-  PING/SETTINGS 的 ACK 会不断进入发送队列。需要限制待发送控制帧的数量。
-- **CONTINUATION 洪泛**：单个 header block 已受 `MaxHeaderBytes` 限制，但还应限制
-  CONTINUATION 帧的数量，以及零长度帧的数量。
-- **慢速连接**：`IdleTimeout` 会结束不开流的连接，读超时约束每个请求的 body，但通过
-  CONTINUATION 帧慢慢送达的 header block 只受 `IdleTimeout` 约束。
+- 重置仍打开的 stream，或用 stream 错误让服务端重置它们，超过突发 1000 个、每秒补充 100 个的额度
+  （Rapid Reset，CVE-2023-44487）；
+- 发送 PING、SETTINGS（第一个除外），或者既为空又不结束任何东西的 DATA、CONTINUATION 帧，超过同样的
+  额度，这也限制了服务端排队等待发送的 ACK；
+- 一个 header block 用了超过 1000 个 CONTINUATION 帧，或者超过 `ReadHeaderTimeout`（未设置时为
+  `ReadTimeout`）仍未结束。
+
+PRIORITY 帧，以及针对已结束 stream 的 WINDOW_UPDATE、RST_STREAM 帧，处理代价不超过读取它们的字节，
+客户端也可能在途中发出，因此不计入。这些额度目前不可配置。
 
 ### 2. 协议一致性测试
 
@@ -186,11 +187,12 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
 ### 3. 流式 body 与 handler 模型（中）
 
 - 流式请求 body 已经实现，接收窗口随 handler 的消费补充；流式响应也已实现，由客户端的
-  窗口限速。整体缓存的 body 仍然是“收到即补充窗口”，客户端仍把每个响应完整缓存。
+  窗口限速。整体缓存的 body 仍然是“收到即补充窗口”。客户端在 `ClientConfig.StreamResponseBody` 下把响应 body
+  流式交给回调，否则整体缓存。
 
 ### 4. 性能（中）
 
-- **HPACK Huffman 解码**：目前逐 bit 遍历解码树，可改为按 4 bit 或 8 bit 查表解码。
+- **HPACK Huffman 解码**：已完成，按查表每步解码 4 bit。
 - **HPACK 编码器**：动态表按线性查找，可以加索引；静态表查找已经是 map。
 - **内存分配**：body 流式交付的 stream 和 push 的 stream 仍各自分配；`static-h2` 的响应 body
   依次拷贝进 handler 的 buffer、帧和 TLS record。

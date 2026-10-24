@@ -480,10 +480,6 @@ handler := http.HandlerFunc(func(c *http.Context) {
 
 ## Planned improvements
 
-- Streaming request bodies for HTTP/2 and HTTP/3, which still buffer them
-  whole, and streaming response bodies for the client.
-- A way for a handler to wait for its queued output to drain, so that
-  streaming a large generated body does not grow memory.
 - Lazily encrypted file sending over TLS, reading the file only as the socket
   drains, and kTLS on Linux for true zero-copy HTTPS.
 - `TransmitFile` on Windows.

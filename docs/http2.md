@@ -212,24 +212,25 @@ preface with an HTTP/1 response, which h2spec cannot read.
 
 In order of priority.
 
-### 1. Hardening against abuse (high)
+### 1. Hardening against abuse
 
-Resources are bounded today only by `MaxConcurrentStreams`, `MaxHeaderBytes`,
-`MaxBodyBytes` and the flow-control windows. Against a malicious client it
-still lacks:
+Done. Besides `MaxConcurrentStreams`, `MaxHeaderBytes`, `MaxBodyBytes` and the
+flow-control windows, the server ends a connection with
+GOAWAY(ENHANCE_YOUR_CALM) when its client:
 
-- **Rapid Reset (CVE-2023-44487)**: a client can open streams and immediately
-  RST_STREAM them without end. Resets per unit of time should be counted, with
-  GOAWAY(ENHANCE_YOUR_CALM) past a threshold.
-- **Control-frame floods**: PING, SETTINGS, empty DATA and WINDOW_UPDATE frames
-  are not rate-limited, and PING/SETTINGS acknowledgements keep entering the
-  send queue. The number of queued control frames should be capped.
-- **CONTINUATION floods**: a single header block is bounded by
-  `MaxHeaderBytes`, but the number of CONTINUATION frames, and of zero-length
-  frames, should be bounded too.
-- **Slow connections**: `IdleTimeout` ends connections that open no stream,
-  and the read timeouts bound each request's body, but a header block that
-  trickles in through CONTINUATION frames is bounded only by `IdleTimeout`.
+- resets streams while they are open, or makes the server reset them with
+  stream errors, past a burst of 1000 refilled at 100 a second (Rapid Reset,
+  CVE-2023-44487);
+- sends PING, SETTINGS (after the first), or DATA and CONTINUATION frames that
+  are empty without ending anything, past the same budget, which bounds the
+  acknowledgements the server queues too;
+- sends one header block in more than 1000 CONTINUATION frames, or takes
+  longer than `ReadHeaderTimeout` (`ReadTimeout` when it is not set) to finish
+  one.
+
+PRIORITY frames, and WINDOW_UPDATE or RST_STREAM frames for a stream that has
+ended, cost no more than their bytes and are not counted, since a client may
+send them in flight. The budgets are not configurable yet.
 
 ### 2. Conformance testing
 
@@ -245,12 +246,12 @@ concurrency.
 - Streamed request bodies are done, with window updates that follow the
   handler's consumption, and so are streamed responses, paced by the
   client's windows; a body read whole still has its window replenished on
-  receipt. The client still buffers each response whole.
+  receipt. The client streams a response body to its callback under
+  `ClientConfig.StreamResponseBody`, and buffers it whole otherwise.
 
 ### 4. Performance (medium)
 
-- **HPACK Huffman decoding** walks the decoding tree bit by bit; table-driven
-  decoding 4 or 8 bits at a time would be faster.
+- **HPACK Huffman decoding** is done: it takes four bits a step from a table.
 - **HPACK encoder** searches the dynamic table linearly; an index would help
   (the static table is already a map).
 - **Allocations**: streams whose body streams, and pushed streams, still
