@@ -113,6 +113,10 @@ type Connection struct {
 	// empties the socket stops at a short read without reaching the end, so
 	// the round that next reads is handed the end with it.
 	hupOwed bool
+	// roundStalled records that the current round's read stopped with
+	// bytes possibly left in the socket, for a hold or for the write
+	// budget. Only the round that owns the connection touches it.
+	roundStalled bool
 	// closePending records that the loop has closed the connection and left
 	// OnClose, and the release of the descriptor, to its last round; see
 	// Engine.closeConnection. Guarded by mu.
@@ -1168,6 +1172,7 @@ func (c *Connection) process() {
 		}
 		events := uint32(c.pendingEvents)
 		c.pendingEvents = 0
+		c.roundStalled = false
 		if c.hupOwed && events&evIn != 0 {
 			events |= evRdHup
 			c.hupOwed = false
@@ -1252,12 +1257,16 @@ func (c *Connection) process() {
 			closeErr = c.socketError()
 			alive = false
 		} else if alive && events&(evHup|evRdHup)&^deferred != 0 {
-			if c.flags.has(flagReadHeld) {
-				// The handler holds reads, so what the peer sent before it
-				// ended is still in the socket, behind the end. The read the
-				// release hands back takes it and then the end, which closes
-				// the connection as it would have here: the end is owed
-				// with it, since its edge is spent.
+			if c.flags.has(flagReadHeld) || c.roundStalled {
+				// The handler holds reads, or the round's read stopped short
+				// for a hold or the write budget, so what the peer sent
+				// before it ended may still be in the socket, behind the
+				// end. The read handed back later takes it and then the
+				// end, which closes the connection as it would have here:
+				// the end is owed with it, since its edge is spent. The
+				// round's own stop counts even when the hold that caused it
+				// was lifted since, on another goroutine: closing here
+				// would drop what is left.
 				c.mu.Lock()
 				c.hupOwed = true
 				c.mu.Unlock()
@@ -1337,6 +1346,7 @@ func (c *Connection) beginReadLocked() {
 	}
 	c.readStalled = false
 	c.readDeferred = false
+	c.roundStalled = false
 }
 
 // readRound is drainInput once beginReadLocked has set the round up.
@@ -1716,6 +1726,7 @@ func (c *Connection) readLoop() error {
 			// flow control slows the peer down instead of this side growing:
 			// releasing the hold refreshes the connection, which hands back
 			// the read owed for whatever was left behind.
+			c.roundStalled = true
 			c.stallRead()
 			return nil
 		}
@@ -1764,6 +1775,7 @@ func (c *Connection) readLoop() error {
 					// The peer is behind, or the handler still has more than
 					// it can take. Stop reading and let the event loop settle
 					// the bytes left behind.
+					c.roundStalled = true
 					c.stallRead()
 					return nil
 				}
