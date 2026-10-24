@@ -438,4 +438,5 @@ func init() {
 		staticPairIndex[f] = i + 1
 	}
 	buildHuffmanTree()
+	buildHuffmanSteps()
 }

@@ -39,33 +39,98 @@ func huffmanDecode(s []byte, maxLen int) (string, error) {
 	return string(out), nil
 }
 
-// huffmanDecodeAppend decodes s onto out, as huffmanDecode does.
-func huffmanDecodeAppend(out, s []byte, maxLen int) ([]byte, error) {
-	node := 0
-	// depth counts the bits since the last symbol, and ones whether they
-	// were all ones, which decides whether they are valid padding.
-	depth, ones := 0, true
-	for _, b := range s {
-		for i := 7; i >= 0; i-- {
-			bit := (b >> uint(i)) & 1
-			next := huffmanTree[node].children[bit]
-			if next == 0 {
-				// Only the path of 30 ones, EOS, runs off the tree.
-				return nil, ErrInvalidHuffman
-			}
-			node = int(next)
-			depth++
-			ones = ones && bit == 1
-			if huffmanTree[node].children[0] == 0 {
-				out = append(out, huffmanTree[node].sym)
-				if maxLen > 0 && len(out) > maxLen {
-					return nil, ErrStringTooLong
-				}
-				node, depth, ones = 0, 0, true
-			}
+// huffmanStep is where the decoder goes from one state on the next four
+// bits of input: the state it reaches, and the symbol those bits finished, if
+// they finished one. Codes are five bits or longer, so four bits finish one
+// at most.
+type huffmanStep struct {
+	next  uint8
+	sym   uint8
+	flags uint8
+}
+
+const (
+	// huffmanEmit says the step finished a symbol, sym.
+	huffmanEmit = 1 << iota
+	// huffmanFail says the bits ran into EOS, which never decodes.
+	huffmanFail
+)
+
+// huffmanSteps is the decoder's table: a state is an inner node of the tree,
+// 0 the root, and the decoder takes four bits a step rather than walking the
+// tree a bit at a time. huffmanAccepts says which states the input may end
+// in: those whose bits since the last symbol are at most seven, all ones,
+// which is the padding RFC 7541 section 5.2 allows.
+var (
+	huffmanSteps   [256][16]huffmanStep
+	huffmanAccepts [256]bool
+)
+
+// buildHuffmanSteps builds the decoder's table from the tree.
+func buildHuffmanSteps() {
+	// The states, numbered in the order the inner nodes were made, the
+	// root first.
+	var stateOf [512]uint8
+	var nodes []int
+	for i, n := range huffmanTree {
+		if n.children[0] != 0 {
+			stateOf[i] = uint8(len(nodes))
+			nodes = append(nodes, i)
 		}
 	}
-	if depth > 7 || !ones {
+	for state, start := range nodes {
+		for nibble := 0; nibble < 16; nibble++ {
+			node := start
+			var step huffmanStep
+			for i := 3; i >= 0; i-- {
+				next := huffmanTree[node].children[nibble>>uint(i)&1]
+				if next == 0 {
+					step.flags |= huffmanFail
+					break
+				}
+				node = int(next)
+				if huffmanTree[node].children[0] == 0 {
+					step.sym = huffmanTree[node].sym
+					step.flags |= huffmanEmit
+					node = 0
+				}
+			}
+			step.next = stateOf[node]
+			huffmanSteps[state][nibble] = step
+		}
+	}
+	// The root, and the nodes up to seven ones down from it.
+	node := 0
+	for depth := 0; depth <= 7 && (depth == 0 || huffmanTree[node].children[0] != 0); depth++ {
+		huffmanAccepts[stateOf[node]] = true
+		node = int(huffmanTree[node].children[1])
+	}
+}
+
+// huffmanDecodeAppend decodes s onto out, as huffmanDecode does.
+func huffmanDecodeAppend(out, s []byte, maxLen int) ([]byte, error) {
+	state := uint8(0)
+	for _, b := range s {
+		step := &huffmanSteps[state][b>>4]
+		if step.flags != 0 {
+			if step.flags&huffmanFail != 0 {
+				return nil, ErrInvalidHuffman
+			}
+			out = append(out, step.sym)
+		}
+		step = &huffmanSteps[step.next][b&0xf]
+		if step.flags != 0 {
+			if step.flags&huffmanFail != 0 {
+				return nil, ErrInvalidHuffman
+			}
+			out = append(out, step.sym)
+		}
+		state = step.next
+		if maxLen > 0 && len(out) > maxLen {
+			return nil, ErrStringTooLong
+		}
+	}
+	if !huffmanAccepts[state] {
 		return nil, ErrInvalidHuffman
 	}
 	return out, nil
